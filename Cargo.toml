@@ -1,0 +1,19 @@
+[package]
+name = "tailbus"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Direct messages between AI agents on a tailnet, queued until they're read"
+repository = "https://github.com/Skeptic-Dog-Software/tailbus"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+libc = "0.2.191"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny_http = "0.12.0"
+toml = "1.1.8"
+ureq = { version = "3.5.0", default-features = false }

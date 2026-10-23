@@ -1,0 +1,1013 @@
+//! The bus itself: sessions, sending, delivery and receipts. The daemon's
+//! local and tailnet listeners and its forwarder all work through this.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+
+use crate::config::Config;
+use crate::local::{Event, Inbox, Item, PeerMachine, Peers, Sent};
+use crate::net;
+use crate::proto::{
+    AgentInfo, AgentList, MAX_BATCH, MAX_BODY, Message, MessageBatch, Receipt, ReceiptBatch,
+    SendState, StoreResult, StoreResults, StoreStatus,
+};
+use crate::store::{Acked, Incoming, Store, Stored, machine_part, name_part};
+use crate::tailscale::{Status, Tailscale, Whois};
+use crate::util::{Address, is_id, new_id, now_ms, valid_name};
+
+const DAY_MS: i64 = 86_400_000;
+const STATUS_TTL: Duration = Duration::from_secs(10);
+const WHOIS_TTL: Duration = Duration::from_secs(60);
+const MAX_EVENTS: usize = 1000;
+
+/// This machine as Tailscale names it.
+#[derive(Debug, Clone)]
+pub struct Me {
+    pub machine: String,
+    pub owner: String,
+    pub ipv4: Option<Ipv4Addr>,
+}
+
+pub struct Bus {
+    pub cfg: Config,
+    ts: Tailscale,
+    store: Mutex<Store>,
+    live: Mutex<Live>,
+    changed: Condvar,
+    me: RwLock<Option<Me>>,
+    status: Mutex<Option<(Instant, Status)>>,
+    whois: Mutex<HashMap<IpAddr, (Instant, Whois)>>,
+    /// Warnings the forwarder learned for messages `send` is waiting on.
+    notes: Mutex<HashMap<String, String>>,
+    /// The tailnet address the bus listens on, or why it isn't listening.
+    pub listening: Mutex<Result<SocketAddr, String>>,
+}
+
+#[derive(Default)]
+struct Live {
+    /// Bumped on every change anyone might be waiting for.
+    generation: u64,
+    holders: HashMap<String, Holder>,
+    waiters: HashMap<String, Waiter>,
+    /// Open `recv --wait` calls per agent.
+    receivers: HashMap<String, usize>,
+    next_token: u64,
+    events: VecDeque<Event>,
+    event_seq: u64,
+    online: HashMap<String, bool>,
+}
+
+/// The session holding an agent name.
+struct Holder {
+    token: u64,
+    session: String,
+    app: Option<String>,
+    client_pid: u32,
+}
+
+/// The push adapter waiting on an agent's behalf.
+struct Waiter {
+    token: u64,
+    session: String,
+    client_pid: u32,
+}
+
+pub enum Waited {
+    Messages(Vec<Incoming>),
+    Replaced,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn backoff(attempts: u32) -> i64 {
+    (1000i64 << attempts.min(6)).min(60_000)
+}
+
+/// A one-line preview of a body, for the event log.
+fn preview(body: &str) -> String {
+    let line = body.lines().next().unwrap_or_default();
+    let mut s: String = line.chars().take(60).collect();
+    if s.len() < body.len() {
+        s.push('…');
+    }
+    s
+}
+
+impl Bus {
+    pub fn new(cfg: Config, store: Store) -> Bus {
+        Bus {
+            ts: Tailscale::find(cfg.tailscale.as_deref()),
+            cfg,
+            store: Mutex::new(store),
+            live: Mutex::new(Live::default()),
+            changed: Condvar::new(),
+            me: RwLock::new(None),
+            status: Mutex::new(None),
+            whois: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            listening: Mutex::new(Err("starting".into())),
+        }
+    }
+
+    pub fn db(&self) -> MutexGuard<'_, Store> {
+        lock(&self.store)
+    }
+
+    // Tailscale.
+
+    pub fn me(&self) -> Result<Me> {
+        if let Some(me) = self.me.read().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Ok(me);
+        }
+        self.refresh_status()
+            .context("Tailscale isn't ready, so this machine has no name on the bus yet")?;
+        Ok(self
+            .me
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("set by refresh_status"))
+    }
+
+    /// Tailscale's view of the tailnet, at most a few seconds old.
+    pub fn status(&self) -> Result<Status> {
+        if let Some((at, status)) = &*lock(&self.status)
+            && at.elapsed() < STATUS_TTL
+        {
+            return Ok(status.clone());
+        }
+        self.refresh_status()
+    }
+
+    pub fn refresh_status(&self) -> Result<Status> {
+        let status = self.ts.status()?;
+        *self.me.write().unwrap_or_else(|e| e.into_inner()) = Some(Me {
+            machine: status.machine.clone(),
+            owner: status.owner.clone(),
+            ipv4: status.ipv4,
+        });
+        *lock(&self.status) = Some((Instant::now(), status.clone()));
+        let mut back = Vec::new();
+        {
+            let mut live = lock(&self.live);
+            for peer in &status.peers {
+                let was = live.online.insert(peer.machine.clone(), peer.online);
+                if peer.online && was == Some(false) {
+                    back.push(peer.machine.clone());
+                }
+            }
+        }
+        for machine in back {
+            if self.db().retry_machine_now(&machine)? > 0 {
+                self.event(format!(
+                    "{machine} is back online; sending what's waiting for it"
+                ));
+            }
+        }
+        Ok(status)
+    }
+
+    pub fn whois(&self, ip: IpAddr) -> Result<Whois> {
+        if let Some((at, who)) = lock(&self.whois).get(&ip)
+            && at.elapsed() < WHOIS_TTL
+        {
+            return Ok(who.clone());
+        }
+        let who = self.ts.whois(ip)?;
+        lock(&self.whois).insert(ip, (Instant::now(), who.clone()));
+        Ok(who)
+    }
+
+    /// Machines owned by this one's owner, plus whatever the config allows.
+    pub fn allowed(&self, who: &Whois) -> Result<bool> {
+        let me = self.me()?;
+        let same_owner =
+            !me.owner.is_empty() && who.owner == me.owner && who.owner != "tagged-devices";
+        Ok(same_owner
+            || self.cfg.allow.iter().any(|a| {
+                a.eq_ignore_ascii_case(&who.owner) || a.eq_ignore_ascii_case(&who.machine)
+            }))
+    }
+
+    // Waiting and events.
+
+    fn notify(&self) {
+        lock(&self.live).generation += 1;
+        self.changed.notify_all();
+    }
+
+    /// Logs an event and keeps it for `tailbus tail`.
+    pub fn event(&self, text: impl Into<String>) {
+        let text = text.into();
+        let at = now_ms();
+        eprintln!("{} {text}", crate::util::rfc3339(at));
+        let mut live = lock(&self.live);
+        live.event_seq += 1;
+        let seq = live.event_seq;
+        live.events.push_back(Event { seq, at, text });
+        if live.events.len() > MAX_EVENTS {
+            live.events.pop_front();
+        }
+        live.generation += 1;
+        drop(live);
+        self.changed.notify_all();
+    }
+
+    pub fn events_after(&self, after: u64) -> Vec<Event> {
+        let live = lock(&self.live);
+        live.events
+            .iter()
+            .filter(|e| e.seq > after)
+            .cloned()
+            .collect()
+    }
+
+    /// Calls `check` after every change until it returns something, the
+    /// deadline passes, or `gone` says the caller went away.
+    pub fn wait_until<T>(
+        &self,
+        deadline: Instant,
+        mut check: impl FnMut() -> Result<Option<T>>,
+        mut gone: impl FnMut() -> bool,
+    ) -> Result<Option<T>> {
+        loop {
+            let generation = lock(&self.live).generation;
+            if let Some(found) = check()? {
+                return Ok(Some(found));
+            }
+            let now = Instant::now();
+            if now >= deadline || gone() {
+                return Ok(None);
+            }
+            let live = lock(&self.live);
+            if live.generation == generation {
+                let wait = (deadline - now).min(Duration::from_secs(2));
+                drop(self.changed.wait_timeout(live, wait));
+            }
+        }
+    }
+
+    /// Sleeps until something changes or `d` passes.
+    pub fn nap(&self, d: Duration) {
+        let live = lock(&self.live);
+        drop(self.changed.wait_timeout(live, d));
+    }
+
+    // Sessions.
+
+    /// Claims `agent` for a session, unless another live session holds it.
+    /// The same session may claim it again. (Matching on the app's process
+    /// is only for hooks: one Codex server can host many sessions.)
+    pub fn hold(
+        &self,
+        agent: &str,
+        session: &str,
+        app: Option<&str>,
+        client_pid: u32,
+    ) -> Result<Result<u64, String>> {
+        if !valid_name(agent) {
+            bail!("{agent:?} isn't a valid agent name: use lowercase letters, digits and hyphens");
+        }
+        let mut live = lock(&self.live);
+        if let Some(h) = live.holders.get(agent)
+            && h.session != session
+        {
+            return Ok(Err(format!(
+                "another live session already holds agent {agent} ({}, process {}). \
+                 Set TAILBUS_AGENT to give this session a name of its own.",
+                h.app.as_deref().unwrap_or("unknown app"),
+                h.client_pid
+            )));
+        }
+        live.next_token += 1;
+        let token = live.next_token;
+        live.holders.insert(
+            agent.to_string(),
+            Holder {
+                token,
+                session: session.to_string(),
+                app: app.map(str::to_string),
+                client_pid,
+            },
+        );
+        if live
+            .waiters
+            .get(agent)
+            .is_some_and(|w| w.session != session && w.client_pid != client_pid)
+        {
+            live.waiters.remove(agent);
+        }
+        drop(live);
+        self.notify();
+        self.db().agent_live(agent, app, now_ms())?;
+        self.event(format!(
+            "{agent}: session started ({})",
+            app.unwrap_or("unknown app")
+        ));
+        Ok(Ok(token))
+    }
+
+    pub fn release(&self, agent: &str, token: u64) {
+        let mut live = lock(&self.live);
+        if live.holders.get(agent).is_some_and(|h| h.token == token) {
+            live.holders.remove(agent);
+            drop(live);
+            self.notify();
+            let _ = self.db().agent_live(agent, None, now_ms());
+            self.event(format!("{agent}: session ended"));
+        }
+    }
+
+    /// Registers the push adapter's wait for `agent`, replacing any other.
+    /// Returns its token and the session messages are handed to.
+    pub fn add_waiter(
+        &self,
+        agent: &str,
+        session: &str,
+        client_pid: u32,
+    ) -> Result<Result<(u64, String), String>> {
+        if !valid_name(agent) {
+            bail!("{agent:?} isn't a valid agent name");
+        }
+        let mut live = lock(&self.live);
+        let session = match live.holders.get(agent) {
+            Some(h) if h.session == session || h.client_pid == client_pid => h.session.clone(),
+            Some(h) => {
+                return Ok(Err(format!(
+                    "another live session holds agent {agent} (process {})",
+                    h.client_pid
+                )));
+            }
+            None => session.to_string(),
+        };
+        live.next_token += 1;
+        let token = live.next_token;
+        live.waiters.insert(
+            agent.to_string(),
+            Waiter {
+                token,
+                session: session.clone(),
+                client_pid,
+            },
+        );
+        drop(live);
+        self.notify();
+        self.db().agent_live(agent, None, now_ms())?;
+        Ok(Ok((token, session)))
+    }
+
+    pub fn remove_waiter(&self, agent: &str, token: u64) {
+        let mut live = lock(&self.live);
+        if live.waiters.get(agent).is_some_and(|w| w.token == token) {
+            live.waiters.remove(agent);
+        }
+    }
+
+    /// Waits for messages on a waiter's behalf.
+    pub fn wait_as_waiter(
+        &self,
+        agent: &str,
+        session: &str,
+        token: u64,
+        gone: impl FnMut() -> bool,
+    ) -> Result<Option<Waited>> {
+        let far = Instant::now() + Duration::from_secs(7 * 86_400);
+        self.wait_until(
+            far,
+            || {
+                let current = lock(&self.live)
+                    .waiters
+                    .get(agent)
+                    .is_some_and(|w| w.token == token);
+                if !current {
+                    return Ok(Some(Waited::Replaced));
+                }
+                let found = self.takeable(agent, session, MAX_BATCH)?;
+                Ok((!found.is_empty()).then_some(Waited::Messages(found)))
+            },
+            gone,
+        )
+    }
+
+    /// Counts a `recv --wait` as the agent being live while it waits.
+    pub fn receiving(&self, agent: &str, delta: isize) {
+        let mut live = lock(&self.live);
+        let n = live.receivers.entry(agent.to_string()).or_default();
+        *n = n.saturating_add_signed(delta);
+        if *n == 0 {
+            live.receivers.remove(agent);
+        }
+    }
+
+    fn is_live(live: &Live, agent: &str) -> bool {
+        live.holders.contains_key(agent)
+            || live.waiters.contains_key(agent)
+            || live.receivers.contains_key(agent)
+    }
+
+    /// Sessions whose pending messages aren't to be handed to anyone else.
+    fn live_sessions(&self, agent: &str) -> HashSet<String> {
+        let live = lock(&self.live);
+        let holder = live.holders.get(agent).map(|h| h.session.clone());
+        let waiter = live.waiters.get(agent).map(|w| w.session.clone());
+        holder.into_iter().chain(waiter).collect()
+    }
+
+    // Receiving.
+
+    pub fn takeable(&self, agent: &str, session: &str, max: usize) -> Result<Vec<Incoming>> {
+        let live = self.live_sessions(agent);
+        self.db().takeable(agent, session, &live, max)
+    }
+
+    /// Records a confirmed hand-off, and sends receipts for first deliveries.
+    pub fn deliver(&self, agent: &str, ids: &[String], session: &str) -> Result<()> {
+        let first = self.db().mark_delivered(ids, session, now_ms())?;
+        for msg in first {
+            self.receipt(&msg.from, &msg.id, SendState::Delivered)?;
+            self.event(format!(
+                "{} -> {agent}: delivered {}",
+                msg.from,
+                preview(&msg.body)
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn ack(&self, agent: &str, id: &str) -> Result<()> {
+        let acked = self.db().ack(agent, id, now_ms())?;
+        match acked {
+            Acked::Now { sender } => {
+                self.receipt(&sender, id, SendState::Acknowledged)?;
+                self.event(format!("{agent}: acknowledged {id} from {sender}"));
+                Ok(())
+            }
+            Acked::Already => Ok(()),
+            Acked::NotFound => bail!("{agent} has no message {id}; msg_inbox lists yours"),
+        }
+    }
+
+    fn receipt(&self, sender: &str, id: &str, state: SendState) -> Result<()> {
+        let me = self.me()?;
+        let machine = machine_part(sender);
+        let receipt = Receipt {
+            id: id.to_string(),
+            state,
+            at: now_ms(),
+        };
+        if machine == me.machine {
+            self.db().apply_receipt(machine, &receipt, now_ms())?;
+        } else {
+            self.db().queue_receipt(machine, &receipt)?;
+        }
+        self.notify();
+        Ok(())
+    }
+
+    // Sending.
+
+    pub fn send(
+        &self,
+        from: &str,
+        to: &str,
+        body: String,
+        reply_to: Option<String>,
+        expects_reply: bool,
+    ) -> Result<Sent> {
+        let me = self.me()?;
+        if !valid_name(from) {
+            bail!("{from:?} isn't a valid agent name: use lowercase letters, digits and hyphens");
+        }
+        if body.trim().is_empty() {
+            bail!("the message is empty");
+        }
+        if body.len() > MAX_BODY {
+            bail!(
+                "the message is {} KiB; the limit is {} KiB",
+                body.len().div_ceil(1024),
+                MAX_BODY / 1024
+            );
+        }
+        if let Some(r) = &reply_to
+            && !is_id(r)
+        {
+            bail!("{r:?} isn't a message ID");
+        }
+        let to = Address::parse(to, &me.machine)?;
+        let now = now_ms();
+        // Sending subscribes the sender, so replies have somewhere to go, and
+        // counts as it being active.
+        self.db().agent_live(from, None, now)?;
+        let msg = Message {
+            id: new_id(),
+            from: format!("{from}@{}", me.machine),
+            to: to.to_string(),
+            body,
+            reply_to,
+            expects_reply,
+            created_at: now,
+        };
+
+        let (state, warning) = if to.machine == me.machine {
+            let stored = self.db().store_incoming(&msg, &me.owner, now)?;
+            if stored == Stored::UnknownAgent {
+                bail!(
+                    "there's no agent {} on {}. peer_list shows the agents you can reach.",
+                    to.agent,
+                    me.machine
+                );
+            }
+            self.db().record_sent(&msg, SendState::Stored, now)?;
+            self.notify();
+            let warning = self
+                .agent_list()?
+                .agents
+                .into_iter()
+                .find(|a| a.name == to.agent)
+                .and_then(|a| staleness(&to.to_string(), a.live, a.last_live, now));
+            (SendState::Stored, warning)
+        } else {
+            let status = self.status()?;
+            let Some(peer) = status.peers.iter().find(|p| p.machine == to.machine) else {
+                bail!(
+                    "there's no machine named {} on this tailnet. peer_list shows the agents you can reach.",
+                    to.machine
+                );
+            };
+            let online = peer.online;
+            self.db().record_sent(&msg, SendState::Queued, now)?;
+            self.notify();
+            // Give the forwarder a moment, so the answer can say whether it
+            // got there.
+            let settled = if online {
+                self.wait_until(
+                    Instant::now() + Duration::from_secs(5),
+                    || {
+                        let sent = self.db().outgoing(&msg.id)?;
+                        Ok(sent.filter(|s| s.state != SendState::Queued))
+                    },
+                    || false,
+                )?
+            } else {
+                None
+            };
+            match settled {
+                Some(s) if s.state == SendState::Failed => {
+                    bail!("{}", s.error.unwrap_or_else(|| "not delivered".into()))
+                }
+                Some(s) => (s.state, lock(&self.notes).remove(&msg.id)),
+                None if !online => (
+                    SendState::Queued,
+                    Some(format!(
+                        "{} is offline; the message goes as soon as it's back",
+                        to.machine
+                    )),
+                ),
+                None => (
+                    SendState::Queued,
+                    Some(format!(
+                        "{} hasn't taken it yet; it's queued and will keep being retried",
+                        to.machine
+                    )),
+                ),
+            }
+        };
+        // A reply acknowledges the message it answers.
+        if let Some(r) = &msg.reply_to {
+            let acked = self.db().ack(from, r, now)?;
+            if let Acked::Now { sender } = acked {
+                self.receipt(&sender, r, SendState::Acknowledged)?;
+            }
+        }
+        self.event(format!(
+            "{} -> {}: {} ({})",
+            msg.from,
+            msg.to,
+            preview(&msg.body),
+            state.as_str()
+        ));
+        Ok(Sent {
+            id: msg.id,
+            to: msg.to,
+            state: state.as_str().into(),
+            warning,
+        })
+    }
+
+    /// Sends what's due in the outbox, and receipts owed to other machines.
+    pub fn forward_once(&self, http: &ureq::Agent) -> Result<()> {
+        let now = now_ms();
+        let port = self.cfg.port;
+        let due = self.db().due_sends(now, 10 * MAX_BATCH)?;
+        if !due.is_empty() {
+            let status = self.status()?;
+            let mut by_machine: HashMap<String, Vec<_>> = HashMap::new();
+            for d in due {
+                by_machine
+                    .entry(machine_part(&d.item.to).to_string())
+                    .or_default()
+                    .push(d);
+            }
+            for (machine, items) in by_machine {
+                let peer = status.peers.iter().find(|p| p.machine == machine);
+                let ip = match peer {
+                    None => {
+                        for d in &items {
+                            let why = format!("there's no machine named {machine} on this tailnet");
+                            self.db().set_send_state(
+                                &d.item.id,
+                                SendState::Failed,
+                                Some(&why),
+                                now,
+                            )?;
+                        }
+                        continue;
+                    }
+                    Some(p) => match p.ipv4 {
+                        Some(ip) if p.online => ip,
+                        _ => {
+                            for d in &items {
+                                let next = now + backoff(d.attempts);
+                                self.db().retry_send(
+                                    &d.item.id,
+                                    next,
+                                    &format!("{machine} is offline"),
+                                )?;
+                            }
+                            continue;
+                        }
+                    },
+                };
+                for chunk in items.chunks(MAX_BATCH) {
+                    let batch = MessageBatch {
+                        messages: chunk.iter().map(|d| d.item.clone()).collect(),
+                    };
+                    match net::post::<_, StoreResults>(http, ip, port, "/v1/messages", &batch) {
+                        Ok(res) => self.apply_results(chunk, res.results, now)?,
+                        Err(e) => {
+                            let why = format!("{machine}: {e:#}");
+                            for d in chunk {
+                                self.db().retry_send(
+                                    &d.item.id,
+                                    now + backoff(d.attempts),
+                                    &why,
+                                )?;
+                            }
+                            if chunk.iter().all(|d| d.attempts == 0) {
+                                self.event(format!("couldn't reach {why}; will retry"));
+                            }
+                        }
+                    }
+                }
+            }
+            self.notify();
+        }
+
+        let due = self.db().due_receipts(now, 10 * MAX_BATCH)?;
+        if !due.is_empty() {
+            let status = self.status()?;
+            let mut by_machine: HashMap<String, Vec<_>> = HashMap::new();
+            for d in due {
+                by_machine
+                    .entry(d.item.machine.clone())
+                    .or_default()
+                    .push(d);
+            }
+            for (machine, items) in by_machine {
+                let peer = status.peers.iter().find(|p| p.machine == machine);
+                let ip = match peer {
+                    None => {
+                        for d in &items {
+                            self.db().drop_receipt(d.item.seq)?;
+                        }
+                        continue;
+                    }
+                    Some(p) => match p.ipv4 {
+                        Some(ip) if p.online => ip,
+                        _ => {
+                            for d in &items {
+                                self.db()
+                                    .retry_receipt(d.item.seq, now + backoff(d.attempts))?;
+                            }
+                            continue;
+                        }
+                    },
+                };
+                for chunk in items.chunks(MAX_BATCH) {
+                    let batch = ReceiptBatch {
+                        receipts: chunk.iter().map(|d| d.item.receipt.clone()).collect(),
+                    };
+                    let sent =
+                        net::post::<_, serde_json::Value>(http, ip, port, "/v1/receipts", &batch);
+                    for d in chunk {
+                        match &sent {
+                            Ok(_) => self.db().drop_receipt(d.item.seq)?,
+                            Err(_) => self
+                                .db()
+                                .retry_receipt(d.item.seq, now + backoff(d.attempts))?,
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_results(
+        &self,
+        sent: &[crate::store::Due<Message>],
+        results: Vec<StoreResult>,
+        now: i64,
+    ) -> Result<()> {
+        let by_id: HashMap<&str, &StoreResult> =
+            results.iter().map(|r| (r.id.as_str(), r)).collect();
+        for d in sent {
+            let msg = &d.item;
+            match by_id.get(msg.id.as_str()) {
+                Some(r) if r.status == StoreStatus::Stored => {
+                    self.db()
+                        .set_send_state(&msg.id, SendState::Stored, None, now)?;
+                    if let Some(w) = staleness(&msg.to, r.live.unwrap_or(true), r.last_live, now) {
+                        lock(&self.notes).insert(msg.id.clone(), w);
+                    }
+                }
+                Some(r) => {
+                    let why = r.error.clone().unwrap_or_else(|| format!("{:?}", r.status));
+                    self.db()
+                        .set_send_state(&msg.id, SendState::Failed, Some(&why), now)?;
+                    self.event(format!("{} -> {}: failed: {why}", msg.from, msg.to));
+                }
+                None => {
+                    self.db()
+                        .retry_send(&msg.id, now + backoff(d.attempts), "no answer for it")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Arriving from other machines.
+
+    pub fn accept(&self, who: &Whois, batch: MessageBatch) -> Result<StoreResults> {
+        let me = self.me()?;
+        let now = now_ms();
+        let agents = self.agent_list()?.agents;
+        let mut results = Vec::new();
+        let mut arrived = Vec::new();
+        for mut msg in batch.messages.into_iter().take(MAX_BATCH) {
+            let mut result = StoreResult {
+                id: msg.id.clone(),
+                status: StoreStatus::Rejected,
+                error: None,
+                live: None,
+                last_live: None,
+            };
+            let to = Address::parse(&msg.to, &me.machine);
+            let from = name_part(&msg.from).to_string();
+            let problem = match &to {
+                _ if !is_id(&msg.id) => Some("bad message ID".to_string()),
+                Err(e) => Some(format!("{e:#}")),
+                Ok(to) if to.machine != me.machine => {
+                    Some(format!("this is {}, not {}", me.machine, to.machine))
+                }
+                _ if !valid_name(&from) => Some(format!("{from:?} isn't a valid agent name")),
+                _ if msg.body.len() > MAX_BODY => Some("the message is over 64 KiB".into()),
+                _ if msg.reply_to.as_deref().is_some_and(|r| !is_id(r)) => {
+                    Some("bad reply_to ID".into())
+                }
+                _ => None,
+            };
+            if let Some(problem) = problem {
+                result.error = Some(problem);
+                results.push(result);
+                continue;
+            }
+            let to = to.expect("checked above");
+            // The sending machine is whoever Tailscale says it is.
+            msg.from = format!("{from}@{}", who.machine);
+            msg.to = to.to_string();
+            let stored = self.db().store_incoming(&msg, &who.owner, now)?;
+            match stored {
+                Stored::UnknownAgent => {
+                    result.status = StoreStatus::UnknownAgent;
+                    result.error = Some(format!(
+                        "there's no agent {} on {}. peer_list shows the agents you can reach.",
+                        to.agent, me.machine
+                    ));
+                }
+                Stored::New | Stored::Duplicate => {
+                    result.status = StoreStatus::Stored;
+                    if let Some(a) = agents.iter().find(|a| a.name == to.agent) {
+                        result.live = Some(a.live);
+                        result.last_live = a.last_live;
+                    }
+                    if stored == Stored::New {
+                        arrived.push(msg);
+                    }
+                }
+            }
+            results.push(result);
+        }
+        if !arrived.is_empty() {
+            self.notify();
+            for msg in arrived {
+                self.event(format!(
+                    "{} -> {}: stored {}",
+                    msg.from,
+                    msg.to,
+                    preview(&msg.body)
+                ));
+            }
+        }
+        Ok(StoreResults { results })
+    }
+
+    pub fn accept_receipts(&self, who: &Whois, batch: ReceiptBatch) -> Result<()> {
+        let now = now_ms();
+        for receipt in batch.receipts.iter().take(MAX_BATCH) {
+            let applied = self.db().apply_receipt(&who.machine, receipt, now)?;
+            if applied {
+                self.event(format!(
+                    "{}: {} {}",
+                    who.machine,
+                    receipt.state.as_str(),
+                    receipt.id
+                ));
+            }
+        }
+        self.notify();
+        Ok(())
+    }
+
+    // Listings.
+
+    pub fn agent_list(&self) -> Result<AgentList> {
+        let me = self.me()?;
+        let rows = self.db().agents()?;
+        let live = lock(&self.live);
+        let now = now_ms();
+        Ok(AgentList {
+            machine: me.machine,
+            agents: rows
+                .into_iter()
+                .map(|r| {
+                    let is_live = Bus::is_live(&live, &r.name);
+                    let app = live
+                        .holders
+                        .get(&r.name)
+                        .and_then(|h| h.app.clone())
+                        .or(r.app);
+                    AgentInfo {
+                        live: is_live,
+                        app,
+                        last_live: if is_live { Some(now) } else { r.last_live },
+                        name: r.name,
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    pub fn inbox(&self, agent: &str) -> Result<Inbox> {
+        let me = self.me()?;
+        let db = self.db();
+        Ok(Inbox {
+            machine: me.machine,
+            incoming: db
+                .open_incoming(agent)?
+                .into_iter()
+                .map(Item::from)
+                .collect(),
+            outgoing: db
+                .open_outgoing(agent, now_ms() - DAY_MS)?
+                .into_iter()
+                .map(Item::from)
+                .collect(),
+        })
+    }
+
+    pub fn thread(&self, id: &str) -> Result<Vec<Item>> {
+        let entries = self.db().thread(id)?;
+        if entries.is_empty() {
+            bail!("this machine has no message {id}");
+        }
+        Ok(entries
+            .into_iter()
+            .map(|e| match e {
+                crate::store::ThreadEntry::In(m) => Item::from(m),
+                crate::store::ThreadEntry::Out(m) => Item::from(m),
+            })
+            .collect())
+    }
+
+    /// Agents on this machine and on every online peer whose bus answers.
+    pub fn peers(&self) -> Result<Peers> {
+        let here = self.agent_list()?;
+        let status = self.status()?;
+        let port = self.cfg.port;
+        let asks: Vec<_> = status
+            .peers
+            .iter()
+            .filter(|p| p.online)
+            .filter_map(|p| p.ipv4.map(|ip| (p.machine.clone(), ip)))
+            .map(|(machine, ip)| thread::spawn(move || (machine, net::get_agents(ip, port))))
+            .collect();
+        let mut machines: Vec<PeerMachine> = asks
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .map(|(machine, got)| match got {
+                Ok(list) => PeerMachine {
+                    machine,
+                    online: true,
+                    agents: Some(list),
+                    error: None,
+                },
+                Err(e) => PeerMachine {
+                    machine,
+                    online: true,
+                    agents: None,
+                    error: Some(format!("{e:#}")),
+                },
+            })
+            .collect();
+        machines.extend(
+            status
+                .peers
+                .iter()
+                .filter(|p| !p.online)
+                .map(|p| PeerMachine {
+                    machine: p.machine.clone(),
+                    online: false,
+                    agents: None,
+                    error: None,
+                }),
+        );
+        machines.sort_by(|a, b| a.machine.cmp(&b.machine));
+        Ok(Peers { here, machines })
+    }
+
+    pub fn prune(&self) {
+        let before = now_ms() - i64::from(self.cfg.retention_days) * DAY_MS;
+        match self.db().prune(before) {
+            Ok(0) => {}
+            Ok(n) => self.event(format!("pruned {n} finished messages")),
+            Err(e) => self.event(format!("pruning failed: {e:#}")),
+        }
+    }
+}
+
+/// A warning for a message to an agent that hasn't had a session lately,
+/// which usually means a misaddress.
+fn staleness(addr: &str, live: bool, last_live: Option<i64>, now: i64) -> Option<String> {
+    if live {
+        return None;
+    }
+    match last_live {
+        None => Some(format!(
+            "{addr} hasn't had a session yet. It's queued for when one starts; check the address if that's unexpected."
+        )),
+        Some(t) if now - t > 7 * DAY_MS => Some(format!(
+            "{addr} hasn't had a session in {} days, so check the address.",
+            (now - t) / DAY_MS
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backs_off_to_a_minute() {
+        assert_eq!(backoff(0), 1000);
+        assert_eq!(backoff(3), 8000);
+        assert_eq!(backoff(40), 60_000);
+    }
+
+    #[test]
+    fn warns_about_agents_without_recent_sessions() {
+        let now = 100 * DAY_MS;
+        assert!(staleness("a@b", true, None, now).is_none());
+        assert!(staleness("a@b", false, Some(now - DAY_MS), now).is_none());
+        assert!(
+            staleness("a@b", false, Some(now - 9 * DAY_MS), now)
+                .unwrap()
+                .contains("9 days")
+        );
+        assert!(staleness("a@b", false, None, now).is_some());
+    }
+
+    #[test]
+    fn previews_the_first_line() {
+        assert_eq!(preview("hello"), "hello");
+        assert_eq!(preview("hello\nworld"), "hello…");
+    }
+}
