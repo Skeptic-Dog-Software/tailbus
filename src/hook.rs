@@ -42,6 +42,13 @@ fn in_claude_code() -> bool {
     env::var("CLAUDECODE").is_ok_and(|v| v == "1")
 }
 
+/// `claude -p` waits for a running `asyncRewake` hook instead of exiting,
+/// so the wait stands down in sessions nobody is attending. Claude Code sets
+/// this to 0 for `-p` runs and 1 for interactive sessions.
+fn unattended() -> bool {
+    env::var("CLAUDE_CODE_SESSION_ATTENDED").is_ok_and(|v| v == "0")
+}
+
 fn agent_for(explicit: Option<String>, input: &Input) -> String {
     explicit.unwrap_or_else(|| {
         let dir = env::var_os("CLAUDE_PROJECT_DIR")
@@ -97,7 +104,7 @@ pub fn session_start(socket: &Path, explicit: Option<String>) -> Result<ExitCode
 /// The background wait: exits 2 with the messages when some arrive, or 0
 /// when a newer wait replaces this one.
 pub fn wait(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
-    if !in_claude_code() {
+    if !in_claude_code() || unattended() {
         return Ok(ExitCode::SUCCESS);
     }
     let input = input();
