@@ -1,6 +1,6 @@
 # tailbus: agent-to-agent messaging over a tailnet
 
-Status: draft for discussion.
+Status: phase 1 built and tested; phases 2 to 4 are plans.
 
 ## Goal
 
@@ -426,15 +426,25 @@ at a terminal.
 
 ## Risks and things to verify before building
 
-- **Claude Code hook-based push** isn't how that hook is meant to be used.
-  Verify before relying on it:
-  - that a long `timeout` is honored;
-  - that a hook armed at session start and after each turn re-arms
-    reliably;
-  - that one waiting hook per agent is enough.
-- **Claude Code details:**
-  - its MCP tool-call timeout for a long `msg_wait`;
-  - that hooks see `CLAUDECODE`, as its shell commands do.
+- **Claude Code hook-based push.** Tested on Claude Code 2.1.309 (phase 1).
+  - Works: a hook armed at session start and after every turn wakes an
+    idle session, and doesn't hold up the session's start. Claude Code
+    shows the message as "Stop hook feedback".
+  - `claude -p` waits for a running `asyncRewake` hook instead of exiting,
+    so the hook stands down when `CLAUDE_CODE_SESSION_ATTENDED` is `0`.
+    That variable isn't documented; if it changes, headless runs with the
+    plugin hang.
+  - Killing Claude Code leaves the hook running. It watches its parent and
+    exits once Claude Code is gone, so it can't take messages for a dead
+    session.
+  - Still open: whether Claude Code honors the hook's 7-day timeout. After
+    it passes, an idle session isn't woken until its next turn.
+- **macOS:**
+  - Under launchd, the Tailscale app's binary acts as the CLI only when a
+    shell starts it, so the daemon runs it through `/bin/sh`.
+  - Overwriting a running or ad-hoc-signed binary in place gets it killed
+    on its next start. Upgrades replace it by rename, as `cargo install`
+    does.
 - **Codex push** rests on `codex queue`, whose server method is marked
   experimental. Verify on the installed version that it wakes an idle
   session, and keep the Stop hook as the fallback. Also verify that a
@@ -464,6 +474,10 @@ at a terminal.
   tailnet `example` and both running Claude Code 2.1.309. A Claude Code
   session on each end sends a message, gets a reply, and gets woken while
   idle.
+  - **Passed on 2026-10-23.** An idle session on `server` was woken by
+    a question from this Mac and answered with `msg_send`. The idle session
+    here was woken by the answer, then acknowledged it. Each hop took a few
+    seconds.
 - **Not installed yet:** neither machine has Codex or Grok Build. Phase 2
   needs at least one of them installed and signed in on at least one
   machine; over ssh, `codex login --device-auth` and

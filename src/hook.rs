@@ -111,6 +111,17 @@ pub fn wait(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
     let agent = agent_for(explicit, &input);
     let session = session_of(&input);
     let client_pid = std::os::unix::process::parent_id();
+    let orphaned = move || std::os::unix::process::parent_id() != client_pid;
+    // Claude Code doesn't stop this hook when it's killed, and an orphaned
+    // wait would take messages for a session that's gone.
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            if orphaned() {
+                std::process::exit(0);
+            }
+        }
+    });
     loop {
         // A daemon that's down or restarting just means waiting longer;
         // Claude Code's timeout for the hook ends it eventually.
@@ -125,6 +136,9 @@ pub fn wait(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
         });
         match woken {
             Ok(Woken::Messages { messages }) => {
+                if orphaned() {
+                    return Ok(ExitCode::SUCCESS);
+                }
                 eprint!("{}", format::messages_for_agent(&messages, Tools::Mcp));
                 let _ = client.call::<serde_json::Value>(&Request::Confirm);
                 return Ok(ExitCode::from(REWAKE));
