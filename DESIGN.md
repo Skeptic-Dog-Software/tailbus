@@ -589,6 +589,84 @@ Next, for permission alerts:
 5. **Tests:** unit tests, then real sessions on both Macs, with alerts
    answering themselves.
 
+## /pipe: handing a task to another agent
+
+Designed 2026-10-26, to build after permission alerts. You run
+`/pipe <agent@machine> <task>` in a Claude Code session. The agent you name
+does the work, checks it with ACR, and sends back a detailed result. Your
+own session's agent presents that result to you, with its own reading of
+it.
+
+1. **Only to a live agent.** If the agent you name has no live session,
+   `/pipe` refuses, says so, and lists the agents that are live.
+2. **Clarifying questions, every time.** Before it starts, the remote agent
+   always sends its questions as structured choices. Your agent shows them
+   to you as a question carousel, and your answers go back. Your agent
+   never answers them for you. The first carousel always includes the ACR
+   dimensions the remote agent proposes for the task, to keep, drop or add
+   to.
+3. **The work, then ACR,** on the remote machine (see
+   [ACR](#acr-adversarial-convergence-review)).
+4. **The result comes back** as one response: what was done or found, the
+   ACR report for each dimension, and the record of where reviewers
+   disagreed. It stays in both machines' buses, so `tailbus thread <id>`
+   shows it from either Mac for the usual 30 days.
+5. **Your agent presents it** in two clearly marked parts:
+   - the remote agent's result, as it came;
+   - its own interpretation, labeled as such: warnings, what it agrees or
+     disagrees with, and what it can't rule on for lack of context.
+6. **Follow-ups.** Your agent can ask the remote agent for clarifying
+   context, as ordinary requests in the same thread.
+
+**The handoff limit.** A pipe sends several messages each way. A message
+sent from a turn you started, or right after you answered a carousel, is
+marked by the sending bus as sent with you in the loop, and the receiving
+bus doesn't count it as a handoff. Agents left to themselves still pause
+at 6. The mark comes from the bus, not the agent, so an agent can't claim
+it.
+
+**Permission prompts** the remote agent hits go to the alerts on your
+Macs, which is why alerts come first. They never go through either agent,
+so neither can approve one for you.
+
+### ACR: adversarial convergence review
+
+Baked into the plugin as an `acr` skill, written from Ray Karnes's essay
+"The Adversarial Agent Fleet: Trust, but Verify" (24 May 2026). Medium
+turns fetchers away, so the text came from the author's RSS feed,
+`https://medium.com/feed/@ray.karnes`. The essay doesn't use the name ACR.
+The name, the dimensions and the rounds come from the review process the
+user runs on their repos, which follows the essay.
+
+- **Why:** an agent pursues the framing it's handed to a confident
+  conclusion, and its confidence is the same whether the framing was sound
+  or not. Asking it to check itself mostly ratifies what it concluded. So
+  the opposition comes from outside it, by structure.
+- **Build, then attack.** The agent that did the work builds the strongest
+  version of its result. Separate reviewers then attack it.
+- **Clean context.** Each reviewer is a fresh agent that sees the result
+  and the dimension's criteria, never the builder's reasoning or earlier
+  rebuttals. Whoever builds or synthesizes may know everything; whoever
+  attacks starts clean.
+- **The verb is "find what is wrong",** never "check this", which invites
+  ratification.
+- **Dimensions.** One reviewer per dimension, each with its own role and
+  criteria. The remote agent proposes the dimensions and you confirm them.
+- **Synthesize, then attack again.** The builder folds the hits into a
+  stronger version, and a fresh clean reviewer attacks that. A dimension is
+  confirmed when its latest round has zero blockers.
+- **Up to 3 rounds.** If a dimension still has blockers after 3 rounds,
+  the remote agent sends you a carousel: one verify-only round, where only
+  earlier findings can block; waive that dimension; or stop.
+- **Disagreement is output, not noise.** When reviewers split, or a
+  finding is arguable rather than obvious, it's a values call for you. The
+  result records the finding, the split, and that it's yours to decide.
+- **Reviewers:** at most 5 running at once, each on a model at least as
+  capable as the agent running the pipe (Opus today), at xhigh effort. Any
+  report others may read labels reviewers as AI agents in roles.
+- **Don't overclaim.** The report says only what each review actually
+  covered.
+
 ## Security model
 
 - **Transport:** WireGuard (Tailscale) between machines, and a Unix socket
@@ -620,6 +698,8 @@ Next, for permission alerts:
    an alert on any of your Macs, the request and response wrappers, and the
    handoff limit (see
    [Permissions and conversation limits](#permissions-and-conversation-limits)).
+   Then `/pipe`, which hands a whole task to an agent on another machine
+   (see [/pipe](#pipe-handing-a-task-to-another-agent)).
 3. **Codex and Grok:**
    - `tailbus setup codex` and `tailbus setup grok`, with push through
      `codex queue`, and through Grok Build's monitor and Stop hook.
