@@ -629,6 +629,40 @@ it.
 Macs, which is why alerts come first. They never go through either agent,
 so neither can approve one for you.
 
+### Hub and workers
+
+The use case: the user's Max plan is the **hub** account, and real work
+for a client is done by that client's **worker**, a Claude Code session
+billed to the client's API key. Today that's `work@server`, for
+Acme. The worker does everything that costs tokens: the work, and
+ACR's reviewers. The hub sends the task, shows you the carousels, and
+presents the result with its own labeled interpretation.
+
+- **Tagging a worker.** Either start its session with
+  `TAILBUS_CLIENT=acme`, or map the agent to the client in its
+  machine's config, for example `[clients]` with `work = "acme"`.
+- **Checking the tag.** When a tagged session starts, its MCP server runs
+  `claude auth status` in the session's own environment. The bus accepts
+  the tag only if `authMethod` says the session is billed to an API key:
+  `api_key`, `api_key_helper`, or `third_party` (Bedrock, Vertex or
+  Foundry). A session on `claude.ai` or `oauth_token` is on a subscription,
+  so the bus refuses the tag and says why. Nothing reads the key itself.
+- **Finding workers.** `peer_list` shows each worker's client and how it's
+  billed. `/pipe acme <task>` finds a live worker by client name.
+- **The hub guard.** Hub sessions are told which clients have workers.
+  When you ask a hub session directly for work that's clearly a client's,
+  it stops and offers to send it with `/pipe` instead of doing it on the
+  Max plan.
+- **Workers don't hand work back.** A worker's wrapper tells it to do the
+  task where it is, and send the hub only questions and results.
+
+Verified on Claude Code 2.1.310: `claude auth status` prints JSON with
+`authMethod` (`none`, `claude.ai`, `oauth_token`, `api_key`,
+`api_key_helper` or `third_party`) and, on a subscription,
+`subscriptionType`. This Mac reports `claude.ai` and `max`. Still to check
+on the worker: that inside a session that was offered an
+`ANTHROPIC_API_KEY` and declined it, the command reports the subscription.
+
 ### ACR: adversarial convergence review
 
 Baked into the plugin as an `acr` skill, written from Ray Karnes's essay
