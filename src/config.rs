@@ -99,10 +99,15 @@ pub struct Config {
     /// stops handing it more.
     #[serde(default = "default_handoff_limit")]
     pub handoff_limit: u32,
-    /// Whether this Mac shows tailbus's dialogs, such as when a session is
-    /// paused.
+    /// Whether this Mac shows tailbus's dialogs: permission prompts and
+    /// paused sessions, from any of the user's machines.
     #[serde(default = "default_alerts")]
     pub alerts: bool,
+    /// How long a permission prompt in a turn the user started waits at its
+    /// own terminal before going out as an alert. Prompts in turns another
+    /// agent's message started go out at once.
+    #[serde(default = "default_ask_after")]
+    pub ask_after_secs: u64,
 }
 
 fn default_port() -> u16 {
@@ -119,6 +124,10 @@ fn default_handoff_limit() -> u32 {
 
 fn default_alerts() -> bool {
     true
+}
+
+fn default_ask_after() -> u64 {
+    60
 }
 
 impl Config {
@@ -145,6 +154,7 @@ mod tests {
         assert!(cfg.allow.is_empty());
         assert_eq!(cfg.handoff_limit, 6);
         assert!(cfg.alerts);
+        assert_eq!(cfg.ask_after_secs, 60);
 
         let cfg: Config = toml::from_str("port = 5000\nallow = [\"a@b.com\"]").unwrap();
         assert_eq!(cfg.port, 5000);

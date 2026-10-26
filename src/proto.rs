@@ -150,3 +150,29 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_live: Option<i64>,
 }
+
+/// `POST /v1/asks`: show the user a dialog for another of their machines.
+/// The answer goes back with `nonce`, which only the asking bus knows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskShow {
+    pub id: String,
+    pub nonce: String,
+    pub title: String,
+    pub text: String,
+    /// Left to right; the first is the "no" button.
+    pub buttons: Vec<String>,
+}
+
+/// `POST /v1/answers`: which button the user clicked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskAnswer {
+    pub id: String,
+    pub nonce: String,
+    pub choice: usize,
+}
+
+/// `POST /v1/asks/close`: the ask was answered elsewhere, or withdrawn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskClose {
+    pub id: String,
+}

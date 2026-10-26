@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::ask;
 use crate::bus::{Bus, Handoff, Waited};
 use crate::config::{Config, Paths};
 use crate::local::{
-    self, AgentStatus, Events, Held, Hello, Item, Messages, Request, Status, Thread, Woken,
+    self, AgentStatus, Events, Held, Hello, Item, Messages, Request, Status, Thread, Verdict, Woken,
 };
 use crate::net;
+use crate::permission;
 use crate::proto::MAX_BATCH;
 use crate::store::{Incoming, Store};
 use crate::util::{now_ms, valid_name};
@@ -27,6 +29,9 @@ use crate::util::{now_ms, valid_name};
 const CONFIRM_WITHIN: Duration = Duration::from_secs(30);
 /// The longest `recv --wait`.
 const MAX_WAIT: u64 = 3600;
+/// The longest a permission prompt waits for an alert's answer: the
+/// permission hook's own timeout.
+const MAX_PERMISSION_WAIT: Duration = Duration::from_secs(86_400);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn run(paths: &Paths) -> Result<()> {
@@ -290,11 +295,11 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             let how = if session == "cli" {
                 Handoff::Free
             } else {
-                Handoff::Counted
+                Handoff::Tool
             };
             let paused = || match how {
-                Handoff::Counted => bus.paused(&agent),
                 Handoff::Free => None,
+                _ => bus.paused(&agent),
             };
             let mut note = paused();
             let found = if note.is_some() {
@@ -348,7 +353,7 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
                     let reply = Woken::Messages {
                         messages: items(&found),
                     };
-                    conn.hand_over(bus, &agent, &session, reply, &found, Handoff::Counted)
+                    conn.hand_over(bus, &agent, &session, reply, &found, Handoff::Wake)
                 }
                 Ok(Some(Waited::Replaced)) => Ok(conn.write(&Woken::Replaced)?),
                 Ok(None) => Ok(()),
@@ -380,6 +385,35 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
                 paused: None,
             };
             conn.hand_over(bus, &agent, &session, reply, &found, Handoff::Free)?;
+        }
+        Request::Permission {
+            agent,
+            session: _,
+            tool,
+            input,
+            cwd,
+            suggestions,
+            unattended,
+        } => {
+            check_name(&agent)?;
+            let key = serde_json::to_string(&input)?;
+            let id = bus.perm_open(&agent, &tool, &key);
+            let asked = Asked {
+                agent: &agent,
+                tool: &tool,
+                input: &input,
+                cwd: &cwd,
+                suggestions: &suggestions,
+                unattended,
+            };
+            let verdict = permission(bus, conn, &id, &asked);
+            bus.perm_close(&id);
+            conn.write(&Verdict { output: verdict? })?;
+        }
+        Request::ToolDone { agent, tool, input } => {
+            check_name(&agent)?;
+            bus.tool_done(&agent, &tool, &serde_json::to_string(&input)?);
+            conn.write(&serde_json::json!({}))?;
         }
         Request::Confirm => bail!("there's nothing to confirm"),
         Request::Ack { agent, id } => {
@@ -423,6 +457,94 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
         }
     }
     Ok(())
+}
+
+struct Asked<'a> {
+    agent: &'a str,
+    tool: &'a str,
+    input: &'a serde_json::Value,
+    cwd: &'a str,
+    suggestions: &'a serde_json::Value,
+    unattended: bool,
+}
+
+/// Holds a permission prompt until the user answers it, on a Mac or at the
+/// terminal. Returns what the hook prints, if the answer came from an
+/// alert.
+fn permission(
+    bus: &Bus,
+    conn: &Conn,
+    id: &str,
+    asked: &Asked,
+) -> Result<Option<serde_json::Value>> {
+    let agent = asked.agent;
+    let woken_by = bus.woken_by(agent);
+    // In a turn the user started, they're likely at the terminal: give
+    // them a while to answer there first.
+    if !asked.unattended && woken_by.is_none() {
+        let wait = Duration::from_secs(bus.cfg.ask_after_secs);
+        bus.wait_until(
+            Instant::now() + wait,
+            || Ok(bus.perm_done(id).then_some(())),
+            || conn.gone(),
+        )?;
+        if bus.perm_done(id) || conn.gone() {
+            return Ok(None);
+        }
+    }
+    let me = bus.me()?;
+    let rules = permission::session_rules(asked.tool, asked.input, asked.suggestions);
+    let prompt = permission::prompt(&permission::Request {
+        agent: &format!("{agent}@{}", me.machine),
+        tool: asked.tool,
+        input: asked.input,
+        cwd: asked.cwd,
+        woken_by: woken_by.as_deref(),
+        rules: &rules,
+    });
+    let (ask_id, shown) = ask::ask(bus, prompt)?;
+    if shown == 0 {
+        ask::close(bus, &ask_id);
+        bus.event(format!(
+            "{agent}: no Mac could show the permission alert for {}",
+            asked.tool
+        ));
+        return Ok(None);
+    }
+    bus.event(format!(
+        "{agent}: asking you, on {shown} Mac(s), to allow {}",
+        asked.tool
+    ));
+    let answer = bus.wait_until(
+        Instant::now() + MAX_PERMISSION_WAIT,
+        || {
+            if bus.perm_done(id) {
+                return Ok(Some(None));
+            }
+            Ok(ask::answer(bus, &ask_id).map(Some))
+        },
+        || conn.gone(),
+    )?;
+    ask::close(bus, &ask_id);
+    let Some(Some(answer)) = answer else {
+        return Ok(None);
+    };
+    let word = match answer.choice {
+        permission::ALLOW => "allowed",
+        permission::ALLOW_FOR_SESSION => "allowed for the session",
+        permission::DENY => "denied",
+        // The dialog's buttons are the ones above; anything else is a deny.
+        _ => "denied",
+    };
+    bus.event(format!(
+        "{agent}: you {word} {}, from {}",
+        asked.tool, answer.machine
+    ));
+    Ok(Some(permission::decision(
+        answer.choice,
+        &answer.machine,
+        &rules,
+    )))
 }
 
 fn status(bus: &Bus) -> Result<Status> {

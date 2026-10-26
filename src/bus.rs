@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::alert::{self, Dialog};
+use crate::alert;
+use crate::ask::{self, Asks, Prompt};
 use crate::config::Config;
 use crate::local::{Event, Inbox, Item, PeerMachine, Peers, Sent};
 use crate::net;
@@ -51,6 +52,8 @@ pub struct Bus {
     notes: Mutex<HashMap<String, String>>,
     /// The tailnet address the bus listens on, or why it isn't listening.
     pub listening: Mutex<Result<SocketAddr, String>>,
+    /// Dialogs out to the user's Macs, and shown here for theirs.
+    pub asks: Asks,
 }
 
 #[derive(Default)]
@@ -69,6 +72,10 @@ struct Live {
     in_flight: HashSet<String>,
     /// Each agent's handoffs since its user last typed in its session.
     runs: HashMap<String, Run>,
+    /// How each agent's current turn started.
+    turns: HashMap<String, Turn>,
+    /// Permission prompts the agents' hooks are holding, by ID.
+    perms: HashMap<String, Perm>,
 }
 
 /// Handoffs to an agent's sessions in a row, without its user typing.
@@ -77,15 +84,36 @@ struct Run {
     handoffs: u32,
     /// Set at the limit, until the user types or lets it continue.
     paused: bool,
-    /// The dialog that says so, while it's up.
-    dialog: Option<Arc<Dialog>>,
+    /// The ask that says so, while it's out.
+    ask: Option<String>,
+}
+
+#[derive(Default)]
+struct Turn {
+    /// The wait hook woke the session with a message from this agent, and
+    /// the turn that starts hasn't begun yet.
+    woke: Option<String>,
+    /// The current turn was started by a message from this agent.
+    by: Option<String>,
+}
+
+/// A permission prompt, until it's answered or withdrawn.
+struct Perm {
+    agent: String,
+    tool: String,
+    /// The tool's input, as JSON.
+    input: String,
+    /// Answered at the terminal, or the session moved on.
+    done: bool,
 }
 
 /// How messages reached a session, for the handoff limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handoff {
-    /// By a wake, `msg_recv` or `msg_wait`: counts toward the limit.
-    Counted,
+    /// By the wait hook, waking the session: counts toward the limit.
+    Wake,
+    /// By `msg_recv` or `msg_wait`: counts too.
+    Tool,
     /// With a prompt the user typed, or to the CLI: doesn't.
     Free,
 }
@@ -142,7 +170,13 @@ impl Bus {
             whois: Mutex::new(HashMap::new()),
             notes: Mutex::new(HashMap::new()),
             listening: Mutex::new(Err("starting".into())),
+            asks: Asks::default(),
         })
+    }
+
+    /// This bus, for work that outlives a call.
+    pub fn arc(&self) -> Option<Arc<Bus>> {
+        self.this.upgrade()
     }
 
     pub fn db(&self) -> MutexGuard<'_, Store> {
@@ -227,7 +261,7 @@ impl Bus {
 
     // Waiting and events.
 
-    fn notify(&self) {
+    pub fn notify(&self) {
         lock(&self.live).generation += 1;
         self.changed.notify_all();
     }
@@ -521,7 +555,15 @@ impl Bus {
                 preview(&msg.body)
             ));
         }
-        if how == Handoff::Counted
+        if how == Handoff::Wake {
+            let from = found.iter().find(|m| m.wakes).map(|m| m.msg.from.clone());
+            lock(&self.live)
+                .turns
+                .entry(agent.to_string())
+                .or_default()
+                .woke = from;
+        }
+        if how != Handoff::Free
             && let Some(last) = found.last()
         {
             self.count_handoff(agent, &last.msg);
@@ -563,32 +605,33 @@ impl Bus {
         self.show_pause(agent, latest, limit);
     }
 
-    /// Tells the user, in a dialog on this Mac, that `agent` is paused.
+    /// Tells the user, in a dialog on each of their Macs, that `agent` is
+    /// paused, and lets it continue if they say so.
     fn show_pause(&self, agent: &str, latest: &Message, limit: u32) {
-        if !self.cfg.alerts {
-            return;
-        }
-        let Some(bus) = self.this.upgrade() else {
+        let Some(bus) = self.arc() else {
             return;
         };
         let machine = self.me().map(|m| m.machine).unwrap_or_default();
-        let text = format!(
-            "{agent}@{machine} has been handed messages from other agents {limit} times in a \
-             row without you typing in its session. The latest is from {}:\n\n{}\n\n\
-             New messages to it wait until you type in that session, or let them continue.",
-            latest.from,
-            alert::clean(&latest.body, 400)
-        );
+        let prompt = Prompt {
+            title: "tailbus: agents paused".into(),
+            text: format!(
+                "{agent}@{machine} has been handed messages from other agents {limit} times in \
+                 a row without you typing in its session. The latest is from {}:\n\n{}\n\n\
+                 New messages to it wait until you type in that session, or let them continue.",
+                latest.from,
+                alert::clean(&latest.body, 400)
+            ),
+            buttons: vec!["Keep waiting".into(), "Let them continue".into()],
+        };
         let agent = agent.to_string();
         thread::spawn(move || {
-            let dialog = match Dialog::show(
-                "tailbus: agents paused",
-                &text,
-                "Keep waiting",
-                "Let them continue",
-                PAUSE_DIALOG,
-            ) {
-                Ok(d) => Arc::new(d),
+            let id = match ask::ask(&bus, prompt) {
+                Ok((id, 0)) => {
+                    bus.event(format!("{agent}: no Mac could show the pause dialog"));
+                    ask::close(&bus, &id);
+                    return;
+                }
+                Ok((id, _)) => id,
                 Err(e) => {
                     bus.event(format!("couldn't show the pause dialog: {e:#}"));
                     return;
@@ -597,17 +640,37 @@ impl Bus {
             {
                 let mut live = lock(&bus.live);
                 match live.runs.get_mut(&agent) {
-                    Some(run) if run.paused => run.dialog = Some(dialog.clone()),
-                    // Resumed while the dialog was opening.
+                    Some(run) if run.paused => run.ask = Some(id.clone()),
+                    // Resumed while the dialogs were opening.
                     _ => {
                         drop(live);
-                        dialog.close();
+                        ask::close(&bus, &id);
                         return;
                     }
                 }
             }
-            if dialog.answer() == Some(true) {
-                bus.resume(&agent, "you let it continue");
+            let got = bus.wait_until(
+                Instant::now() + PAUSE_DIALOG,
+                || {
+                    if let Some(answer) = ask::answer(&bus, &id) {
+                        return Ok(Some(Some(answer)));
+                    }
+                    let out = lock(&bus.live)
+                        .runs
+                        .get(&agent)
+                        .is_some_and(|r| r.ask.as_deref() == Some(id.as_str()));
+                    Ok((!out).then_some(None))
+                },
+                || false,
+            );
+            ask::close(&bus, &id);
+            if let Ok(Some(Some(answer))) = got
+                && answer.choice == 1
+            {
+                bus.resume(
+                    &agent,
+                    &format!("you let it continue, from {}", answer.machine),
+                );
             }
         });
     }
@@ -619,8 +682,8 @@ impl Bus {
             return;
         };
         drop(live);
-        if let Some(dialog) = &run.dialog {
-            dialog.close();
+        if let Some(id) = &run.ask {
+            ask::close(self, id);
         }
         if run.paused {
             self.event(format!("{agent}: resumed, as {why}"));
@@ -643,17 +706,101 @@ impl Bus {
         if typed {
             self.resume(agent, "its user typed in its session");
         }
+        {
+            let mut live = lock(&self.live);
+            let turn = live.turns.entry(agent.to_string()).or_default();
+            turn.by = if typed { None } else { turn.woke.take() };
+            if typed {
+                turn.woke = None;
+            }
+        }
+        // Whatever the session was asking permission for is settled.
+        self.perms_done(agent);
         Some(session)
     }
 
     /// A turn of `agent`'s ended: the responses and notices it was handed
     /// are handled now.
     pub fn turn_ended(&self, agent: &str) -> Result<()> {
+        if let Some(turn) = lock(&self.live).turns.get_mut(agent) {
+            turn.by = None;
+        }
+        self.perms_done(agent);
         let acked = self.db().ack_responses(agent, now_ms())?;
         for (id, sender) in acked {
             self.receipt(&sender, &id, SendState::Acknowledged)?;
         }
         Ok(())
+    }
+
+    /// The agent whose message started `agent`'s current turn, if one did.
+    pub fn woken_by(&self, agent: &str) -> Option<String> {
+        lock(&self.live).turns.get(agent).and_then(|t| t.by.clone())
+    }
+
+    // Permission prompts.
+
+    /// Notes a permission prompt a hook is holding. Returns its ID.
+    pub fn perm_open(&self, agent: &str, tool: &str, input: &str) -> String {
+        let id = new_id();
+        lock(&self.live).perms.insert(
+            id.clone(),
+            Perm {
+                agent: agent.to_string(),
+                tool: tool.to_string(),
+                input: input.to_string(),
+                done: false,
+            },
+        );
+        id
+    }
+
+    /// Whether the prompt was answered at the terminal, or its session
+    /// moved on.
+    pub fn perm_done(&self, id: &str) -> bool {
+        lock(&self.live).perms.get(id).is_none_or(|p| p.done)
+    }
+
+    pub fn perm_close(&self, id: &str) {
+        lock(&self.live).perms.remove(id);
+    }
+
+    /// A tool call ran, so a prompt for it was answered at the terminal.
+    /// Matched on the input, or failing that, on the only open prompt for
+    /// that tool.
+    pub fn tool_done(&self, agent: &str, tool: &str, input: &str) {
+        let mut live = lock(&self.live);
+        let open: Vec<&mut Perm> = live
+            .perms
+            .values_mut()
+            .filter(|p| p.agent == agent && p.tool == tool && !p.done)
+            .collect();
+        let exact = open.iter().any(|p| p.input == input);
+        let only = open.len() == 1;
+        let mut any = false;
+        for p in open {
+            if p.input == input || (!exact && only) {
+                p.done = true;
+                any = true;
+            }
+        }
+        drop(live);
+        if any {
+            self.notify();
+        }
+    }
+
+    fn perms_done(&self, agent: &str) {
+        let mut live = lock(&self.live);
+        let mut any = false;
+        for p in live.perms.values_mut().filter(|p| p.agent == agent) {
+            any |= !p.done;
+            p.done = true;
+        }
+        drop(live);
+        if any {
+            self.notify();
+        }
     }
 
     pub fn ack(&self, agent: &str, id: &str) -> Result<()> {
@@ -1201,7 +1348,7 @@ fn staleness(addr: &str, live: bool, last_live: Option<i64>, now: i64) -> Option
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1232,7 +1379,7 @@ mod tests {
 
     /// A bus on machine `here` with no Tailscale, no dialogs, and `api`
     /// subscribed.
-    fn bus() -> Arc<Bus> {
+    pub fn bus() -> Arc<Bus> {
         let mut cfg: Config = toml::from_str("alerts = false").unwrap();
         cfg.handoff_limit = 3;
         let bus = Bus::start(cfg, Store::memory());
@@ -1307,7 +1454,7 @@ mod tests {
             let id = format!("r{i}");
             arrive(&bus, &id, true);
             let found = bus.take("api", "s1", 10, false).unwrap();
-            bus.deliver("api", &found, "s1", Handoff::Counted).unwrap();
+            bus.deliver("api", &found, "s1", Handoff::Tool).unwrap();
             bus.unreserve(&found);
         }
         assert!(bus.paused("api").unwrap().contains("3 times in a row"));
@@ -1325,6 +1472,46 @@ mod tests {
     }
 
     #[test]
+    fn remembers_which_message_started_a_turn() {
+        let bus = bus();
+        arrive(&bus, "r", true);
+        let found = bus.take("api", "s1", 10, true).unwrap();
+        bus.deliver("api", &found, "s1", Handoff::Wake).unwrap();
+        // Not until the turn the wake starts.
+        assert_eq!(bus.woken_by("api"), None);
+        bus.turn("api", "s1", 1, false).unwrap();
+        assert_eq!(bus.woken_by("api").as_deref(), Some("sim@here"));
+        bus.turn_ended("api").unwrap();
+        assert_eq!(bus.woken_by("api"), None);
+        // A prompt the user types starts a turn of their own.
+        arrive(&bus, "r2", true);
+        let found = bus.take("api", "s1", 10, true).unwrap();
+        bus.deliver("api", &found, "s1", Handoff::Wake).unwrap();
+        bus.turn("api", "s1", 1, true).unwrap();
+        assert_eq!(bus.woken_by("api"), None);
+    }
+
+    #[test]
+    fn prompts_settle_when_their_tool_runs_or_the_session_moves_on() {
+        let bus = bus();
+        let a = bus.perm_open("api", "Bash", r#"{"command":"ls"}"#);
+        let b = bus.perm_open("api", "Bash", r#"{"command":"pwd"}"#);
+        let c = bus.perm_open("api", "Write", r#"{"file_path":"/x"}"#);
+        bus.tool_done("api", "Bash", r#"{"command":"ls"}"#);
+        assert!(bus.perm_done(&a) && !bus.perm_done(&b) && !bus.perm_done(&c));
+        // An input that doesn't match still settles the only open prompt for
+        // its tool.
+        bus.tool_done("api", "Write", r#"{"file_path":"/x","content":""}"#);
+        assert!(bus.perm_done(&c));
+        bus.tool_done("other", "Bash", r#"{"command":"pwd"}"#);
+        assert!(!bus.perm_done(&b));
+        bus.turn("api", "s1", 1, true).unwrap();
+        assert!(bus.perm_done(&b));
+        bus.perm_close(&b);
+        assert!(bus.perm_done(&b), "a closed prompt counts as settled");
+    }
+
+    #[test]
     fn a_turn_from_another_session_is_ignored() {
         let bus = bus();
         bus.hold("api", "s1", None, 100).unwrap().unwrap();
@@ -1339,7 +1526,7 @@ mod tests {
         arrive(&bus, "r", true);
         arrive(&bus, "n", false);
         let found = bus.take("api", "s1", 10, false).unwrap();
-        bus.deliver("api", &found, "s1", Handoff::Counted).unwrap();
+        bus.deliver("api", &found, "s1", Handoff::Tool).unwrap();
         bus.turn_ended("api").unwrap();
         let open: Vec<_> = bus.inbox("api").unwrap().incoming;
         assert_eq!(

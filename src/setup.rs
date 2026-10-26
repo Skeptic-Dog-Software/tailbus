@@ -18,6 +18,9 @@ const LABEL: &str = "com.skepticdogsoftware.tailbus";
 /// The wait hook's timeout. Claude Code enforces it on `asyncRewake` hooks,
 /// and once it passes an idle session can't be woken until its next turn.
 const WAIT_HOOK_TIMEOUT_SECS: u64 = 7 * 86_400;
+/// How long the permission hook holds a prompt for an alert's answer. If it
+/// passes, the prompt stays with the terminal.
+const PERMISSION_HOOK_TIMEOUT_SECS: u64 = 86_400;
 
 fn home() -> Result<PathBuf> {
     env::var_os("HOME")
@@ -91,6 +94,11 @@ pub fn claude(install: bool) -> Result<()> {
         "type": "command", "command": exe, "args": ["hook", "wait"],
         "asyncRewake": true, "timeout": WAIT_HOOK_TIMEOUT_SECS
     });
+    // Fired after every tool call, so it doesn't hold the session up.
+    let done = json!({
+        "type": "command", "command": exe, "args": ["hook", "tool-done"],
+        "async": true, "timeout": 10
+    });
     write(
         &plugin.join("hooks/hooks.json"),
         &pretty(&json!({
@@ -103,6 +111,12 @@ pub fn claude(install: bool) -> Result<()> {
                 "UserPromptSubmit": [{"hooks": [
                     {"type": "command", "command": exe, "args": ["hook", "prompt"], "timeout": 10}
                 ]}],
+                "PermissionRequest": [{"hooks": [
+                    {"type": "command", "command": exe, "args": ["hook", "permission"],
+                     "timeout": PERMISSION_HOOK_TIMEOUT_SECS}
+                ]}],
+                "PostToolUse": [{"hooks": [done.clone()]}],
+                "PostToolUseFailure": [{"hooks": [done]}],
                 "Stop": [{"hooks": [wait]}]
             }
         })),

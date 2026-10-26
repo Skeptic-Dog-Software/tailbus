@@ -14,8 +14,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tiny_http::{Header, Method, Response, Server};
 
+use crate::ask;
 use crate::bus::Bus;
-use crate::proto::{AgentList, MessageBatch, ReceiptBatch};
+use crate::proto::{AgentList, AskAnswer, AskClose, AskShow, MessageBatch, ReceiptBatch};
 
 /// A full batch of the largest messages, with room for JSON escaping.
 const MAX_REQUEST: usize = 16 * 1024 * 1024;
@@ -156,6 +157,23 @@ fn route(bus: &Bus, req: &mut tiny_http::Request) -> Result<Value, Reject> {
         (Method::Get, "/v1/agents") => {
             let list = bus.agent_list().map_err(internal)?;
             Ok(serde_json::to_value(list).map_err(|e| internal(e.into()))?)
+        }
+        // Dialogs for the user's other Macs. `ask` refuses machines with
+        // another owner, even allowed ones.
+        (Method::Post, "/v1/asks") => {
+            let req: AskShow = read_json(req)?;
+            ask::show(bus, &who, req).map_err(|why| (409, why))?;
+            Ok(json!({}))
+        }
+        (Method::Post, "/v1/asks/close") => {
+            let req: AskClose = read_json(req)?;
+            ask::closed(bus, &who, req);
+            Ok(json!({}))
+        }
+        (Method::Post, "/v1/answers") => {
+            let req: AskAnswer = read_json(req)?;
+            ask::answered(bus, &who, req).map_err(|why| (404, why))?;
+            Ok(json!({}))
         }
         _ => Err((404, format!("no {} {}", req.method(), req.url()))),
     }

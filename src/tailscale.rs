@@ -32,6 +32,8 @@ pub struct Peer {
     pub machine: String,
     pub ipv4: Option<Ipv4Addr>,
     pub online: bool,
+    /// The Tailscale login that owns it.
+    pub owner: String,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,11 @@ impl Tailscale {
                         machine: machine_of(&p.dns_name).ok()?,
                         ipv4: ipv4_of(&p.tailscale_ips),
                         online: p.online,
+                        owner: raw
+                            .user
+                            .get(&p.user_id.to_string())
+                            .map(|u| u.login_name.clone())
+                            .unwrap_or_default(),
                     })
                 })
                 .collect(),
@@ -205,6 +212,7 @@ mod tests {
         );
         assert_eq!(raw.user["7"].login_name, "ray@example.com");
         assert!(!raw.peer["k"].online);
+        assert_eq!(raw.peer["k"].user_id, 7);
 
         let whois = r#"{"Node": {"Name": "server.example.ts.net.", "User": 7},
                         "UserProfile": {"ID": 7, "LoginName": "ray@example.com"}}"#;

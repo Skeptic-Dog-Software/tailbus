@@ -2,6 +2,7 @@
 //! they're read. See DESIGN.md.
 
 mod alert;
+mod ask;
 mod bus;
 mod config;
 mod daemon;
@@ -10,6 +11,7 @@ mod hook;
 mod local;
 mod mcp;
 mod net;
+mod permission;
 mod proto;
 mod setup;
 mod store;
@@ -134,6 +136,8 @@ enum HookCmd {
     SessionStart,
     Prompt,
     Wait,
+    Permission,
+    ToolDone,
 }
 
 #[derive(Subcommand)]
@@ -205,6 +209,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 HookCmd::SessionStart => hook::session_start(&socket, explicit),
                 HookCmd::Prompt => hook::prompt(&socket, explicit),
                 HookCmd::Wait => hook::wait(&socket, explicit),
+                HookCmd::Permission => hook::permission(&socket, explicit),
+                HookCmd::ToolDone => hook::tool_done(&socket, explicit),
             };
         }
         Cmd::Setup {

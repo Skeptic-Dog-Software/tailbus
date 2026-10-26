@@ -59,6 +59,29 @@ pub enum Request {
         client_pid: u32,
         typed: bool,
     },
+    /// The permission hook's prompt: held until the user answers an alert
+    /// on one of their Macs, or answers at the terminal. The reply is a
+    /// `Verdict`.
+    Permission {
+        agent: String,
+        session: String,
+        tool: String,
+        input: serde_json::Value,
+        #[serde(default)]
+        cwd: String,
+        /// Claude Code's suggested permission updates.
+        #[serde(default)]
+        suggestions: serde_json::Value,
+        /// A session nobody's attending, such as `claude -p`.
+        #[serde(default)]
+        unattended: bool,
+    },
+    /// A tool call ran, so any prompt for it was answered at the terminal.
+    ToolDone {
+        agent: String,
+        tool: String,
+        input: serde_json::Value,
+    },
     /// The messages just received were handed on.
     Confirm,
     Ack {
@@ -158,6 +181,15 @@ pub enum Woken {
     Refused {
         reason: String,
     },
+}
+
+/// The answer to a `Permission` request.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Verdict {
+    /// What the hook prints, or nothing when the prompt was settled at the
+    /// terminal or no alert could be shown.
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

@@ -20,7 +20,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::format::{self, Tools};
-use crate::local::{self, Client, Inbox, Messages, Request, Woken};
+use crate::local::{self, Client, Inbox, Messages, Request, Verdict, Woken};
 use crate::util::derive_agent_name;
 
 /// Wakes Claude Code and shows it what the hook printed.
@@ -35,12 +35,35 @@ struct Input {
     /// `UserPromptSubmit`: what starts the turn.
     #[serde(default)]
     prompt: String,
+    /// Tool events: the tool and what it was called with.
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    tool_input: serde_json::Value,
+    /// `PermissionRequest`: the permission updates Claude Code suggests.
+    #[serde(default)]
+    permission_suggestions: serde_json::Value,
 }
 
 fn input() -> Input {
     let mut text = String::new();
     let _ = io::stdin().read_to_string(&mut text);
     serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// Exits when Claude Code does: it doesn't stop a hook that's still running
+/// when it's killed, or when the prompt a hook holds is answered.
+fn exit_when_orphaned() -> u32 {
+    let client_pid = std::os::unix::process::parent_id();
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            if std::os::unix::process::parent_id() != client_pid {
+                std::process::exit(0);
+            }
+        }
+    });
+    client_pid
 }
 
 /// Grok Build also runs the hooks in Claude Code's settings, so these do
@@ -137,6 +160,54 @@ pub fn prompt(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// PermissionRequest: holds the prompt for an alert on the user's Macs and
+/// returns the answer. Without one, it returns nothing, and the prompt
+/// stays with the terminal, which is open the whole time.
+pub fn permission(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
+    if !in_claude_code() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let input = input();
+    exit_when_orphaned();
+    let Ok(mut client) = Client::connect(socket) else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let verdict = client.call::<Verdict>(&Request::Permission {
+        agent: agent_for(explicit, &input),
+        session: session_of(&input),
+        tool: input.tool_name.clone(),
+        input: input.tool_input.clone(),
+        cwd: input.cwd.clone(),
+        suggestions: input.permission_suggestions.clone(),
+        unattended: unattended(),
+    });
+    if let Ok(Verdict {
+        output: Some(output),
+    }) = verdict
+    {
+        println!("{output}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// PostToolUse and PostToolUseFailure: a tool ran, so a prompt for it was
+/// answered at the terminal.
+pub fn tool_done(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
+    if !in_claude_code() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let input = input();
+    let _ = local::call::<serde_json::Value>(
+        socket,
+        &Request::ToolDone {
+            agent: agent_for(explicit, &input),
+            tool: input.tool_name.clone(),
+            input: input.tool_input.clone(),
+        },
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The background wait: exits 2 with the messages when some arrive, or 0
 /// when a newer wait replaces this one.
 pub fn wait(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
@@ -146,18 +217,9 @@ pub fn wait(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
     let input = input();
     let agent = agent_for(explicit, &input);
     let session = session_of(&input);
-    let client_pid = std::os::unix::process::parent_id();
+    // An orphaned wait would take messages for a session that's gone.
+    let client_pid = exit_when_orphaned();
     let orphaned = move || std::os::unix::process::parent_id() != client_pid;
-    // Claude Code doesn't stop this hook when it's killed, and an orphaned
-    // wait would take messages for a session that's gone.
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(2));
-            if orphaned() {
-                std::process::exit(0);
-            }
-        }
-    });
     loop {
         // A daemon that's down or restarting just means waiting longer;
         // Claude Code's timeout for the hook ends it eventually.

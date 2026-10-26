@@ -10,37 +10,52 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-/// Escape picks the first button, the "no" one. Neither is the default, so
+/// Escape picks the first button, the "no" one. None is the default, so
 /// pressing Return can't say yes.
 const SCRIPT: &str = r#"on run argv
-    set r to display dialog (item 2 of argv) with title (item 1 of argv) buttons {item 3 of argv, item 4 of argv} cancel button 1 with icon caution giving up after (item 5 of argv as integer)
-    if gave up of r then return "timeout"
-    return "yes"
+    set r to display dialog (item 2 of argv) with title (item 1 of argv) buttons (items 4 thru -1 of argv) cancel button 1 with icon caution giving up after (item 3 of argv as integer)
+    if gave up of r then return ""
+    return button returned of r
 end run"#;
 
-/// For tests: `yes` or `no` answers every dialog after a second, without
-/// showing it.
+/// For tests: answers every dialog after a second, without showing it.
+/// `no` picks the first button, `yes` the last, and anything else the
+/// button with that label.
 const TEST_ANSWER: &str = "TAILBUS_TEST_ALERTS";
+
+/// The most buttons a dialog can have.
+pub const MAX_BUTTONS: usize = 3;
 
 /// A dialog on screen.
 pub struct Dialog {
+    buttons: Vec<String>,
     shown: Mutex<Shown>,
 }
 
 enum Shown {
     Open(Child),
-    Test { answer: bool, at: Instant },
+    Test { choice: Option<usize>, at: Instant },
     Closed,
 }
 
 impl Dialog {
-    /// Shows a dialog with a "no" and a "yes" button, which closes by
-    /// itself after `timeout`.
-    pub fn show(title: &str, text: &str, no: &str, yes: &str, timeout: Duration) -> Result<Dialog> {
+    /// Shows a dialog with up to three buttons, the first of them the
+    /// "no" one, which closes by itself after `timeout`.
+    pub fn show(title: &str, text: &str, buttons: &[&str], timeout: Duration) -> Result<Dialog> {
+        if buttons.is_empty() || buttons.len() > MAX_BUTTONS {
+            bail!("a dialog has 1 to {MAX_BUTTONS} buttons");
+        }
+        let owned: Vec<String> = buttons.iter().map(|b| b.to_string()).collect();
         if let Ok(answer) = env::var(TEST_ANSWER) {
+            let choice = match answer.as_str() {
+                "no" => Some(0),
+                "yes" => Some(buttons.len() - 1),
+                label => buttons.iter().position(|b| b.eq_ignore_ascii_case(label)),
+            };
             return Ok(Dialog {
+                buttons: owned,
                 shown: Mutex::new(Shown::Test {
-                    answer: answer == "yes",
+                    choice,
                     at: Instant::now() + Duration::from_secs(1),
                 }),
             });
@@ -52,31 +67,33 @@ impl Dialog {
             .arg("-e")
             .arg(SCRIPT)
             .arg("--")
-            .args([title, text, no, yes])
+            .args([title, text])
             .arg(timeout.as_secs().max(1).to_string())
+            .args(buttons)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .context("running osascript")?;
         Ok(Dialog {
+            buttons: owned,
             shown: Mutex::new(Shown::Open(child)),
         })
     }
 
-    /// Waits for an answer: whether "yes" was clicked, or `None` when the
-    /// dialog was closed, timed out, or couldn't be shown.
-    pub fn answer(&self) -> Option<bool> {
+    /// Waits for an answer: the index of the button clicked, or `None` when
+    /// the dialog was closed, timed out, or couldn't be shown.
+    pub fn answer(&self) -> Option<usize> {
         loop {
             {
                 let mut shown = self.shown.lock().unwrap_or_else(|e| e.into_inner());
                 match &mut *shown {
                     Shown::Closed => return None,
-                    Shown::Test { answer, at } => {
+                    Shown::Test { choice, at } => {
                         if Instant::now() >= *at {
-                            let answer = *answer;
+                            let choice = *choice;
                             *shown = Shown::Closed;
-                            return Some(answer);
+                            return choice;
                         }
                     }
                     Shown::Open(child) => match child.try_wait() {
@@ -91,11 +108,13 @@ impl Dialog {
                                 let _ = s.read_to_string(&mut err);
                             }
                             *shown = Shown::Closed;
-                            return match (status.success(), out.trim()) {
-                                (true, "yes") => Some(true),
-                                // "User canceled", from the "no" button or Escape.
-                                (false, _) if err.contains("-128") => Some(false),
-                                _ => None,
+                            return if status.success() {
+                                self.buttons.iter().position(|b| b == out.trim())
+                            } else if err.contains("-128") {
+                                // "User canceled", from the first button or Escape.
+                                Some(0)
+                            } else {
+                                None
                             };
                         }
                         Err(_) => {
@@ -179,12 +198,21 @@ mod tests {
     fn test_answers_come_after_a_second() {
         // SAFETY: tests in this module don't read the variable concurrently
         // with another writer.
-        unsafe { env::set_var(TEST_ANSWER, "no") };
-        let d = Dialog::show("t", "x", "No", "Yes", Duration::from_secs(5)).unwrap();
-        assert_eq!(d.answer(), Some(false));
-        let d = Dialog::show("t", "x", "No", "Yes", Duration::from_secs(5)).unwrap();
+        let buttons = ["Deny", "Allow", "Allow for session"];
+        for (answer, want) in [
+            ("no", Some(0)),
+            ("yes", Some(2)),
+            ("allow", Some(1)),
+            ("x", None),
+        ] {
+            unsafe { env::set_var(TEST_ANSWER, answer) };
+            let d = Dialog::show("t", "x", &buttons, Duration::from_secs(5)).unwrap();
+            assert_eq!(d.answer(), want, "{answer}");
+        }
+        let d = Dialog::show("t", "x", &buttons, Duration::from_secs(5)).unwrap();
         d.close();
         assert_eq!(d.answer(), None);
+        assert!(Dialog::show("t", "x", &[], Duration::from_secs(5)).is_err());
         unsafe { env::remove_var(TEST_ANSWER) };
     }
 }
