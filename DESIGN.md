@@ -656,6 +656,15 @@ client> <task>` sets what does the work remotely.
 - They travel in the pipe's task message as fields of their own, so the
   worker doesn't have to parse them out of the task text.
 
+**Just `/pipe`.** Typed with nothing after it, `/pipe` first shows a
+carousel to fill in the rest:
+
+- which worker, from the live ones;
+- the model, with the worker's own model marked as the default;
+- the effort, with `xhigh` marked as the default.
+
+Then it asks for the task.
+
 **The handoff limit.** A pipe sends several messages each way. A message
 sent from a turn you started, or right after you answered a carousel, is
 marked by the sending bus as sent with you in the loop, and the receiving
@@ -700,6 +709,72 @@ Verified on Claude Code 2.1.310: `claude auth status` prints JSON with
 `subscriptionType`. This Mac reports `claude.ai` and `max`. Still to check
 on the worker: that inside a session that was offered an
 `ANTHROPIC_API_KEY` and declined it, the command reports the subscription.
+
+### /pipe build plan
+
+Not started as of 2026-10-26. In order:
+
+1. **Messages** gain two optional fields, each stored in a new column on
+   `inbox` and `sent`, added to older databases like `wakes`:
+   - `pipe`: the stage (`task`, `questions`, `answers` or `result`), plus
+     a task's `model` and `effort`.
+   - `attended`: set by the sending bus, never by the agent. A receiving
+     bus believes it only from its owner's own machines.
+   New columns go at the end of the `INCOMING` and `OUTGOING` column
+   lists, so the existing row indexes hold.
+2. **Attended turns.** Each agent's turn state also records whether its
+   user is in the loop:
+   - true from a typed prompt;
+   - false from a wake;
+   - true again when `tool-done` reports `AskUserQuestion`, meaning the
+     user answered a carousel;
+   - false at turn end.
+   `send` copies it onto the message. `deliver` doesn't count a batch
+   that's entirely attended.
+3. **Worker tags.** At start, the MCP server reads `TAILBUS_CLIENT` and
+   runs `claude auth status`, and `Hold` carries both. The bus also checks
+   `[clients]` in its config. It keeps a tag only for `api_key`,
+   `api_key_helper` or `third_party`. `AgentInfo` gains the client, how the
+   session is billed, and why a tag was refused, and `peer_list` shows
+   them. `TAILBUS_TEST_AUTH_METHOD` stands in for `claude auth status` in
+   tests, so tests never use a client's key.
+4. **Finding the target.** A pipe task's `to` may be an address or a
+   client name. The bus resolves a client name to that client's live
+   worker, here or on a peer. It refuses if nothing that matches is live,
+   and lists what is.
+5. **Tools:**
+   - `pipe_send(to, task, model?, effort?)`, for the hub;
+   - `pipe_questions(reply_to, questions)`, for the worker. It takes
+     AskUserQuestion's shape: 1 to 4 questions, each with 2 to 4 options,
+     and the bus checks it.
+   - `pipe_answers(reply_to, answers)`, for the hub;
+   - `pipe_result(reply_to, result)`, for the worker.
+   Follow-ups use `msg_send`, in the same thread.
+6. **Wrappers per stage:**
+   - **A task,** to the worker: you're the worker; ask questions first,
+     every time, proposing the ACR dimensions; build in subagents with the
+     given model and effort; run ACR with the `acr` skill; send
+     `pipe_result`; don't hand work back.
+   - **Questions,** to the hub: show them with AskUserQuestion exactly as
+     given, every time, never answering them yourself, then send
+     `pipe_answers`.
+   - **Answers,** to the worker: go on.
+   - **A result,** to the hub: present it in two labeled parts, the
+     worker's result as it came and your own interpretation.
+7. **Plugin files,** kept in the repo and built into the binary with
+   `include_str!`:
+   - `commands/pipe.md`, the `/pipe` command, including the bare-`/pipe`
+     carousel;
+   - `skills/acr/SKILL.md`, the ACR method below.
+   The hub guard goes in the MCP server's instructions for every session
+   that isn't a worker.
+8. **Tests:**
+   - unit tests;
+   - then a hub session and a tagged test worker, both on this Mac, both
+     on test buses and on the Skeptic Dog account, never a client's;
+   - a small task with a cheap model and effort, and a single ACR
+     dimension;
+   - then the whole thing across machines.
 
 ### ACR: adversarial convergence review
 
