@@ -43,12 +43,22 @@ pub fn messages_for_agent(items: &[Item], tools: Tools) -> String {
              no answer, mark it handled with {ack}."
         );
     }
-    if items.iter().any(|i| !i.msg.expects_reply) {
-        out.push_str(
-            "\nA response (kind=\"response\") answers one of your messages, and a notice \
-             (kind=\"notice\") is for your information. Neither needs anything back: use what \
-             it says, but don't reply to it, thank the sender, or follow up. If you need \
-             something new, send a new request.\n",
+    // Handling these is the point: only the reply to the sender is left out.
+    let after = "It needs nothing back, so don't reply to it, thank the sender, or follow up. \
+                 If you need more from that agent, send it a new request.";
+    if items.iter().any(|i| i.msg.kind() == "response") {
+        let _ = writeln!(
+            out,
+            "\nA response (kind=\"response\") answers one of your messages, so pick up where \
+             you left off. If you asked for your user, tell your user what it says. If you \
+             asked for your own work, carry on with it. {after}"
+        );
+    }
+    if items.iter().any(|i| i.msg.kind() == "notice") {
+        let _ = writeln!(
+            out,
+            "\nA notice (kind=\"notice\") is for your information. Use it, and tell your user \
+             if it matters to them. {after}"
         );
     }
     for item in items {
@@ -288,12 +298,16 @@ mod tests {
         answer.msg.reply_to = Some("01K0000000000000000000000B".into());
         let response = messages_for_agent(&[answer.clone()], Tools::Cli);
         assert!(response.contains("kind=\"response\""));
+        assert!(response.contains("tell your user what it says"));
         assert!(response.contains("don't reply to it, thank the sender, or follow up"));
-        assert!(!response.contains("A request"));
+        assert!(!response.contains("A request") && !response.contains("A notice"));
 
-        let both = messages_for_agent(&[item("hello"), answer], Tools::Mcp);
-        assert!(both.starts_with("tailbus: 2 messages"));
+        let mut notice = item("fyi");
+        notice.msg.expects_reply = false;
+        let both = messages_for_agent(&[item("hello"), answer, notice], Tools::Mcp);
+        assert!(both.starts_with("tailbus: 3 messages"));
         assert!(both.contains("A request") && both.contains("A response"));
+        assert!(both.contains("A notice"));
     }
 
     #[test]
