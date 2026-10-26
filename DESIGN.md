@@ -618,6 +618,24 @@ it.
 6. **Follow-ups.** Your agent can ask the remote agent for clarifying
    context, as ordinary requests in the same thread.
 
+**Model and effort.** `/pipe [--model <model>] [--effort <level>] <agent or
+client> <task>` sets what does the work remotely.
+
+- **What they apply to:** the worker's session orchestrates and
+  synthesizes. The building and the ACR attacks run in subagents it starts
+  with Claude Code's per-run `model` and `effort` settings. `--model` takes
+  an alias such as `opus`, `sonnet` or `fable`, or a full model ID.
+  `--effort` takes `low`, `medium`, `high`, `xhigh` or `max`.
+- **Defaults:** the worker session's own model (Opus today), at `xhigh`.
+  That keeps reviewers at least as capable as the agent running the pipe.
+- **Overrides cover both builders and reviewers,** and the result says
+  which model and effort actually ran. Claude Code may substitute a model
+  the organization's allowlist blocks, or pick a lower effort than asked
+  for, since the levels available depend on the model. The report names
+  what was used, not just what was asked for.
+- They travel in the pipe's task message as fields of their own, so the
+  worker doesn't have to parse them out of the task text.
+
 **The handoff limit.** A pipe sends several messages each way. A message
 sent from a turn you started, or right after you answered a carousel, is
 marked by the sending bus as sent with you in the loop, and the receiving
