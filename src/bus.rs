@@ -412,14 +412,18 @@ impl Bus {
         self.wait_until(
             far,
             || {
-                let current = lock(&self.live)
-                    .waiters
-                    .get(agent)
-                    .is_some_and(|w| w.token == token);
+                let (current, receiving) = {
+                    let live = lock(&self.live);
+                    let current = live.waiters.get(agent).is_some_and(|w| w.token == token);
+                    (current, live.receivers.contains_key(agent))
+                };
                 if !current {
                     return Ok(Some(Waited::Replaced));
                 }
-                if self.paused(agent).is_some() {
+                // While the session waits in `msg_wait` itself, what arrives
+                // is for that call, which would otherwise wait on for
+                // nothing.
+                if receiving || self.paused(agent).is_some() {
                     return Ok(None);
                 }
                 let found = self.take(agent, session, MAX_BATCH, true)?;
@@ -436,6 +440,9 @@ impl Bus {
         *n = n.saturating_add_signed(delta);
         if *n == 0 {
             live.receivers.remove(agent);
+            drop(live);
+            // The waiter may take messages again.
+            self.notify();
         }
     }
 
@@ -1263,6 +1270,22 @@ mod tests {
         arrive(&bus, "r", true);
         let found = bus.take("api", "s1", 10, true).unwrap();
         assert_eq!(ids(&found), ["n", "r"]);
+    }
+
+    #[test]
+    fn the_waiter_leaves_messages_to_an_open_msg_wait() {
+        let bus = bus();
+        let (token, session) = bus.add_waiter("api", "s1", 1).unwrap().unwrap();
+        arrive(&bus, "r", true);
+        bus.receiving("api", 1);
+        assert!(
+            bus.wait_as_waiter("api", &session, token, || true)
+                .unwrap()
+                .is_none()
+        );
+        bus.receiving("api", -1);
+        let got = bus.wait_as_waiter("api", &session, token, || true).unwrap();
+        assert!(matches!(got, Some(Waited::Messages(m)) if m.len() == 1));
     }
 
     #[test]
