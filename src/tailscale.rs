@@ -151,12 +151,17 @@ struct RawStatus {
 struct RawNode {
     #[serde(rename = "DNSName", default)]
     dns_name: String,
-    #[serde(rename = "TailscaleIPs", default)]
+    /// `null` while Tailscale is stopped.
+    #[serde(rename = "TailscaleIPs", default, deserialize_with = "null_as_empty")]
     tailscale_ips: Vec<String>,
     #[serde(rename = "Online", default)]
     online: bool,
     #[serde(rename = "UserID", default)]
     user_id: u64,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -206,5 +211,15 @@ mod tests {
         let raw: RawWhois = serde_json::from_str(whois).unwrap();
         assert_eq!(machine_of(&raw.node.name).unwrap(), "server");
         assert!(machine_of("").is_err());
+    }
+
+    #[test]
+    fn reads_a_stopped_tailscale() {
+        // As Tailscale reports itself while it's starting after a reboot.
+        let status = r#"{"BackendState": "Stopped", "TailscaleIPs": null,
+                         "Self": {"DNSName": "", "TailscaleIPs": null}}"#;
+        let raw: RawStatus = serde_json::from_str(status).unwrap();
+        assert_eq!(raw.backend_state, "Stopped");
+        assert!(raw.myself.unwrap().tailscale_ips.is_empty());
     }
 }
