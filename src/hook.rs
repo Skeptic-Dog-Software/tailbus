@@ -4,9 +4,13 @@
 //! every turn. It blocks on the bus, and when a message arrives it prints it
 //! and exits with status 2, which shows it to Claude and wakes the session
 //! even when it's idle.
+//!
+//! `prompt` runs as each turn starts. It tells the bus whether the user
+//! typed the prompt, which starts the handoff count over, and brings along
+//! messages that don't wake a session by themselves.
 
 use std::env;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
@@ -16,7 +20,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::format::{self, Tools};
-use crate::local::{self, Client, Inbox, Request, Woken};
+use crate::local::{self, Client, Inbox, Messages, Request, Woken};
 use crate::util::derive_agent_name;
 
 /// Wakes Claude Code and shows it what the hook printed.
@@ -28,6 +32,9 @@ struct Input {
     session_id: String,
     #[serde(default)]
     cwd: String,
+    /// `UserPromptSubmit`: what starts the turn.
+    #[serde(default)]
+    prompt: String,
 }
 
 fn input() -> Input {
@@ -97,6 +104,35 @@ pub fn session_start(socket: &Path, explicit: Option<String>) -> Result<ExitCode
             inbox.machine,
             if earlier == 1 { "was" } else { "were" },
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// UserPromptSubmit: reports the turn, and adds what's waiting to it as
+/// context.
+pub fn prompt(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
+    if !in_claude_code() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let input = input();
+    // A wake from the wait hook starts a turn too, with this prompt.
+    let typed = !input.prompt.trim_start().starts_with("<task-notification>");
+    let Ok(mut client) = Client::connect(socket) else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let got = client.call::<Messages>(&Request::Turn {
+        agent: agent_for(explicit, &input),
+        session: session_of(&input),
+        client_pid: std::os::unix::process::parent_id(),
+        typed,
+    });
+    if let Ok(got) = got
+        && !got.messages.is_empty()
+    {
+        // Printed is handed over: Claude Code adds it to the turn.
+        print!("{}", format::messages_for_agent(&got.messages, Tools::Mcp));
+        let _ = io::stdout().flush();
+        let _ = client.call::<serde_json::Value>(&Request::Confirm);
     }
     Ok(ExitCode::SUCCESS)
 }

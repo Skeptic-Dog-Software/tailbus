@@ -27,6 +27,21 @@ pub struct Message {
     pub created_at: i64,
 }
 
+impl Message {
+    /// What it is to its recipient: a request asks for an answer, while a
+    /// response (to one of the recipient's messages) or a notice needs
+    /// nothing back.
+    pub fn kind(&self) -> &'static str {
+        if self.expects_reply {
+            "request"
+        } else if self.reply_to.is_some() {
+            "response"
+        } else {
+            "notice"
+        }
+    }
+}
+
 /// How far a sent message has got. States only move forward, except that
 /// any state can become `Failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

@@ -100,6 +100,9 @@ pub fn claude(install: bool) -> Result<()> {
                     {"type": "command", "command": exe, "args": ["hook", "session-start"], "timeout": 10},
                     wait.clone()
                 ]}],
+                "UserPromptSubmit": [{"hooks": [
+                    {"type": "command", "command": exe, "args": ["hook", "prompt"], "timeout": 10}
+                ]}],
                 "Stop": [{"hooks": [wait]}]
             }
         })),

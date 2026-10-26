@@ -7,19 +7,19 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::bus::{Bus, Waited};
+use crate::bus::{Bus, Handoff, Waited};
 use crate::config::{Config, Paths};
 use crate::local::{
     self, AgentStatus, Events, Held, Hello, Item, Messages, Request, Status, Thread, Woken,
 };
 use crate::net;
+use crate::proto::MAX_BATCH;
 use crate::store::{Incoming, Store};
 use crate::util::{now_ms, valid_name};
 
@@ -41,7 +41,7 @@ pub fn run(paths: &Paths) -> Result<()> {
     }
     let _ = fs::remove_file(&socket);
     let store = Store::open(&paths.db())?;
-    let bus = Arc::new(Bus::new(cfg, store));
+    let bus = Bus::start(cfg, store);
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("listening on {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
@@ -156,8 +156,8 @@ impl Conn {
         }
     }
 
-    /// Hands messages over: sends them, and records them delivered once the
-    /// client confirms.
+    /// Hands over messages `take` reserved: sends them, records them
+    /// delivered once the client confirms, and frees them either way.
     fn hand_over(
         &mut self,
         bus: &Bus,
@@ -165,6 +165,21 @@ impl Conn {
         session: &str,
         reply: impl Serialize,
         found: &[Incoming],
+        how: Handoff,
+    ) -> Result<()> {
+        let handed = self.try_hand_over(bus, agent, session, reply, found, how);
+        bus.unreserve(found);
+        handed
+    }
+
+    fn try_hand_over(
+        &mut self,
+        bus: &Bus,
+        agent: &str,
+        session: &str,
+        reply: impl Serialize,
+        found: &[Incoming],
+        how: Handoff,
     ) -> Result<()> {
         self.write(&reply)?;
         if found.is_empty() {
@@ -182,8 +197,7 @@ impl Conn {
             Some(Ok(Request::Confirm))
         );
         if confirmed {
-            let ids: Vec<String> = found.iter().map(|m| m.msg.id.clone()).collect();
-            bus.deliver(agent, &ids, session)?;
+            bus.deliver(agent, found, session, how)?;
             self.write(&serde_json::json!({}))?;
         }
         Ok(())
@@ -271,26 +285,51 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             check_name(&agent)?;
             bus.db().agent_live(&agent, None, now_ms())?;
             let max = max.clamp(1, 100);
-            let found = if wait_secs == 0 {
-                bus.takeable(&agent, &session, max)?
+            // An agent session's handoffs count toward the limit; the CLI's
+            // don't.
+            let how = if session == "cli" {
+                Handoff::Free
+            } else {
+                Handoff::Counted
+            };
+            let paused = || match how {
+                Handoff::Counted => bus.paused(&agent),
+                Handoff::Free => None,
+            };
+            let mut note = paused();
+            let found = if note.is_some() {
+                Vec::new()
+            } else if wait_secs == 0 {
+                bus.take(&agent, &session, max, false)?
             } else {
                 let deadline = Instant::now() + Duration::from_secs(wait_secs.min(MAX_WAIT));
                 bus.receiving(&agent, 1);
-                let found = bus.wait_until(
+                let got = bus.wait_until(
                     deadline,
                     || {
-                        let found = bus.takeable(&agent, &session, max)?;
-                        Ok((!found.is_empty()).then_some(found))
+                        if let Some(why) = paused() {
+                            return Ok(Some(Err(why)));
+                        }
+                        let found = bus.take(&agent, &session, max, false)?;
+                        Ok((!found.is_empty()).then_some(Ok(found)))
                     },
                     || conn.gone(),
                 );
                 bus.receiving(&agent, -1);
-                found?.unwrap_or_default()
+                match got? {
+                    Some(Ok(found)) => found,
+                    Some(Err(why)) => {
+                        note = Some(why);
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
             };
             let reply = Messages {
                 messages: items(&found),
+                paused: note,
             };
-            conn.hand_over(bus, &agent, &session, reply, &found)?;
+            conn.hand_over(bus, &agent, &session, reply, &found, how)?;
         }
         Request::Wait {
             agent,
@@ -301,13 +340,15 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
                 Ok(granted) => granted,
                 Err(reason) => return Ok(conn.write(&Woken::Refused { reason })?),
             };
+            // Waits start at session start and after every turn.
+            bus.turn_ended(&agent)?;
             let waited = bus.wait_as_waiter(&agent, &session, token, || conn.gone());
             let result = match waited {
                 Ok(Some(Waited::Messages(found))) => {
                     let reply = Woken::Messages {
                         messages: items(&found),
                     };
-                    conn.hand_over(bus, &agent, &session, reply, &found)
+                    conn.hand_over(bus, &agent, &session, reply, &found, Handoff::Counted)
                 }
                 Ok(Some(Waited::Replaced)) => Ok(conn.write(&Woken::Replaced)?),
                 Ok(None) => Ok(()),
@@ -315,6 +356,30 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             };
             bus.remove_waiter(&agent, token);
             result?;
+        }
+        Request::Turn {
+            agent,
+            session,
+            client_pid,
+            typed,
+        } => {
+            check_name(&agent)?;
+            let Some(session) = bus.turn(&agent, &session, client_pid, typed) else {
+                return Ok(conn.write(&Messages::default())?);
+            };
+            // What's waiting comes along with the turn, unless the agent is
+            // paused. A turn the user started counts for nothing; a woken
+            // one was counted when it was woken.
+            let found = if bus.paused(&agent).is_some() {
+                Vec::new()
+            } else {
+                bus.take(&agent, &session, MAX_BATCH, false)?
+            };
+            let reply = Messages {
+                messages: items(&found),
+                paused: None,
+            };
+            conn.hand_over(bus, &agent, &session, reply, &found, Handoff::Free)?;
         }
         Request::Confirm => bail!("there's nothing to confirm"),
         Request::Ack { agent, id } => {
@@ -370,6 +435,7 @@ fn status(bus: &Bus) -> Result<Status> {
             .into_iter()
             .map(|a| AgentStatus {
                 open: open.get(&a.name).copied().unwrap_or(0),
+                paused: bus.paused(&a.name).is_some(),
                 live: a.live,
                 app: a.app,
                 name: a.name,

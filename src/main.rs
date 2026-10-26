@@ -1,6 +1,7 @@
 //! tailbus: direct messages between AI agents on a tailnet, queued until
 //! they're read. See DESIGN.md.
 
+mod alert;
 mod bus;
 mod config;
 mod daemon;
@@ -55,9 +56,13 @@ enum Cmd {
         /// The ID of the message this answers.
         #[arg(long, value_name = "ID")]
         reply_to: Option<String>,
-        /// Say you'll wait for an answer.
+        /// Ask for an answer. A new message does unless you say otherwise.
         #[arg(long)]
         expects_reply: bool,
+        /// Ask for nothing back. A reply asks for nothing unless you say
+        /// otherwise.
+        #[arg(long, conflicts_with = "expects_reply")]
+        no_reply: bool,
     },
     /// Take your next messages.
     Recv {
@@ -127,6 +132,7 @@ enum AgentCmd {
 #[derive(Subcommand)]
 enum HookCmd {
     SessionStart,
+    Prompt,
     Wait,
 }
 
@@ -197,6 +203,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let explicit = cli.agent.filter(|a| valid_name(a));
             return match command {
                 HookCmd::SessionStart => hook::session_start(&socket, explicit),
+                HookCmd::Prompt => hook::prompt(&socket, explicit),
                 HookCmd::Wait => hook::wait(&socket, explicit),
             };
         }
@@ -212,7 +219,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             body,
             reply_to,
             expects_reply,
+            no_reply,
         } => {
+            let expects_reply = match (expects_reply, no_reply) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
             let body = match body.as_deref() {
                 None | Some("-") => {
                     if io::stdin().is_terminal() {
@@ -254,7 +267,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     max,
                     wait_secs: if wait { timeout.max(1) } else { 0 },
                 },
-            )?;
+            )?
+            .messages;
             if json {
                 for item in &got {
                     println!("{}", serde_json::to_string(item)?);
@@ -338,14 +352,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             for a in &s.agents {
                 println!(
-                    "  {}  {}{}, {} open",
+                    "  {}  {}{}, {} open{}",
                     a.name,
                     if a.live { "live" } else { "idle" },
                     a.app
                         .as_deref()
                         .map(|a| format!(" ({a})"))
                         .unwrap_or_default(),
-                    a.open
+                    a.open,
+                    if a.paused {
+                        ", paused until its user types in its session"
+                    } else {
+                        ""
+                    }
                 );
             }
         }

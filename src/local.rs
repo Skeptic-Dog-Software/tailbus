@@ -30,7 +30,10 @@ pub enum Request {
         to: String,
         body: String,
         reply_to: Option<String>,
-        expects_reply: bool,
+        /// Whether it asks for an answer. Left out: a new message does and
+        /// a reply doesn't.
+        #[serde(default)]
+        expects_reply: Option<bool>,
     },
     /// Takes messages, waiting up to `wait_secs` for one. A reply with
     /// messages must be followed by `Confirm` before they count as delivered.
@@ -46,6 +49,15 @@ pub enum Request {
         agent: String,
         session: String,
         client_pid: u32,
+    },
+    /// A turn is starting in a session, either from a prompt its user typed
+    /// or from a wake. The reply hands over what's waiting, which must be
+    /// confirmed like `Recv`.
+    Turn {
+        agent: String,
+        session: String,
+        client_pid: u32,
+        typed: bool,
     },
     /// The messages just received were handed on.
     Confirm,
@@ -117,6 +129,9 @@ pub struct Held {
 pub struct Sent {
     pub id: String,
     pub to: String,
+    /// `request`, `response` or `notice`.
+    #[serde(default)]
+    pub kind: String,
     pub state: String,
     /// For example, that the recipient hasn't had a session in a long time.
     #[serde(default)]
@@ -126,6 +141,9 @@ pub struct Sent {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Messages {
     pub messages: Vec<Item>,
+    /// Why there are none, when the agent is paused by the handoff limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,6 +210,9 @@ pub struct AgentStatus {
     pub live: bool,
     pub app: Option<String>,
     pub open: usize,
+    /// Held back by the handoff limit.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -325,11 +346,11 @@ pub fn call<T: DeserializeOwned>(socket: &Path, req: &Request) -> Result<T> {
     Client::connect(socket)?.call(req)
 }
 
-/// `Recv` or a confirmed hand-off of whatever arrives.
-pub fn recv(client: &mut Client, req: &Request) -> Result<Vec<Item>> {
+/// `Recv` or `Turn`, confirming the hand-off of whatever arrives.
+pub fn recv(client: &mut Client, req: &Request) -> Result<Messages> {
     let got: Messages = client.call(req)?;
     if !got.messages.is_empty() {
         client.call::<serde_json::Value>(&Request::Confirm)?;
     }
-    Ok(got.messages)
+    Ok(got)
 }

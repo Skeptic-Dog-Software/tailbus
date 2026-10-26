@@ -3,12 +3,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::alert::{self, Dialog};
 use crate::config::Config;
 use crate::local::{Event, Inbox, Item, PeerMachine, Peers, Sent};
 use crate::net;
@@ -24,6 +25,8 @@ const DAY_MS: i64 = 86_400_000;
 const STATUS_TTL: Duration = Duration::from_secs(10);
 const WHOIS_TTL: Duration = Duration::from_secs(60);
 const MAX_EVENTS: usize = 1000;
+/// How long the dialog about a paused session stays up.
+const PAUSE_DIALOG: Duration = Duration::from_secs(86_400);
 
 /// This machine as Tailscale names it.
 #[derive(Debug, Clone)]
@@ -35,6 +38,8 @@ pub struct Me {
 
 pub struct Bus {
     pub cfg: Config,
+    /// This bus, for work that outlives a call.
+    this: Weak<Bus>,
     ts: Tailscale,
     store: Mutex<Store>,
     live: Mutex<Live>,
@@ -60,6 +65,29 @@ struct Live {
     events: VecDeque<Event>,
     event_seq: u64,
     online: HashMap<String, bool>,
+    /// Messages being handed over right now, which nobody else may take.
+    in_flight: HashSet<String>,
+    /// Each agent's handoffs since its user last typed in its session.
+    runs: HashMap<String, Run>,
+}
+
+/// Handoffs to an agent's sessions in a row, without its user typing.
+#[derive(Default)]
+struct Run {
+    handoffs: u32,
+    /// Set at the limit, until the user types or lets it continue.
+    paused: bool,
+    /// The dialog that says so, while it's up.
+    dialog: Option<Arc<Dialog>>,
+}
+
+/// How messages reached a session, for the handoff limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handoff {
+    /// By a wake, `msg_recv` or `msg_wait`: counts toward the limit.
+    Counted,
+    /// With a prompt the user typed, or to the CLI: doesn't.
+    Free,
 }
 
 /// The session holding an agent name.
@@ -101,8 +129,9 @@ fn preview(body: &str) -> String {
 }
 
 impl Bus {
-    pub fn new(cfg: Config, store: Store) -> Bus {
-        Bus {
+    pub fn start(cfg: Config, store: Store) -> Arc<Bus> {
+        Arc::new_cyclic(|this| Bus {
+            this: this.clone(),
             ts: Tailscale::find(cfg.tailscale.as_deref()),
             cfg,
             store: Mutex::new(store),
@@ -113,7 +142,7 @@ impl Bus {
             whois: Mutex::new(HashMap::new()),
             notes: Mutex::new(HashMap::new()),
             listening: Mutex::new(Err("starting".into())),
-        }
+        })
     }
 
     pub fn db(&self) -> MutexGuard<'_, Store> {
@@ -370,7 +399,8 @@ impl Bus {
         }
     }
 
-    /// Waits for messages on a waiter's behalf.
+    /// Waits on a waiter's behalf for messages that may wake its session.
+    /// The ones returned are reserved until `unreserve`.
     pub fn wait_as_waiter(
         &self,
         agent: &str,
@@ -389,7 +419,10 @@ impl Bus {
                 if !current {
                     return Ok(Some(Waited::Replaced));
                 }
-                let found = self.takeable(agent, session, MAX_BATCH)?;
+                if self.paused(agent).is_some() {
+                    return Ok(None);
+                }
+                let found = self.take(agent, session, MAX_BATCH, true)?;
                 Ok((!found.is_empty()).then_some(Waited::Messages(found)))
             },
             gone,
@@ -422,14 +455,57 @@ impl Bus {
 
     // Receiving.
 
-    pub fn takeable(&self, agent: &str, session: &str, max: usize) -> Result<Vec<Incoming>> {
-        let live = self.live_sessions(agent);
-        self.db().takeable(agent, session, &live, max)
+    /// Takes up to `max` messages for `session`, reserving them until
+    /// `unreserve` so no other session or call hands out the same ones
+    /// meanwhile. With `to_wake`, takes nothing unless one of them may wake
+    /// a session; the others then come along with it.
+    pub fn take(
+        &self,
+        agent: &str,
+        session: &str,
+        max: usize,
+        to_wake: bool,
+    ) -> Result<Vec<Incoming>> {
+        let sessions = self.live_sessions(agent);
+        let found = self.db().takeable(agent, session, &sessions, usize::MAX)?;
+        let mut live = lock(&self.live);
+        let found: Vec<Incoming> = found
+            .into_iter()
+            .filter(|m| !live.in_flight.contains(&m.msg.id))
+            .take(max)
+            .collect();
+        if to_wake && !found.iter().any(|m| m.wakes) {
+            return Ok(Vec::new());
+        }
+        live.in_flight
+            .extend(found.iter().map(|m| m.msg.id.clone()));
+        Ok(found)
     }
 
-    /// Records a confirmed hand-off, and sends receipts for first deliveries.
-    pub fn deliver(&self, agent: &str, ids: &[String], session: &str) -> Result<()> {
-        let first = self.db().mark_delivered(ids, session, now_ms())?;
+    /// Frees messages `take` reserved, whether or not they were delivered.
+    pub fn unreserve(&self, found: &[Incoming]) {
+        if found.is_empty() {
+            return;
+        }
+        let mut live = lock(&self.live);
+        for m in found {
+            live.in_flight.remove(&m.msg.id);
+        }
+        drop(live);
+        self.notify();
+    }
+
+    /// Records a confirmed hand-off, sends receipts for first deliveries,
+    /// and counts it toward the handoff limit.
+    pub fn deliver(
+        &self,
+        agent: &str,
+        found: &[Incoming],
+        session: &str,
+        how: Handoff,
+    ) -> Result<()> {
+        let ids: Vec<String> = found.iter().map(|m| m.msg.id.clone()).collect();
+        let first = self.db().mark_delivered(&ids, session, now_ms())?;
         for msg in first {
             self.receipt(&msg.from, &msg.id, SendState::Delivered)?;
             self.event(format!(
@@ -437,6 +513,138 @@ impl Bus {
                 msg.from,
                 preview(&msg.body)
             ));
+        }
+        if how == Handoff::Counted
+            && let Some(last) = found.last()
+        {
+            self.count_handoff(agent, &last.msg);
+        }
+        Ok(())
+    }
+
+    // The handoff limit.
+
+    /// Why `agent` is being handed nothing, if it's paused.
+    pub fn paused(&self, agent: &str) -> Option<String> {
+        let live = lock(&self.live);
+        let run = live.runs.get(agent)?;
+        run.paused.then(|| {
+            format!(
+                "tailbus has paused your messages. Other agents' messages have reached you {} \
+                 times in a row without your user typing in this session, so new ones wait \
+                 until your user does, or lets them continue from the dialog on their Mac. \
+                 Don't wait for replies now: finish what you're doing and tell your user \
+                 where things stand.",
+                run.handoffs
+            )
+        })
+    }
+
+    fn count_handoff(&self, agent: &str, latest: &Message) {
+        let limit = self.cfg.handoff_limit;
+        let mut live = lock(&self.live);
+        let run = live.runs.entry(agent.to_string()).or_default();
+        run.handoffs += 1;
+        if limit == 0 || run.handoffs < limit || run.paused {
+            return;
+        }
+        run.paused = true;
+        drop(live);
+        self.event(format!(
+            "{agent}: paused after {limit} handoffs in a row from other agents without its user"
+        ));
+        self.show_pause(agent, latest, limit);
+    }
+
+    /// Tells the user, in a dialog on this Mac, that `agent` is paused.
+    fn show_pause(&self, agent: &str, latest: &Message, limit: u32) {
+        if !self.cfg.alerts {
+            return;
+        }
+        let Some(bus) = self.this.upgrade() else {
+            return;
+        };
+        let machine = self.me().map(|m| m.machine).unwrap_or_default();
+        let text = format!(
+            "{agent}@{machine} has been handed messages from other agents {limit} times in a \
+             row without you typing in its session. The latest is from {}:\n\n{}\n\n\
+             New messages to it wait until you type in that session, or let them continue.",
+            latest.from,
+            alert::clean(&latest.body, 400)
+        );
+        let agent = agent.to_string();
+        thread::spawn(move || {
+            let dialog = match Dialog::show(
+                "tailbus: agents paused",
+                &text,
+                "Keep waiting",
+                "Let them continue",
+                PAUSE_DIALOG,
+            ) {
+                Ok(d) => Arc::new(d),
+                Err(e) => {
+                    bus.event(format!("couldn't show the pause dialog: {e:#}"));
+                    return;
+                }
+            };
+            {
+                let mut live = lock(&bus.live);
+                match live.runs.get_mut(&agent) {
+                    Some(run) if run.paused => run.dialog = Some(dialog.clone()),
+                    // Resumed while the dialog was opening.
+                    _ => {
+                        drop(live);
+                        dialog.close();
+                        return;
+                    }
+                }
+            }
+            if dialog.answer() == Some(true) {
+                bus.resume(&agent, "you let it continue");
+            }
+        });
+    }
+
+    /// Starts `agent`'s count over, ending any pause.
+    fn resume(&self, agent: &str, why: &str) {
+        let mut live = lock(&self.live);
+        let Some(run) = live.runs.remove(agent) else {
+            return;
+        };
+        drop(live);
+        if let Some(dialog) = &run.dialog {
+            dialog.close();
+        }
+        if run.paused {
+            self.event(format!("{agent}: resumed, as {why}"));
+            self.notify();
+        }
+    }
+
+    /// A turn is starting in a session of `agent`. Returns the session to
+    /// hand messages to, or `None` if another session holds the agent.
+    /// A prompt the user typed starts the handoff count over.
+    pub fn turn(&self, agent: &str, session: &str, client_pid: u32, typed: bool) -> Option<String> {
+        let session = {
+            let live = lock(&self.live);
+            match live.holders.get(agent) {
+                Some(h) if h.session == session || h.client_pid == client_pid => h.session.clone(),
+                Some(_) => return None,
+                None => session.to_string(),
+            }
+        };
+        if typed {
+            self.resume(agent, "its user typed in its session");
+        }
+        Some(session)
+    }
+
+    /// A turn of `agent`'s ended: the responses and notices it was handed
+    /// are handled now.
+    pub fn turn_ended(&self, agent: &str) -> Result<()> {
+        let acked = self.db().ack_responses(agent, now_ms())?;
+        for (id, sender) in acked {
+            self.receipt(&sender, &id, SendState::Acknowledged)?;
         }
         Ok(())
     }
@@ -479,8 +687,11 @@ impl Bus {
         to: &str,
         body: String,
         reply_to: Option<String>,
-        expects_reply: bool,
+        expects_reply: Option<bool>,
     ) -> Result<Sent> {
+        // A new message is a request; a reply is a response unless it asks
+        // something back.
+        let expects_reply = expects_reply.unwrap_or(reply_to.is_none());
         let me = self.me()?;
         if !valid_name(from) {
             bail!("{from:?} isn't a valid agent name: use lowercase letters, digits and hyphens");
@@ -594,6 +805,7 @@ impl Bus {
             state.as_str()
         ));
         Ok(Sent {
+            kind: msg.kind().into(),
             id: msg.id,
             to: msg.to,
             state: state.as_str().into(),
@@ -1009,5 +1221,130 @@ mod tests {
     fn previews_the_first_line() {
         assert_eq!(preview("hello"), "hello");
         assert_eq!(preview("hello\nworld"), "hello…");
+    }
+
+    /// A bus on machine `here` with no Tailscale, no dialogs, and `api`
+    /// subscribed.
+    fn bus() -> Arc<Bus> {
+        let mut cfg: Config = toml::from_str("alerts = false").unwrap();
+        cfg.handoff_limit = 3;
+        let bus = Bus::start(cfg, Store::memory());
+        *bus.me.write().unwrap() = Some(Me {
+            machine: "here".into(),
+            owner: "o".into(),
+            ipv4: None,
+        });
+        bus.db().add_agent("api", 1).unwrap();
+        bus
+    }
+
+    fn arrive(bus: &Bus, id: &str, expects_reply: bool) {
+        let msg = Message {
+            id: id.into(),
+            from: "sim@here".into(),
+            to: "api@here".into(),
+            body: format!("body of {id}"),
+            reply_to: None,
+            expects_reply,
+            created_at: 1,
+        };
+        bus.db().store_incoming(&msg, "o", 1).unwrap();
+    }
+
+    fn ids(found: &[Incoming]) -> Vec<&str> {
+        found.iter().map(|m| m.msg.id.as_str()).collect()
+    }
+
+    #[test]
+    fn notices_ride_along_with_a_message_that_wakes() {
+        let bus = bus();
+        arrive(&bus, "n", false);
+        assert!(bus.take("api", "s1", 10, true).unwrap().is_empty());
+        arrive(&bus, "r", true);
+        let found = bus.take("api", "s1", 10, true).unwrap();
+        assert_eq!(ids(&found), ["n", "r"]);
+    }
+
+    #[test]
+    fn reserved_messages_go_to_one_taker_at_a_time() {
+        let bus = bus();
+        arrive(&bus, "r", true);
+        let first = bus.take("api", "s1", 10, false).unwrap();
+        assert_eq!(ids(&first), ["r"]);
+        assert!(bus.take("api", "s1", 10, false).unwrap().is_empty());
+        bus.unreserve(&first);
+        assert_eq!(ids(&bus.take("api", "s1", 10, false).unwrap()), ["r"]);
+    }
+
+    #[test]
+    fn pauses_at_the_limit_until_the_user_types() {
+        let bus = bus();
+        for i in 0..3 {
+            assert!(bus.paused("api").is_none());
+            let id = format!("r{i}");
+            arrive(&bus, &id, true);
+            let found = bus.take("api", "s1", 10, false).unwrap();
+            bus.deliver("api", &found, "s1", Handoff::Counted).unwrap();
+            bus.unreserve(&found);
+        }
+        assert!(bus.paused("api").unwrap().contains("3 times in a row"));
+
+        // Handoffs to the CLI, or with a typed prompt, don't count; a wake
+        // that starts a turn doesn't reset the count.
+        bus.turn("api", "s1", 1, false).unwrap();
+        assert!(bus.paused("api").is_some());
+        bus.turn("api", "s1", 1, true).unwrap();
+        assert!(bus.paused("api").is_none());
+        arrive(&bus, "c", true);
+        let found = bus.take("api", "cli", 10, false).unwrap();
+        bus.deliver("api", &found, "cli", Handoff::Free).unwrap();
+        assert!(!lock(&bus.live).runs.contains_key("api"));
+    }
+
+    #[test]
+    fn a_turn_from_another_session_is_ignored() {
+        let bus = bus();
+        bus.hold("api", "s1", None, 100).unwrap().unwrap();
+        assert_eq!(bus.turn("api", "s2", 200, true), None);
+        // After /clear, the hook's session changes but its app is the same.
+        assert_eq!(bus.turn("api", "s2", 100, true).as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn responses_are_handled_when_the_turn_ends() {
+        let bus = bus();
+        arrive(&bus, "r", true);
+        arrive(&bus, "n", false);
+        let found = bus.take("api", "s1", 10, false).unwrap();
+        bus.deliver("api", &found, "s1", Handoff::Counted).unwrap();
+        bus.turn_ended("api").unwrap();
+        let open: Vec<_> = bus.inbox("api").unwrap().incoming;
+        assert_eq!(
+            open.iter().map(|i| i.msg.id.as_str()).collect::<Vec<_>>(),
+            ["r"]
+        );
+    }
+
+    #[test]
+    fn new_messages_are_requests_and_replies_are_responses() {
+        let bus = bus();
+        bus.db().add_agent("sim", 1).unwrap();
+        let ask = bus
+            .send("api", "sim", "6 times 7?".into(), None, None)
+            .unwrap();
+        assert_eq!(ask.kind, "request");
+        let answer = bus
+            .send("sim", "api", "42".into(), Some(ask.id.clone()), None)
+            .unwrap();
+        assert_eq!(answer.kind, "response");
+        // The answer to api's request wakes it.
+        let found = bus.take("api", "s1", 10, true).unwrap();
+        assert_eq!(ids(&found), [answer.id.as_str()]);
+        bus.unreserve(&found);
+        // A thank-you for the answer doesn't wake sim.
+        bus.send("api", "sim", "thanks".into(), Some(answer.id), None)
+            .unwrap();
+        let sim = bus.take("sim", "s2", 10, true).unwrap();
+        assert!(sim.is_empty(), "{:?}", ids(&sim));
     }
 }

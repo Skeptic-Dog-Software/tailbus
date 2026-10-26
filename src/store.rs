@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS inbox (
     body          TEXT NOT NULL,
     reply_to      TEXT,
     expects_reply INTEGER NOT NULL,
+    wakes         INTEGER NOT NULL DEFAULT 1,
     created_at    INTEGER NOT NULL,
     stored_at     INTEGER NOT NULL,
     delivered_at  INTEGER,
@@ -82,6 +83,10 @@ pub struct Incoming {
     /// The session it was last handed to.
     pub session: Option<String>,
     pub acked_at: Option<i64>,
+    /// Whether it may wake an idle session: it's a request, or it answers
+    /// one of the recipient's requests. Anything else waits for the
+    /// session's next turn.
+    pub wakes: bool,
 }
 
 /// A message a local agent sent.
@@ -144,7 +149,7 @@ impl ThreadEntry {
 }
 
 const INCOMING: &str = "id, sender, recipient, body, reply_to, expects_reply, created_at, \
-                        owner, delivered_at, session, acked_at";
+                        owner, delivered_at, session, acked_at, wakes";
 const OUTGOING: &str = "id, sender, recipient, body, reply_to, expects_reply, created_at, \
                         state, error";
 
@@ -167,6 +172,7 @@ fn incoming(r: &Row) -> rusqlite::Result<Incoming> {
         delivered_at: r.get(8)?,
         session: r.get(9)?,
         acked_at: r.get(10)?,
+        wakes: r.get(11)?,
     })
 }
 
@@ -212,6 +218,13 @@ impl Store {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch(SCHEMA)?;
+        // Added after 0.1.0: queues from then are all requests, so they wake.
+        let has_wakes = db
+            .prepare("SELECT 1 FROM pragma_table_info('inbox') WHERE name = 'wakes'")?
+            .exists([])?;
+        if !has_wakes {
+            db.execute_batch("ALTER TABLE inbox ADD COLUMN wakes INTEGER NOT NULL DEFAULT 1")?;
+        }
         Ok(Store { db })
     }
 
@@ -268,10 +281,21 @@ impl Store {
         if !self.has_agent(agent)? {
             return Ok(Stored::UnknownAgent);
         }
+        // The recipient's own messages are in this machine's sent history,
+        // so whether a reply answers one of its requests is known here.
+        let wakes = msg.expects_reply
+            || match &msg.reply_to {
+                Some(r) => self
+                    .db
+                    .prepare("SELECT 1 FROM sent WHERE id = ?1 AND agent = ?2 AND expects_reply")?
+                    .exists(params![r, agent])?,
+                None => false,
+            };
         let n = self.db.execute(
             "INSERT OR IGNORE INTO inbox
-             (id, agent, sender, recipient, owner, body, reply_to, expects_reply, created_at, stored_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, agent, sender, recipient, owner, body, reply_to, expects_reply, wakes,
+              created_at, stored_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 msg.id,
                 agent,
@@ -281,6 +305,7 @@ impl Store {
                 msg.body,
                 msg.reply_to,
                 msg.expects_reply,
+                wakes,
                 msg.created_at,
                 now
             ],
@@ -395,6 +420,27 @@ impl Store {
                 Ok(Acked::Now { sender })
             }
         }
+    }
+
+    /// Marks handled the messages handed to `agent` that ask for nothing
+    /// back, once the turn they arrived in is over. Returns each one's ID
+    /// and sender, for receipts.
+    pub fn ack_responses(&self, agent: &str, now: i64) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, sender FROM inbox
+             WHERE agent = ?1 AND acked_at IS NULL AND delivered_at IS NOT NULL
+               AND NOT expects_reply",
+        )?;
+        let rows = stmt
+            .query_map([agent], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        for (id, _) in &rows {
+            self.db.execute(
+                "UPDATE inbox SET acked_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )?;
+        }
+        Ok(rows)
     }
 
     // The outbox and sent history.
@@ -829,6 +875,93 @@ mod tests {
             .collect();
         assert_eq!(thread, ["a", "b", "c"]);
         assert!(s.thread("zzz").unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_requests_and_answers_to_requests_wake() {
+        let s = Store::memory();
+        s.add_agent("api", 1).unwrap();
+        let mut ask = msg("q", "api@here", "sim@there", None);
+        ask.expects_reply = true;
+        s.record_sent(&ask, SendState::Stored, 1).unwrap();
+        s.record_sent(
+            &msg("n", "api@here", "sim@there", None),
+            SendState::Stored,
+            1,
+        )
+        .unwrap();
+        // An answer to api's request wakes it; a reply to its notice doesn't.
+        for m in [
+            msg("a", "sim@there", "api@here", Some("q")),
+            msg("b", "sim@there", "api@here", Some("n")),
+        ] {
+            s.store_incoming(&m, "o", 2).unwrap();
+        }
+        // A new request wakes it; a new notice doesn't.
+        let mut req = msg("c", "sim@there", "api@here", None);
+        req.expects_reply = true;
+        s.store_incoming(&req, "o", 2).unwrap();
+        s.store_incoming(&msg("d", "sim@there", "api@here", None), "o", 2)
+            .unwrap();
+        let wakes: Vec<_> = s
+            .open_incoming("api")
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.msg.id, m.wakes))
+            .collect();
+        assert_eq!(
+            wakes,
+            [
+                ("a".to_string(), true),
+                ("b".to_string(), false),
+                ("c".to_string(), true),
+                ("d".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn responses_are_handled_once_delivered() {
+        let mut s = Store::memory();
+        s.add_agent("api", 1).unwrap();
+        let mut req = msg("a", "sim@there", "api@here", None);
+        req.expects_reply = true;
+        s.store_incoming(&req, "o", 1).unwrap();
+        for m in [
+            msg("b", "sim@there", "api@here", Some("x")),
+            msg("c", "sim@there", "api@here", Some("y")),
+        ] {
+            s.store_incoming(&m, "o", 1).unwrap();
+        }
+        s.mark_delivered(&["a".into(), "b".into()], "s1", 2)
+            .unwrap();
+        // The request waits for an answer; the response not yet handed out
+        // waits too.
+        assert_eq!(
+            s.ack_responses("api", 3).unwrap(),
+            [("b".to_string(), "sim@there".to_string())]
+        );
+        assert_eq!(ids(&s.open_incoming("api").unwrap()), ["a", "c"]);
+    }
+
+    #[test]
+    fn older_databases_gain_the_wakes_column() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE inbox (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+                agent TEXT NOT NULL, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+                owner TEXT NOT NULL, body TEXT NOT NULL, reply_to TEXT,
+                expects_reply INTEGER NOT NULL, created_at INTEGER NOT NULL,
+                stored_at INTEGER NOT NULL, delivered_at INTEGER, session TEXT,
+                acked_at INTEGER);
+             INSERT INTO inbox (id, agent, sender, recipient, owner, body, expects_reply,
+                                created_at, stored_at)
+             VALUES ('a', 'api', 'x@t', 'api@h', 'o', 'hi', 0, 1, 1);",
+        )
+        .unwrap();
+        let s = Store::init(db).unwrap();
+        assert!(s.open_incoming("api").unwrap()[0].wakes);
     }
 
     #[test]

@@ -94,6 +94,15 @@ pub struct Config {
     pub retention_days: u32,
     /// The Tailscale CLI, if not the app's or the one on `PATH`.
     pub tailscale: Option<PathBuf>,
+    /// How many times in a row a session can be handed other agents'
+    /// messages, with no prompt from its user in between, before the bus
+    /// stops handing it more.
+    #[serde(default = "default_handoff_limit")]
+    pub handoff_limit: u32,
+    /// Whether this Mac shows tailbus's dialogs, such as when a session is
+    /// paused.
+    #[serde(default = "default_alerts")]
+    pub alerts: bool,
 }
 
 fn default_port() -> u16 {
@@ -102,6 +111,14 @@ fn default_port() -> u16 {
 
 fn default_retention() -> u32 {
     30
+}
+
+fn default_handoff_limit() -> u32 {
+    6
+}
+
+fn default_alerts() -> bool {
+    true
 }
 
 impl Config {
@@ -126,6 +143,8 @@ mod tests {
         assert_eq!(cfg.port, DEFAULT_PORT);
         assert_eq!(cfg.retention_days, 30);
         assert!(cfg.allow.is_empty());
+        assert_eq!(cfg.handoff_limit, 6);
+        assert!(cfg.alerts);
 
         let cfg: Config = toml::from_str("port = 5000\nallow = [\"a@b.com\"]").unwrap();
         assert_eq!(cfg.port, 5000);
