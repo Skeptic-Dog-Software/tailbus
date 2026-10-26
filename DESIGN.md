@@ -1,6 +1,7 @@
 # tailbus: agent-to-agent messaging over a tailnet
 
-Status: phase 1 built and tested; phase 2 designed; phases 3 to 5 are plans.
+Status: phase 1 built and tested; phase 2's conversation limits built and
+tested, its permission alerts designed; phases 3 to 5 are plans.
 
 ## Goal
 
@@ -388,19 +389,33 @@ at a terminal.
 
 ## Permissions and conversation limits
 
-Phase 2: designed, not built yet. Phase 1 left two problems:
+Phase 2. Phase 1 left two problems:
 
 - A session woken by a message stops at a permission prompt in its own
   terminal, which nobody may be watching.
 - Two agents can keep answering each other, and each answer wakes the
   other.
 
+Decided on 2026-10-26:
+
+- **Limits first.** The wrappers, responses that don't wake, and the
+  handoff limit are built. Permission alerts come next.
+- **Maximum control is the default.** Claude Code keeps asking before the
+  bus's own tools too, so the user approves every message an agent sends.
+  An approach modeled on grayboard's may replace this later.
+- **The handoff limit is 6.**
+- **Alerts get a third button,** **Allow for session** (below).
+
 ### Permission alerts
 
-- **Where you answer:** an alert on each of your Macs, with **Allow** and
-  **Deny**. The first answer wins, and the other alerts close. The dialog
-  in the session's terminal stays open too, and answering there withdraws
-  the alerts.
+- **Where you answer:** an alert on each of your Macs, with **Deny**,
+  **Allow** and **Allow for session**. The first answer wins, and the other
+  alerts close. The dialog in the session's terminal stays open too, and
+  answering there withdraws the alerts.
+- **Allow for session** also returns, as `updatedPermissions`, the rules
+  Claude Code suggested for the prompt (its `permission_suggestions`), with
+  their destination set to `session`. Similar calls stop asking until the
+  session ends, and nothing is written to a settings file.
 - **Which prompts go out:**
   - Right away when a message from another agent started the session's
     turn, or when the session is headless.
@@ -458,8 +473,10 @@ tailbus enforces three rules:
    - After 6 handoffs in a row (`handoff_limit`) without its user typing
      in it, the bus hands that session nothing more. `msg_recv` and
      `msg_wait` say why, and the wait hook doesn't wake it.
-   - Your Macs get an alert: **Keep waiting** or **Let them continue**.
-     Your next prompt in that session also resets the count.
+   - A dialog offers **Keep waiting** or **Let them continue**. For now it
+     shows on the paused session's own Mac; with alerts, it will show on
+     each of your Macs. Your next prompt in that session also resets the
+     count.
    - Each machine counts its own sessions. A loop across machines stops on
      whichever side reaches the limit first, and loops through three or
      more agents stop the same way.
@@ -500,32 +517,66 @@ gating. In auto mode, Claude Code's classifier decides instead of you.
   prompt, too late to be the trigger.
 - A bus wake fires `UserPromptSubmit`, with a prompt that starts with
   `<task-notification>` and contains the hook's message.
-- For sessions in a temporary directory, `transcript_path` named a file
-  that was never written. Nothing in this design reads transcripts.
+- In test sessions, `transcript_path` named a file that was never written.
+  Sessions started from inside another Claude Code session inherit its
+  `CLAUDE_CODE_CHILD_SESSION` marker, which turns transcript saving off.
+  Nothing in this design reads transcripts.
 - `osascript`'s `display dialog`, run by a launchd job in the login
   session, shows on screen and returns the button clicked. `server`
   has `dana` logged in at its screen.
+- `osascript`'s `display notification` from a launchd job exits 0 but
+  shows nothing on this Mac, presumably because notifications from Script
+  Editor aren't allowed. So tailbus uses dialogs, not banners.
+
+### Conversation limits tested on Claude Code 2.1.310
+
+Real interactive sessions on this Mac, against a separate test bus, on
+2026-10-26:
+
+- **An answer to a request wakes the asker; a thank-you for it doesn't.**
+  A request woke an idle session, which answered `42` as a response. The
+  sender's "thanks" to that answer stayed undelivered for 25 seconds, came
+  along with the next typed prompt, and was marked handled when that turn
+  ended. The session didn't reply to it.
+- **Claude sees what comes along with a turn.** A notice holding a code
+  word didn't wake its session. Asked afterwards, Claude gave the word.
+- **The handoff limit stops a relay.** Two sessions told to count back and
+  forth, with no end, reached 12 in about 40 seconds. Then each paused at
+  its sixth handoff, the 13th request stayed queued, and the session that
+  was told to keep going stopped and told its user why.
+- **Found and fixed:** while a session waited in `msg_wait`, its
+  background wait hook could take the message it was waiting for. The
+  session then sat in `msg_wait` until it timed out. The wait hook now
+  stands aside while the agent has a `msg_wait` open.
+- **Not seen yet:** the pause dialog itself on screen. In the tests it
+  answered itself through `TAILBUS_TEST_ALERTS`.
 
 ### Build plan
 
-1. **Store:**
-   - A `wakes` flag on each message, set when it's stored.
-   - Responses marked handled at turn end.
-   - Messages reserved while being handed over, so two takers can't hand
-     out the same ones.
-2. **Bus:** each agent's turn state (who woke it, the handoff count, paused
-   or not), and pending permission requests.
-3. **Alerts:**
-   - `alert.rs` shows the dialogs.
-   - `ask.rs` sends them out and handles nonces, answers and closing,
-     over `POST /v1/asks`, `/v1/asks/close` and `/v1/answers`.
-   - Peers get their owner from `tailscale status`.
-4. **Plugin and tools:** the `prompt`, `permission` and `tool-done` hooks,
-   the new `expects_reply` defaults, and the wrappers and instructions.
-5. **Config:** `alerts`, `handoff_limit`, `ask_after_secs`.
-6. **Tests:** unit tests, then real sessions on both Macs. A test-only
-   setting makes alerts answer themselves, so tests don't need someone
-   clicking.
+Built, for the conversation limits:
+
+- **Store:** a `wakes` flag on each message, set when it's stored;
+  responses marked handled at turn end; and messages reserved while being
+  handed over, so two takers can't hand out the same ones.
+- **Bus:** each agent's handoff count, and the pause.
+- **Plugin and tools:** the `prompt` hook, the new `expects_reply`
+  defaults, and the wrappers and instructions.
+- **Alerts:** `alert.rs` shows the pause dialog. `TAILBUS_TEST_ALERTS`
+  (`yes` or `no`) makes every dialog answer itself, for tests.
+- **Config:** `handoff_limit` and `alerts`.
+
+Next, for permission alerts:
+
+1. **Bus:** each agent's turn state (who woke it), and pending permission
+   requests.
+2. **Alerts:** `ask.rs` sends alerts to your other Macs and handles nonces,
+   answers and closing, over `POST /v1/asks`, `/v1/asks/close` and
+   `/v1/answers`. Peers get their owner from `tailscale status`. The pause
+   dialog moves to all your Macs too.
+3. **Plugin:** the `permission` and `tool-done` hooks.
+4. **Config:** `ask_after_secs`.
+5. **Tests:** unit tests, then real sessions on both Macs, with alerts
+   answering themselves.
 
 ## Security model
 
