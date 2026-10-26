@@ -1,7 +1,8 @@
 # tailbus: agent-to-agent messaging over a tailnet
 
-Status: phase 1 built and tested; phase 2's conversation limits built and
-tested, its permission alerts designed; phases 3 to 5 are plans.
+Status: phase 1 built and tested; phase 2's conversation limits and
+permission alerts built and tested, and `/pipe` designed; phases 3 to 5 are
+plans.
 
 ## Goal
 
@@ -576,18 +577,37 @@ Built, for the conversation limits:
   (`yes` or `no`) makes every dialog answer itself, for tests.
 - **Config:** `handoff_limit` and `alerts`.
 
-Next, for permission alerts:
+Built, for permission alerts:
 
-1. **Bus:** each agent's turn state (who woke it), and pending permission
-   requests.
-2. **Alerts:** `ask.rs` sends alerts to your other Macs and handles nonces,
-   answers and closing, over `POST /v1/asks`, `/v1/asks/close` and
-   `/v1/answers`. Peers get their owner from `tailscale status`. The pause
-   dialog moves to all your Macs too.
-3. **Plugin:** the `permission` and `tool-done` hooks.
-4. **Config:** `ask_after_secs`.
-5. **Tests:** unit tests, then real sessions on both Macs, with alerts
-   answering themselves.
+- **Bus:** each agent's turn state (whose message woke it), and the
+  permission prompts hooks are holding.
+- **Alerts:** `ask.rs` sends dialogs to your other Macs and handles nonces,
+  answers and closing, over `POST /v1/asks`, `/v1/asks/close` and
+  `/v1/answers`. Peers get their owner from `tailscale status`. The pause
+  dialog goes to all your Macs too. `permission.rs` writes the alert and
+  works out what Allow for session covers.
+- **Plugin:** the `permission` and `tool-done` hooks.
+- **Config:** `ask_after_secs`. `server` runs with `alerts = false`,
+  since it's the worker's machine; its alerts show on
+  the hub Mac.
+
+### Permission alerts tested on Claude Code 2.1.310
+
+Real sessions in default permission mode, against test buses whose
+dialogs answer themselves, on 2026-10-26:
+
+| Test | Result |
+|---|---|
+| Another agent asks for `touch`; the alert answers Allow | Asked at once; the command ran; the agent reported back. |
+| The same; the alert answers Deny | Nothing ran; the agent reported that its user denied it from the alert. |
+| Allow for session, then the same command again | One alert; both runs went ahead. |
+| You start the turn, and answer at the terminal | The command ran; no alert, even past the wait. |
+| You start the turn, and don't answer | After the wait (8 seconds in the test), the alert went out; Allow ran it. |
+| This Mac's alerts off; `server`'s test bus answers | Asked on 1 Mac; "allowed Bash, from server"; the command ran. |
+
+Not seen yet: a real dialog on screen for a permission prompt. The
+three-button script compiles with `osacompile`, and two-button dialogs
+were shown and clicked earlier.
 
 ## /pipe: handing a task to another agent
 

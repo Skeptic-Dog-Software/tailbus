@@ -12,7 +12,9 @@ which account owns it.
 
 [DESIGN.md](DESIGN.md) has the design and the plan. Built so far: the bus
 itself, the CLI, the MCP tools, push into Claude Code, and the limits that
-stop agents answering each other forever. Permission alerts are next.
+stop agents answering each other forever, and permission alerts on your
+Macs. `/pipe`, which hands a whole task to an agent on another machine, is
+next.
 
 ## Install
 
@@ -102,6 +104,30 @@ After 6 in a row with no prompt from you in that session, the bus hands it
 nothing more, and a dialog on its Mac offers **Keep waiting** or **Let them
 continue**. Typing in the session also lets it continue, and starts the
 count over. `tailbus status` shows which agents are paused.
+
+### Permission alerts
+
+A session woken by another agent's message may need permission for
+something, with nobody at its terminal. So the bus also shows the prompt as
+a dialog on your Macs, with **Deny**, **Allow** and **Allow for session**.
+Your answer goes back to the session, and the first answer from any Mac
+wins.
+
+- **When:** at once, if another agent's message started the session's
+  turn. In a turn you started, only after the prompt has waited at its
+  terminal for a minute (`ask_after_secs`).
+- **The terminal still works.** Its own prompt stays open, and answering
+  there withdraws the alerts.
+- **Allow for session** adds only the allow rule the dialog names, such as
+  `Bash(npm test)`, until that session ends. It never switches the
+  session's mode.
+- **Which Macs:** this one, and the bus on each of your other online Macs,
+  meaning machines owned by your own Tailscale account, not ones you only
+  allowed. Set `alerts = false` in a Mac's config to keep dialogs off it.
+  Its prompts and pauses then show on your other Macs.
+
+Only a click on a dialog can answer an alert. Neither agent can, and
+nothing on the bus's socket can either.
 
 ## From the command line
 

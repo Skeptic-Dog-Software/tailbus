@@ -529,17 +529,15 @@ fn permission(
     let Some(Some(answer)) = answer else {
         return Ok(None);
     };
-    let word = match answer.choice {
-        permission::ALLOW => "allowed",
-        permission::ALLOW_FOR_SESSION => "allowed for the session",
-        permission::DENY => "denied",
+    let tool = asked.tool;
+    let what = match answer.choice {
+        permission::ALLOW => format!("allowed {tool}"),
+        permission::ALLOW_FOR_SESSION => format!("allowed {tool} for the session"),
+        permission::DENY => format!("denied {tool}"),
         // The dialog's buttons are the ones above; anything else is a deny.
-        _ => "denied",
+        _ => format!("denied {tool}"),
     };
-    bus.event(format!(
-        "{agent}: you {word} {}, from {}",
-        asked.tool, answer.machine
-    ));
+    bus.event(format!("{agent}: you {what}, from {}", answer.machine));
     Ok(Some(permission::decision(
         answer.choice,
         &answer.machine,
