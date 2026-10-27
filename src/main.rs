@@ -251,6 +251,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     body,
                     reply_to,
                     expects_reply,
+                    pipe: None,
                 },
             )?;
             println!("{}", format::sent(&sent));

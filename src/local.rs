@@ -34,6 +34,9 @@ pub enum Request {
         /// a reply doesn't.
         #[serde(default)]
         expects_reply: Option<bool>,
+        /// A `/pipe` step.
+        #[serde(default)]
+        pipe: Option<crate::proto::Pipe>,
     },
     /// Takes messages, waiting up to `wait_secs` for one. A reply with
     /// messages must be followed by `Confirm` before they count as delivered.

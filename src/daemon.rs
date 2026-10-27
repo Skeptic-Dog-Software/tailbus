@@ -277,8 +277,9 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             body,
             reply_to,
             expects_reply,
+            pipe,
         } => {
-            let sent = bus.send(&agent, &to, body, reply_to, expects_reply)?;
+            let sent = bus.send(&agent, &to, body, reply_to, expects_reply, pipe)?;
             conn.write(&sent)?;
         }
         Request::Recv {

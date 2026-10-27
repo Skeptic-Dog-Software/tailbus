@@ -240,6 +240,7 @@ impl Server {
                         body: need("body")?,
                         reply_to: str_arg("reply_to"),
                         expects_reply: args["expects_reply"].as_bool(),
+                        pipe: None,
                     },
                 )?;
                 Ok(format::sent(&sent))

@@ -269,6 +269,8 @@ mod tests {
                 reply_to: None,
                 expects_reply: true,
                 created_at: 0,
+                pipe: None,
+                attended: false,
             },
             incoming: true,
             state: "new".into(),

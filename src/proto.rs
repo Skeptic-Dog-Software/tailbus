@@ -25,6 +25,35 @@ pub struct Message {
     pub expects_reply: bool,
     /// Unix milliseconds.
     pub created_at: i64,
+    /// Set on the messages of a `/pipe`: which step of it this is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipe: Option<Pipe>,
+    /// Sent with the sender's user in the loop, as the sending bus saw it.
+    /// A receiving bus believes it only from its owner's own machines.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attended: bool,
+}
+
+/// A `/pipe` message: a task handed to a worker, the worker's clarifying
+/// questions and the user's answers, and the worker's result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pipe {
+    pub stage: PipeStage,
+    /// A task's model and effort for the remote work, if not the worker's
+    /// own model and `xhigh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PipeStage {
+    Task,
+    Questions,
+    Answers,
+    Result,
 }
 
 impl Message {

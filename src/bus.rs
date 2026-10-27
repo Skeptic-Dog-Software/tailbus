@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::local::{Event, Inbox, Item, PeerMachine, Peers, Sent};
 use crate::net;
 use crate::proto::{
-    AgentInfo, AgentList, MAX_BATCH, MAX_BODY, Message, MessageBatch, Receipt, ReceiptBatch,
+    AgentInfo, AgentList, MAX_BATCH, MAX_BODY, Message, MessageBatch, Pipe, Receipt, ReceiptBatch,
     SendState, StoreResult, StoreResults, StoreStatus,
 };
 use crate::store::{Acked, Incoming, Store, Stored, machine_part, name_part};
@@ -95,6 +95,9 @@ struct Turn {
     woke: Option<String>,
     /// The current turn was started by a message from this agent.
     by: Option<String>,
+    /// The user is in the loop: they typed the prompt that started the
+    /// turn, or answered a question carousel in it.
+    attended: bool,
 }
 
 /// A permission prompt, until it's answered or withdrawn.
@@ -563,7 +566,10 @@ impl Bus {
                 .or_default()
                 .woke = from;
         }
+        // A batch sent entirely with its senders' users in the loop isn't a
+        // run of agents talking among themselves.
         if how != Handoff::Free
+            && !found.iter().all(|m| m.msg.attended)
             && let Some(last) = found.last()
         {
             self.count_handoff(agent, &last.msg);
@@ -710,6 +716,7 @@ impl Bus {
             let mut live = lock(&self.live);
             let turn = live.turns.entry(agent.to_string()).or_default();
             turn.by = if typed { None } else { turn.woke.take() };
+            turn.attended = typed;
             if typed {
                 turn.woke = None;
             }
@@ -724,6 +731,7 @@ impl Bus {
     pub fn turn_ended(&self, agent: &str) -> Result<()> {
         if let Some(turn) = lock(&self.live).turns.get_mut(agent) {
             turn.by = None;
+            turn.attended = false;
         }
         self.perms_done(agent);
         let acked = self.db().ack_responses(agent, now_ms())?;
@@ -770,6 +778,10 @@ impl Bus {
     /// that tool.
     pub fn tool_done(&self, agent: &str, tool: &str, input: &str) {
         let mut live = lock(&self.live);
+        // Only the user answers a question carousel.
+        if tool == "AskUserQuestion" {
+            live.turns.entry(agent.to_string()).or_default().attended = true;
+        }
         let open: Vec<&mut Perm> = live
             .perms
             .values_mut()
@@ -842,6 +854,7 @@ impl Bus {
         body: String,
         reply_to: Option<String>,
         expects_reply: Option<bool>,
+        pipe: Option<Pipe>,
     ) -> Result<Sent> {
         // A new message is a request; a reply is a response unless it asks
         // something back.
@@ -878,6 +891,9 @@ impl Bus {
             reply_to,
             expects_reply,
             created_at: now,
+            pipe,
+            // The bus says so, not the agent.
+            attended: lock(&self.live).turns.get(from).is_some_and(|t| t.attended),
         };
 
         let (state, warning) = if to.machine == me.machine {
@@ -1156,9 +1172,12 @@ impl Bus {
                 continue;
             }
             let to = to.expect("checked above");
-            // The sending machine is whoever Tailscale says it is.
+            // The sending machine is whoever Tailscale says it is, and its
+            // word that its user was in the loop counts only if it's the
+            // same user's.
             msg.from = format!("{from}@{}", who.machine);
             msg.to = to.to_string();
+            msg.attended &= !me.owner.is_empty() && who.owner == me.owner;
             let stored = self.db().store_incoming(&msg, &who.owner, now)?;
             match stored {
                 Stored::UnknownAgent => {
@@ -1401,6 +1420,8 @@ pub(crate) mod tests {
             reply_to: None,
             expects_reply,
             created_at: 1,
+            pipe: None,
+            attended: false,
         };
         bus.db().store_incoming(&msg, "o", 1).unwrap();
     }
@@ -1512,6 +1533,93 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn messages_sent_with_the_user_in_the_loop_dont_count() {
+        let bus = bus();
+        bus.db().add_agent("sim", 1).unwrap();
+        // api's user typed the prompt, so what api sends is attended, and
+        // handing it to sim doesn't count.
+        bus.turn("api", "s1", 1, true).unwrap();
+        let task = bus
+            .send("api", "sim", "do this".into(), None, None, None)
+            .unwrap();
+        let found = bus.take("sim", "s2", 10, true).unwrap();
+        assert!(found[0].msg.attended);
+        bus.deliver("sim", &found, "s2", Handoff::Wake).unwrap();
+        bus.unreserve(&found);
+        assert!(!lock(&bus.live).runs.contains_key("sim"));
+        // sim was woken, not typed to, so its answer isn't, and counts.
+        bus.turn("sim", "s2", 2, false).unwrap();
+        bus.send(
+            "sim",
+            "api",
+            "a question".into(),
+            Some(task.id),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        let found = bus.take("api", "s1", 10, true).unwrap();
+        assert!(!found[0].msg.attended);
+        bus.deliver("api", &found, "s1", Handoff::Wake).unwrap();
+        bus.unreserve(&found);
+        assert_eq!(lock(&bus.live).runs["api"].handoffs, 1);
+        // In a woken turn, the user answering a carousel puts them in the
+        // loop, until the turn ends.
+        bus.turn("api", "s1", 1, false).unwrap();
+        bus.tool_done("api", "AskUserQuestion", "{}");
+        let answers = bus
+            .send("api", "sim", "answers".into(), None, None, None)
+            .unwrap();
+        assert!(
+            bus.db()
+                .outgoing(&answers.id)
+                .unwrap()
+                .unwrap()
+                .msg
+                .attended
+        );
+        bus.turn_ended("api").unwrap();
+        let later = bus
+            .send("api", "sim", "later".into(), None, None, None)
+            .unwrap();
+        assert!(!bus.db().outgoing(&later.id).unwrap().unwrap().msg.attended);
+    }
+
+    #[test]
+    fn only_the_owners_own_machines_can_say_their_user_was_there() {
+        let bus = bus();
+        let from = |owner: &str, id: &str| {
+            let msg = Message {
+                id: id.into(),
+                from: "x@there".into(),
+                to: "api@here".into(),
+                body: "hi".into(),
+                reply_to: None,
+                expects_reply: true,
+                created_at: 1,
+                pipe: None,
+                attended: true,
+            };
+            let who = Whois {
+                machine: "there".into(),
+                owner: owner.into(),
+            };
+            bus.accept(
+                &who,
+                MessageBatch {
+                    messages: vec![msg],
+                },
+            )
+            .unwrap();
+        };
+        from("o", "01K0000000000000000000000A");
+        from("someone-else", "01K0000000000000000000000B");
+        let open = bus.db().open_incoming("api").unwrap();
+        let attended: Vec<_> = open.iter().map(|m| m.msg.attended).collect();
+        assert_eq!(attended, [true, false]);
+    }
+
+    #[test]
     fn a_turn_from_another_session_is_ignored() {
         let bus = bus();
         bus.hold("api", "s1", None, 100).unwrap().unwrap();
@@ -1540,11 +1648,11 @@ pub(crate) mod tests {
         let bus = bus();
         bus.db().add_agent("sim", 1).unwrap();
         let ask = bus
-            .send("api", "sim", "6 times 7?".into(), None, None)
+            .send("api", "sim", "6 times 7?".into(), None, None, None)
             .unwrap();
         assert_eq!(ask.kind, "request");
         let answer = bus
-            .send("sim", "api", "42".into(), Some(ask.id.clone()), None)
+            .send("sim", "api", "42".into(), Some(ask.id.clone()), None, None)
             .unwrap();
         assert_eq!(answer.kind, "response");
         // The answer to api's request wakes it.
@@ -1552,7 +1660,7 @@ pub(crate) mod tests {
         assert_eq!(ids(&found), [answer.id.as_str()]);
         bus.unreserve(&found);
         // A thank-you for the answer doesn't wake sim.
-        bus.send("api", "sim", "thanks".into(), Some(answer.id), None)
+        bus.send("api", "sim", "thanks".into(), Some(answer.id), None, None)
             .unwrap();
         let sim = bus.take("sim", "s2", 10, true).unwrap();
         assert!(sim.is_empty(), "{:?}", ids(&sim));

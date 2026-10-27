@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS inbox (
     stored_at     INTEGER NOT NULL,
     delivered_at  INTEGER,
     session       TEXT,
-    acked_at      INTEGER
+    acked_at      INTEGER,
+    pipe          TEXT,
+    attended      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS inbox_open ON inbox (agent, acked_at, seq);
 CREATE INDEX IF NOT EXISTS inbox_reply ON inbox (reply_to);
@@ -54,7 +56,9 @@ CREATE TABLE IF NOT EXISTS sent (
     error         TEXT,
     attempts      INTEGER NOT NULL DEFAULT 0,
     next_try      INTEGER NOT NULL DEFAULT 0,
-    updated_at    INTEGER NOT NULL
+    updated_at    INTEGER NOT NULL,
+    pipe          TEXT,
+    attended      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sent_due ON sent (state, next_try);
 CREATE INDEX IF NOT EXISTS sent_agent ON sent (agent, created_at);
@@ -148,12 +152,16 @@ impl ThreadEntry {
     }
 }
 
+// Columns added later go at the end of each list, so earlier indexes hold.
 const INCOMING: &str = "id, sender, recipient, body, reply_to, expects_reply, created_at, \
-                        owner, delivered_at, session, acked_at, wakes";
+                        owner, delivered_at, session, acked_at, wakes, pipe, attended";
 const OUTGOING: &str = "id, sender, recipient, body, reply_to, expects_reply, created_at, \
-                        state, error";
+                        state, error, pipe, attended";
 
-fn message(r: &Row) -> rusqlite::Result<Message> {
+/// A message from a row, with its `pipe` and `attended` columns at `extra`
+/// and the one after.
+fn message(r: &Row, extra: usize) -> rusqlite::Result<Message> {
+    let pipe: Option<String> = r.get(extra)?;
     Ok(Message {
         id: r.get(0)?,
         from: r.get(1)?,
@@ -162,12 +170,20 @@ fn message(r: &Row) -> rusqlite::Result<Message> {
         reply_to: r.get(4)?,
         expects_reply: r.get(5)?,
         created_at: r.get(6)?,
+        pipe: pipe.and_then(|p| serde_json::from_str(&p).ok()),
+        attended: r.get(extra + 1)?,
     })
+}
+
+fn pipe_column(msg: &Message) -> Option<String> {
+    msg.pipe
+        .as_ref()
+        .and_then(|p| serde_json::to_string(p).ok())
 }
 
 fn incoming(r: &Row) -> rusqlite::Result<Incoming> {
     Ok(Incoming {
-        msg: message(r)?,
+        msg: message(r, 12)?,
         owner: r.get(7)?,
         delivered_at: r.get(8)?,
         session: r.get(9)?,
@@ -178,7 +194,7 @@ fn incoming(r: &Row) -> rusqlite::Result<Incoming> {
 
 fn outgoing(r: &Row) -> rusqlite::Result<Outgoing> {
     Ok(Outgoing {
-        msg: message(r)?,
+        msg: message(r, 9)?,
         state: SendState::parse(&r.get::<_, String>(7)?),
         error: r.get(8)?,
     })
@@ -218,12 +234,23 @@ impl Store {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch(SCHEMA)?;
-        // Added after 0.1.0: queues from then are all requests, so they wake.
-        let has_wakes = db
-            .prepare("SELECT 1 FROM pragma_table_info('inbox') WHERE name = 'wakes'")?
-            .exists([])?;
-        if !has_wakes {
-            db.execute_batch("ALTER TABLE inbox ADD COLUMN wakes INTEGER NOT NULL DEFAULT 1")?;
+        // Columns added after 0.1.0. Queues from then are all requests, so
+        // their messages wake.
+        for (table, column, kind) in [
+            ("inbox", "wakes", "INTEGER NOT NULL DEFAULT 1"),
+            ("inbox", "pipe", "TEXT"),
+            ("inbox", "attended", "INTEGER NOT NULL DEFAULT 0"),
+            ("sent", "pipe", "TEXT"),
+            ("sent", "attended", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let has = db
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"
+                ))?
+                .exists([])?;
+            if !has {
+                db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+            }
         }
         Ok(Store { db })
     }
@@ -294,8 +321,8 @@ impl Store {
         let n = self.db.execute(
             "INSERT OR IGNORE INTO inbox
              (id, agent, sender, recipient, owner, body, reply_to, expects_reply, wakes,
-              created_at, stored_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              created_at, stored_at, pipe, attended)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 msg.id,
                 agent,
@@ -307,7 +334,9 @@ impl Store {
                 msg.expects_reply,
                 wakes,
                 msg.created_at,
-                now
+                now,
+                pipe_column(msg),
+                msg.attended
             ],
         )?;
         Ok(if n == 1 {
@@ -448,8 +477,9 @@ impl Store {
     pub fn record_sent(&self, msg: &Message, state: SendState, now: i64) -> Result<()> {
         self.db.execute(
             "INSERT INTO sent
-             (id, agent, sender, recipient, body, reply_to, expects_reply, created_at, state, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, agent, sender, recipient, body, reply_to, expects_reply, created_at, state,
+              updated_at, pipe, attended)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 msg.id,
                 name_part(&msg.from),
@@ -460,7 +490,9 @@ impl Store {
                 msg.expects_reply,
                 msg.created_at,
                 state.as_str(),
-                now
+                now,
+                pipe_column(msg),
+                msg.attended
             ],
         )?;
         Ok(())
@@ -485,8 +517,8 @@ impl Store {
         ))?;
         let rows = stmt.query_map(params![now, limit as i64], |r| {
             Ok(Due {
-                item: message(r)?,
-                attempts: r.get(9)?,
+                item: message(r, 9)?,
+                attempts: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -713,6 +745,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{Pipe, PipeStage};
 
     fn msg(id: &str, from: &str, to: &str, reply_to: Option<&str>) -> Message {
         Message {
@@ -723,6 +756,8 @@ mod tests {
             reply_to: reply_to.map(Into::into),
             expects_reply: false,
             created_at: 1000,
+            pipe: None,
+            attended: false,
         }
     }
 
@@ -945,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn older_databases_gain_the_wakes_column() {
+    fn older_databases_gain_the_new_columns() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE inbox (
@@ -955,13 +990,44 @@ mod tests {
                 expects_reply INTEGER NOT NULL, created_at INTEGER NOT NULL,
                 stored_at INTEGER NOT NULL, delivered_at INTEGER, session TEXT,
                 acked_at INTEGER);
+             CREATE TABLE sent (
+                id TEXT PRIMARY KEY, agent TEXT NOT NULL, sender TEXT NOT NULL,
+                recipient TEXT NOT NULL, body TEXT NOT NULL, reply_to TEXT,
+                expects_reply INTEGER NOT NULL, created_at INTEGER NOT NULL,
+                state TEXT NOT NULL, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                next_try INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
              INSERT INTO inbox (id, agent, sender, recipient, owner, body, expects_reply,
                                 created_at, stored_at)
-             VALUES ('a', 'api', 'x@t', 'api@h', 'o', 'hi', 0, 1, 1);",
+             VALUES ('a', 'api', 'x@t', 'api@h', 'o', 'hi', 0, 1, 1);
+             INSERT INTO sent (id, agent, sender, recipient, body, expects_reply, created_at,
+                               state, updated_at)
+             VALUES ('b', 'api', 'api@h', 'x@t', 'hi', 0, 1, 'queued', 1);",
         )
         .unwrap();
         let s = Store::init(db).unwrap();
-        assert!(s.open_incoming("api").unwrap()[0].wakes);
+        let old = &s.open_incoming("api").unwrap()[0];
+        assert!(old.wakes && old.msg.pipe.is_none() && !old.msg.attended);
+        let due = s.due_sends(10, 10).unwrap();
+        assert_eq!(due[0].item.id, "b");
+        assert!(due[0].item.pipe.is_none() && !due[0].item.attended);
+    }
+
+    #[test]
+    fn keeps_pipe_steps_and_attended_both_ways() {
+        let s = Store::memory();
+        s.add_agent("sim", 1).unwrap();
+        let mut m = msg("a", "x@t", "sim@h", None);
+        m.pipe = Some(Pipe {
+            stage: PipeStage::Task,
+            model: Some("sonnet".into()),
+            effort: Some("high".into()),
+        });
+        m.attended = true;
+        s.store_incoming(&m, "o", 1).unwrap();
+        assert_eq!(s.open_incoming("sim").unwrap()[0].msg, m);
+        s.record_sent(&m, SendState::Queued, 1).unwrap();
+        assert_eq!(s.outgoing("a").unwrap().unwrap().msg, m);
+        assert_eq!(s.due_sends(10, 10).unwrap()[0].item, m);
     }
 
     #[test]
