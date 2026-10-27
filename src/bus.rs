@@ -784,19 +784,23 @@ impl Bus {
                 turn.woke = None;
             }
         }
-        // Whatever the session was asking permission for is settled.
-        self.perms_done(agent);
+        // A prompt the user typed means they're at the terminal, where any
+        // open prompt is. A wake doesn't: a background subagent's prompt may
+        // still be waiting.
+        if typed {
+            self.perms_done(agent);
+        }
         Some(session)
     }
 
     /// A turn of `agent`'s ended: the responses and notices it was handed
     /// are handled now.
     pub fn turn_ended(&self, agent: &str) -> Result<()> {
+        // Open prompts stay open: background subagents outlive the turn.
         if let Some(turn) = lock(&self.live).turns.get_mut(agent) {
             turn.by = None;
             turn.attended = false;
         }
-        self.perms_done(agent);
         let acked = self.db().ack_responses(agent, now_ms())?;
         for (id, sender) in acked {
             self.receipt(&sender, &id, SendState::Acknowledged)?;
@@ -837,27 +841,22 @@ impl Bus {
     }
 
     /// A tool call ran, so a prompt for it was answered at the terminal.
-    /// Matched on the input, or failing that, on the only open prompt for
-    /// that tool.
+    /// Matched on the tool and its exact input: subagents run calls in
+    /// parallel, so anything looser could settle someone else's prompt.
     pub fn tool_done(&self, agent: &str, tool: &str, input: &str) {
         let mut live = lock(&self.live);
         // Only the user answers a question carousel.
         if tool == "AskUserQuestion" {
             live.turns.entry(agent.to_string()).or_default().attended = true;
         }
-        let open: Vec<&mut Perm> = live
+        let mut any = false;
+        for p in live
             .perms
             .values_mut()
-            .filter(|p| p.agent == agent && p.tool == tool && !p.done)
-            .collect();
-        let exact = open.iter().any(|p| p.input == input);
-        let only = open.len() == 1;
-        let mut any = false;
-        for p in open {
-            if p.input == input || (!exact && only) {
-                p.done = true;
-                any = true;
-            }
+            .filter(|p| p.agent == agent && p.tool == tool && p.input == input && !p.done)
+        {
+            p.done = true;
+            any = true;
         }
         drop(live);
         if any {
@@ -1685,14 +1684,20 @@ pub(crate) mod tests {
         let c = bus.perm_open("api", "Write", r#"{"file_path":"/x"}"#);
         bus.tool_done("api", "Bash", r#"{"command":"ls"}"#);
         assert!(bus.perm_done(&a) && !bus.perm_done(&b) && !bus.perm_done(&c));
-        // An input that doesn't match still settles the only open prompt for
-        // its tool.
-        bus.tool_done("api", "Write", r#"{"file_path":"/x","content":""}"#);
-        assert!(bus.perm_done(&c));
+        // Another call to the same tool, as a subagent running in parallel
+        // makes, doesn't settle it.
+        bus.tool_done("api", "Write", r#"{"file_path":"/y"}"#);
+        assert!(!bus.perm_done(&c));
         bus.tool_done("other", "Bash", r#"{"command":"pwd"}"#);
         assert!(!bus.perm_done(&b));
+        // Neither does a wake, or the end of the turn, which background
+        // subagents outlive.
+        bus.turn("api", "s1", 1, false).unwrap();
+        bus.turn_ended("api").unwrap();
+        assert!(!bus.perm_done(&b) && !bus.perm_done(&c));
+        // A prompt the user types does: they're at the terminal.
         bus.turn("api", "s1", 1, true).unwrap();
-        assert!(bus.perm_done(&b));
+        assert!(bus.perm_done(&b) && bus.perm_done(&c));
         bus.perm_close(&b);
         assert!(bus.perm_done(&b), "a closed prompt counts as settled");
     }

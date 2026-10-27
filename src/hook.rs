@@ -21,6 +21,7 @@ use serde::Deserialize;
 
 use crate::format::{self, Tools};
 use crate::local::{self, Client, Inbox, Messages, Request, Verdict, Woken};
+use crate::permission;
 use crate::util::derive_agent_name;
 
 /// Wakes Claude Code and shows it what the hook printed.
@@ -168,6 +169,9 @@ pub fn permission(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let input = input();
+    if permission::ANSWERED_AT_TERMINAL.contains(&input.tool_name.as_str()) {
+        return Ok(ExitCode::SUCCESS);
+    }
     exit_when_orphaned();
     let Ok(mut client) = Client::connect(socket) else {
         return Ok(ExitCode::SUCCESS);

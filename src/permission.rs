@@ -6,6 +6,11 @@ use serde_json::{Value, json};
 use crate::alert;
 use crate::ask::Prompt;
 
+/// Tools whose permission prompt is the user answering in the terminal, a
+/// question carousel or a plan to approve, rather than a call to allow.
+/// They stay with the terminal: an alert must never answer them.
+pub const ANSWERED_AT_TERMINAL: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
+
 pub const DENY: usize = 0;
 pub const ALLOW: usize = 1;
 pub const ALLOW_FOR_SESSION: usize = 2;

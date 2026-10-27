@@ -122,15 +122,13 @@ pub fn claude(install: bool) -> Result<()> {
         })),
     )?;
     // The /pipe command, and the ACR method its workers follow.
-    write(
-        &plugin.join("commands/pipe.md"),
-        include_str!("../plugin/commands/pipe.md"),
-    )?;
+    write(&plugin.join("commands/pipe.md"), PIPE)?;
     write(
         &plugin.join("skills/acr/SKILL.md"),
         include_str!("../plugin/skills/acr/SKILL.md"),
     )?;
     println!("Wrote the Claude Code plugin to {}", plugin.display());
+    install_pipe_skill()?;
 
     if !install {
         println!(
@@ -164,6 +162,42 @@ pub fn claude(install: bool) -> Result<()> {
         "Installed the tailbus plugin. Sessions started from now on load it; \
          in a session that's already open, run /reload-plugins."
     );
+    Ok(())
+}
+
+const PIPE: &str = include_str!("../plugin/commands/pipe.md");
+/// Marks the personal `/pipe` skill as tailbus's, so setup replaces only
+/// its own.
+const PIPE_MARK: &str = "<!-- Installed by `tailbus setup claude`, which rewrites this file. -->";
+
+/// The `/pipe` command as a personal skill. A plugin's commands always
+/// carry the plugin's name, as `/tailbus:pipe`, and a personal skill is the
+/// way to have a plain `/pipe`. Only your user starts it.
+fn pipe_skill() -> String {
+    let rest = PIPE.strip_prefix("---\n").unwrap_or(PIPE);
+    let (front, body) = rest.split_once("\n---\n").unwrap_or(("", rest));
+    format!("---\nname: pipe\ndisable-model-invocation: true\n{front}\n---\n{PIPE_MARK}\n{body}")
+}
+
+fn install_pipe_skill() -> Result<()> {
+    let config = env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map_or_else(
+            || home().map(|h| h.join(".claude")),
+            |d| Ok(PathBuf::from(d)),
+        )?;
+    let path = config.join("skills/pipe/SKILL.md");
+    if let Ok(existing) = fs::read_to_string(&path)
+        && !existing.contains(PIPE_MARK)
+    {
+        println!(
+            "Left {} alone, since tailbus didn't write it. /tailbus:pipe works either way.",
+            path.display()
+        );
+        return Ok(());
+    }
+    write(&path, &pipe_skill())?;
+    println!("Wrote {}, so /pipe works in every session.", path.display());
     Ok(())
 }
 
@@ -304,4 +338,19 @@ pub fn service_uninstall() -> Result<()> {
     }
     println!("Stopped the tailbus daemon and removed {}.", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pipe_skill_is_the_command_under_its_own_name() {
+        let skill = pipe_skill();
+        assert!(skill.starts_with("---\nname: pipe\ndisable-model-invocation: true\ndescription:"));
+        assert!(skill.contains("argument-hint:"));
+        assert!(skill.contains(&format!("---\n{PIPE_MARK}\n")));
+        assert!(skill.contains("Arguments: $ARGUMENTS"));
+        assert_eq!(skill.matches("\n---\n").count(), 1);
+    }
 }

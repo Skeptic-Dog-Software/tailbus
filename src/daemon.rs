@@ -414,6 +414,9 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             unattended,
         } => {
             check_name(&agent)?;
+            if permission::ANSWERED_AT_TERMINAL.contains(&tool.as_str()) {
+                return Ok(conn.write(&Verdict::default())?);
+            }
             let key = serde_json::to_string(&input)?;
             let id = bus.perm_open(&agent, &tool, &key);
             let asked = Asked {
@@ -506,6 +509,12 @@ fn permission(
             || Ok(bus.perm_done(id).then_some(())),
             || conn.gone(),
         )?;
+        if bus.perm_done(id) {
+            bus.event(format!(
+                "{agent}: {} was answered at its terminal",
+                asked.tool
+            ));
+        }
         if bus.perm_done(id) || conn.gone() {
             return Ok(None);
         }
@@ -545,6 +554,12 @@ fn permission(
     )?;
     ask::close(bus, &ask_id);
     let Some(Some(answer)) = answer else {
+        if bus.perm_done(id) {
+            bus.event(format!(
+                "{agent}: {} was answered at its terminal; alert withdrawn",
+                asked.tool
+            ));
+        }
         return Ok(None);
     };
     let tool = asked.tool;
