@@ -18,7 +18,7 @@ This method comes from Ray Karnes's essay "The Adversarial Agent Fleet: Trust, b
 
 1. **Dimensions.** Use the ones your user chose. Write down each one's criteria: what "wrong" means for this task in that dimension. One reviewer per dimension per round.
 2. **Build the strongest version first.** Before any attack, make the work the version its most capable advocate would stand behind. An attack that survives a strong version tells you something; one that knocks down a weak version tells you nothing.
-3. **Run a round.** Start one reviewer per open dimension with the Agent tool, passing the task's `model` and `effort` for each run. Default to your own model at `xhigh`, which keeps every reviewer at least as capable as you.
+3. **Run a round.** Start one reviewer per open dimension with the Agent tool, passing the task's `model` and `effort` for each run. Default to your own model at `xhigh`, which keeps every reviewer at least as capable as you. Claude Code drops the Agent tool's `model` setting while `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` is on, and then every subagent runs on the forced model.
    - Run **at most 5 reviewers at once.** Start more as slots free up.
    - Brief each with its dimension, the criteria, the scope, and the artifact itself, such as the diff, the document or the answer.
    - Give the instruction **"Find what is wrong"**, never "check this", which invites ratification. Name its role, for example "the reviewer for correctness".

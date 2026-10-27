@@ -27,8 +27,10 @@ tailbus setup claude        # add the Claude Code plugin
 ```
 
 `tailbus status` shows whether the bus is up and listening on the tailnet.
-Restart open Claude Code sessions, or run `/reload-plugins` in them, to load
-the plugin.
+Restart open Claude Code sessions to load the plugin, and again after
+updating tailbus. `/reload-plugins` isn't enough after an update: it
+rereads the plugin's files, but keeps a session's tailbus server running
+on the old version.
 
 By default a bus accepts messages only from machines owned by the same
 Tailscale account. To allow others, list their Tailscale logins or machine

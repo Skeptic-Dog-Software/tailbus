@@ -84,7 +84,9 @@ fn pipe_wrappers(out: &mut String, stage: impl Fn(PipeStage) -> bool) {
              You're the worker: you do all of it here, on your own account.\n\
              1. Before you start, always ask clarifying questions with pipe_questions \
              (reply_to: the task's id), even if the task looks clear. Include the ACR \
-             dimensions you propose for it, as one multiSelect question.\n\
+             dimensions you propose for it, as one multiSelect question. If you can't start \
+             subagents with the task's model or effort, for example because your Agent tool \
+             has no model setting, ask there too: go on with what will run, or stop.\n\
              2. When the answers arrive, do the work. Build in subagents started with the \
              task's model and effort, as its tag gives them, and otherwise your own model \
              at xhigh.\n\

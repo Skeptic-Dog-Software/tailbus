@@ -615,9 +615,21 @@ dialogs answer themselves, on 2026-10-26:
 | You start the turn, and don't answer | After the wait (8 seconds in the test), the alert went out; Allow ran it. |
 | This Mac's alerts off; `server`'s test bus answers | Asked on 1 Mac; "allowed Bash, from server"; the command ran. |
 
-Not seen yet: a real dialog on screen for a permission prompt. The
-three-button script compiles with `osacompile`, and two-button dialogs
-were shown and clicked earlier.
+On 2026-10-27, with real dialogs on this Mac, a session woken by another
+agent's message ran `touch` on a file outside its project, three times:
+
+| Run | Result |
+|---|---|
+| 1 | The dialog showed; the user clicked Allow; it ran. |
+| 2 | Asked again, as it should after Allow; Allow for session; it ran. |
+| 3 | **Asked again.** Allow for session didn't stick. |
+
+The cause: for a file outside the project, Claude Code's only suggestion is
+a folder grant ("always allow access to `/private/tmp/claude-501` from
+this project"). Allow for session leaves folder grants out, so it fell
+back to the exact command, `Bash(touch …)`, and Claude Code's check on
+folders outside the project still asked. Inside the project (test 3
+above), the button works. Open: what the button should do here.
 
 ## /pipe: handing a task to another agent
 
@@ -668,6 +680,13 @@ client> <task>` sets what does the work remotely.
   the organization's allowlist blocks, or pick a lower effort than asked
   for, since the levels available depend on the model. The report names
   what was used, not just what was asked for.
+- **A worker can't choose a model** while its settings set
+  `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`: Claude Code then drops the Agent
+  tool's `model` setting, and ignores `model` in subagent definitions too.
+  This Mac's `~/.claude/settings.json` forces `opus`, on purpose. The work
+  agent's settings on `server` don't. A worker that can't use the
+  task's model or effort asks, among its first questions, whether to go
+  on with what will run.
 - They travel in the pipe's task message as fields of their own, so the
   worker doesn't have to parse them out of the task text.
 
@@ -825,9 +844,29 @@ Found and fixed:
 - **`/pipe` was an unknown command,** since the plugin's command is
   `/tailbus:pipe`. Setup now also installs the personal `pipe` skill.
 
-Not tested yet: `/pipe` as typed, `/pipe` with nothing after it, a
-background subagent's prompt since the fix, and a pipe across machines to
-the real worker, which bills the client.
+A second run, on 2026-10-27 on Claude Code 2.1.311, the same way:
+
+- **`/pipe` with nothing after it,** typed as `/pipe`, found the personal
+  skill and showed one carousel: worker, model, effort. It then asked for
+  the task. Found and fixed: the hub offered itself as a worker.
+- **The task** went to the worker with `sonnet` and `medium`. Its
+  questions came back as one carousel (tone, file contents, and the ACR
+  dimensions as a multiSelect), and the result arrived as before.
+- **A background subagent's prompts:** three Write prompts went out as
+  alerts and were answered, and none was withdrawn.
+- **`--model` didn't take effect.** This Mac's settings force every
+  subagent onto `opus`, so the worker had no way to choose Sonnet. It said
+  so in its result. The hub's interpretation flagged that the run probably
+  cost more than asked for. Now a worker asks about that before it starts.
+- **A follow-up:** the user asked the hub to find out why. The hub sent the
+  worker a request, the worker answered once, correcting part of its own
+  result, and the hub passed the answer on with its own take.
+- **`/reload-plugins` doesn't restart the tailbus server.** It reported
+  reloading the plugin's servers, but the hub's `tailbus mcp` kept the same
+  process. After updating tailbus, restart sessions.
+
+Not tested yet: a pipe across machines to the real worker, which bills the
+client.
 
 ### ACR: adversarial convergence review
 

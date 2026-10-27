@@ -8,7 +8,7 @@ Hand a task to a worker over tailbus. A worker is another Claude Code session, u
 Arguments: $ARGUMENTS
 
 1. **Fill in what's missing.** Read the arguments: an optional `--model <model>` and `--effort <level>`, then the worker, then the task. When the worker and the task are both given, go straight to step 2, with the defaults for any setting left out. Otherwise call peer_list and ask your user with a single AskUserQuestion carousel, with only the questions below that the arguments leave open:
-   - **Worker:** the live sessions peer_list shows, clients' workers first. Label each with its address, and its client when it has one.
+   - **Worker:** the live sessions peer_list shows, other than your own, clients' workers first. Label each with its address, and its client when it has one.
    - **Model:** "Worker's own (Recommended)", then "opus", "sonnet" and "fable".
    - **Effort:** "xhigh (Recommended)", then "high", "max" and "medium".
    If there's no task, ask your user to write it in their next message, and stop until they do.

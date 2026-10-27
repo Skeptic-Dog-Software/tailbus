@@ -159,8 +159,9 @@ pub fn claude(install: bool) -> Result<()> {
         bail!("`claude plugin install` failed: {}", said.trim());
     }
     println!(
-        "Installed the tailbus plugin. Sessions started from now on load it; \
-         in a session that's already open, run /reload-plugins."
+        "Installed the tailbus plugin. Sessions started from now on load it. Restart \
+         sessions that are already open: /reload-plugins rereads the plugin's files, but \
+         keeps a tailbus server that's already running on the old version."
     );
     Ok(())
 }
