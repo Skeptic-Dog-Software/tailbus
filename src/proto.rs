@@ -178,6 +178,47 @@ pub struct AgentInfo {
     /// When a session last held the name, in Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_live: Option<i64>,
+    /// The client its live session is a worker for: tagged for that client,
+    /// and billed to an API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// How its live session is billed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<Billing>,
+    /// Why its session's client tag didn't hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_refused: Option<String>,
+}
+
+/// How a session is billed, as `claude auth status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Billing {
+    /// `claude.ai`, `oauth_token`, `api_key`, `api_key_helper`,
+    /// `third_party` or `none`.
+    pub method: String,
+    /// The subscription, on `claude.ai`, such as `max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+}
+
+impl Billing {
+    /// Billed to an API key: Anthropic's, one from a helper script, or a
+    /// cloud provider's. Not to a subscription.
+    pub fn api_key(&self) -> bool {
+        matches!(
+            self.method.as_str(),
+            "api_key" | "api_key_helper" | "third_party"
+        )
+    }
+}
+
+impl std::fmt::Display for Billing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.plan {
+            Some(plan) => write!(f, "{} ({plan})", self.method),
+            None => write!(f, "{}", self.method),
+        }
+    }
 }
 
 /// `POST /v1/asks`: show the user a dialog for another of their machines.

@@ -108,6 +108,11 @@ pub struct Config {
     /// agent's message started go out at once.
     #[serde(default = "default_ask_after")]
     pub ask_after_secs: u64,
+    /// Agents here that are clients' workers: agent name to client name.
+    /// The tag holds only while the agent's session is billed to an API
+    /// key. `TAILBUS_CLIENT` can tag a session instead.
+    #[serde(default)]
+    pub clients: std::collections::HashMap<String, String>,
 }
 
 fn default_port() -> u16 {
@@ -155,6 +160,9 @@ mod tests {
         assert_eq!(cfg.handoff_limit, 6);
         assert!(cfg.alerts);
         assert_eq!(cfg.ask_after_secs, 60);
+        assert!(cfg.clients.is_empty());
+        let cfg: Config = toml::from_str("[clients]\nwork = \"acme\"").unwrap();
+        assert_eq!(cfg.clients["work"], "acme");
 
         let cfg: Config = toml::from_str("port = 5000\nallow = [\"a@b.com\"]").unwrap();
         assert_eq!(cfg.port, 5000);

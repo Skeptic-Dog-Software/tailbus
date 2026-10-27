@@ -201,7 +201,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("mcp-{}-{}", std::process::id(), util::new_id()));
-            mcp::run(socket, agent, session, std::os::unix::process::parent_id())?;
+            let client = env::var("TAILBUS_CLIENT").ok().filter(|c| !c.is_empty());
+            mcp::run(
+                socket,
+                agent,
+                session,
+                std::os::unix::process::parent_id(),
+                client,
+            )?;
         }
         Cmd::Hook { command } => {
             let explicit = cli.agent.filter(|a| valid_name(a));

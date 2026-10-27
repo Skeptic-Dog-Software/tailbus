@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::ask;
-use crate::bus::{Bus, Handoff, Waited};
+use crate::bus::{Bus, Claim, Handoff, Waited};
 use crate::config::{Config, Paths};
 use crate::local::{
     self, AgentStatus, Events, Held, Hello, Item, Messages, Request, Status, Thread, Verdict, Woken,
@@ -256,7 +256,18 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             session,
             app,
             client_pid,
-        } => match bus.hold(&agent, &session, app.as_deref(), client_pid)? {
+            client,
+            billing,
+        } => match bus.hold(
+            &agent,
+            &Claim {
+                session: &session,
+                app: app.as_deref(),
+                client_pid,
+                client: client.as_deref(),
+                billing: billing.as_ref(),
+            },
+        )? {
             Err(reason) => conn.write(&Held {
                 held: false,
                 reason: Some(reason),

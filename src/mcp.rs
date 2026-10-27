@@ -7,6 +7,7 @@ use std::io::{self, BufRead, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::format::{self, Tools};
 use crate::local::{self, Client, Held, Hello, Inbox, Peers, Request, Sent, Thread};
-use crate::proto::MAX_BATCH;
+use crate::proto::{Billing, MAX_BATCH};
 
 /// Revisions this server speaks. Claude Code also offers 2026-07-28, but
 /// a server on that revision can't become a channel later, so it's left out.
@@ -34,6 +35,8 @@ struct Server {
     agent: String,
     session: String,
     client_pid: u32,
+    /// The client this session is a worker for, from `TAILBUS_CLIENT`.
+    client: Option<String>,
     socket: PathBuf,
     machine: Option<String>,
     hold: Mutex<Hold>,
@@ -45,7 +48,13 @@ struct Server {
     started: Mutex<bool>,
 }
 
-pub fn run(socket: PathBuf, agent: String, session: String, client_pid: u32) -> Result<()> {
+pub fn run(
+    socket: PathBuf,
+    agent: String,
+    session: String,
+    client_pid: u32,
+    client: Option<String>,
+) -> Result<()> {
     let machine = local::call::<Hello>(&socket, &Request::Hello)
         .ok()
         .map(|h| h.machine)
@@ -54,6 +63,7 @@ pub fn run(socket: PathBuf, agent: String, session: String, client_pid: u32) -> 
         agent,
         session,
         client_pid,
+        client,
         socket,
         machine,
         hold: Mutex::new(Hold::Connecting),
@@ -175,6 +185,13 @@ impl Server {
     /// Holds the agent name while the daemon runs, taking it again after a
     /// daemon restart.
     fn hold_loop(&self, app: Option<String>) {
+        // Only Claude Code's own CLI can say how a Claude Code session is
+        // billed.
+        let billing = if app.as_deref() == Some("claude-code") {
+            billing()
+        } else {
+            None
+        };
         loop {
             let held = Client::connect(&self.socket).and_then(|mut c| {
                 let held: Held = c.call(&Request::Hold {
@@ -182,6 +199,8 @@ impl Server {
                     session: self.session.clone(),
                     app: app.clone(),
                     client_pid: self.client_pid,
+                    client: self.client.clone(),
+                    billing: billing.clone(),
                 })?;
                 Ok((c, held))
             });
@@ -318,6 +337,27 @@ impl Server {
             wait_secs,
         }
     }
+}
+
+/// How this session is billed, as `claude auth status` reports it, run in
+/// the session's own environment so it sees the same credentials.
+/// `TAILBUS_TEST_AUTH_METHOD` stands in for it in tests, which keeps them
+/// off any client's API key.
+fn billing() -> Option<Billing> {
+    if let Ok(method) = std::env::var("TAILBUS_TEST_AUTH_METHOD") {
+        return Some(Billing { method, plan: None });
+    }
+    let out = Command::new("claude")
+        .args(["auth", "status"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let status: Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(Billing {
+        method: status["authMethod"].as_str()?.to_string(),
+        plan: status["subscriptionType"].as_str().map(str::to_string),
+    })
 }
 
 fn tools() -> Value {

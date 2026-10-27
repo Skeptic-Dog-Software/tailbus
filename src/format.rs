@@ -205,12 +205,20 @@ fn agents(out: &mut String, list: &AgentList, now: i64) {
                 None => "no session yet".into(),
             }
         };
-        let app = a
-            .app
-            .as_deref()
-            .map(|a| format!(", {a}"))
-            .unwrap_or_default();
-        let _ = writeln!(out, "  {}@{}  ({state}{app})", a.name, list.machine);
+        let mut about = state;
+        if let Some(app) = &a.app {
+            let _ = write!(about, ", {app}");
+        }
+        if let Some(client) = &a.client {
+            let _ = write!(about, ", {client}'s worker");
+        }
+        if let Some(billing) = &a.billing {
+            let _ = write!(about, ", billed to {billing}");
+        }
+        if let Some(why) = &a.tag_refused {
+            let _ = write!(about, "; not a worker: {why}");
+        }
+        let _ = writeln!(out, "  {}@{}  ({about})", a.name, list.machine);
     }
 }
 
@@ -310,6 +318,38 @@ mod tests {
         assert!(both.starts_with("tailbus: 3 messages"));
         assert!(both.contains("A request") && both.contains("A response"));
         assert!(both.contains("A notice"));
+    }
+
+    #[test]
+    fn lists_workers_and_how_sessions_are_billed() {
+        use crate::proto::{AgentInfo, Billing};
+        let agent = |name: &str, client: Option<&str>, method: &str| AgentInfo {
+            name: name.into(),
+            live: true,
+            app: Some("claude-code".into()),
+            last_live: None,
+            client: client.map(Into::into),
+            billing: Some(Billing {
+                method: method.into(),
+                plan: (method == "claude.ai").then(|| "max".into()),
+            }),
+            tag_refused: None,
+        };
+        let list = AgentList {
+            machine: "server".into(),
+            agents: vec![
+                agent("work", Some("acme"), "api_key"),
+                agent("dana", None, "claude.ai"),
+            ],
+        };
+        let mut out = String::new();
+        agents(&mut out, &list, 0);
+        assert!(out.contains(
+            "work@server  (live, claude-code, acme's worker, billed to api_key)"
+        ));
+        assert!(
+            out.contains("dana@server  (live, claude-code, billed to claude.ai (max))")
+        );
     }
 
     #[test]

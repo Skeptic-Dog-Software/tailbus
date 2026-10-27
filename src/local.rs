@@ -24,6 +24,12 @@ pub enum Request {
         app: Option<String>,
         /// The agent app's process, which owns the session.
         client_pid: u32,
+        /// The client the session is a worker for, from `TAILBUS_CLIENT`.
+        #[serde(default)]
+        client: Option<String>,
+        /// How the session is billed, from `claude auth status`.
+        #[serde(default)]
+        billing: Option<crate::proto::Billing>,
     },
     Send {
         agent: String,

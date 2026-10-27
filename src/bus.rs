@@ -15,8 +15,8 @@ use crate::config::Config;
 use crate::local::{Event, Inbox, Item, PeerMachine, Peers, Sent};
 use crate::net;
 use crate::proto::{
-    AgentInfo, AgentList, MAX_BATCH, MAX_BODY, Message, MessageBatch, Pipe, Receipt, ReceiptBatch,
-    SendState, StoreResult, StoreResults, StoreStatus,
+    AgentInfo, AgentList, Billing, MAX_BATCH, MAX_BODY, Message, MessageBatch, Pipe, Receipt,
+    ReceiptBatch, SendState, StoreResult, StoreResults, StoreStatus,
 };
 use crate::store::{Acked, Incoming, Store, Stored, machine_part, name_part};
 use crate::tailscale::{Status, Tailscale, Whois};
@@ -127,6 +127,23 @@ struct Holder {
     session: String,
     app: Option<String>,
     client_pid: u32,
+    /// The client it's a worker for, once the tag has been checked.
+    client: Option<String>,
+    billing: Option<Billing>,
+    /// Why its client tag didn't hold.
+    tag_refused: Option<String>,
+}
+
+/// What a session says about itself when it claims an agent name.
+#[derive(Default)]
+pub struct Claim<'a> {
+    pub session: &'a str,
+    pub app: Option<&'a str>,
+    pub client_pid: u32,
+    /// The client it's a worker for, from `TAILBUS_CLIENT`.
+    pub client: Option<&'a str>,
+    /// How it's billed, from `claude auth status`.
+    pub billing: Option<&'a Billing>,
 }
 
 /// The push adapter waiting on an agent's behalf.
@@ -331,16 +348,17 @@ impl Bus {
     /// Claims `agent` for a session, unless another live session holds it.
     /// The same session may claim it again. (Matching on the app's process
     /// is only for hooks: one Codex server can host many sessions.)
-    pub fn hold(
-        &self,
-        agent: &str,
-        session: &str,
-        app: Option<&str>,
-        client_pid: u32,
-    ) -> Result<Result<u64, String>> {
+    pub fn hold(&self, agent: &str, claim: &Claim) -> Result<Result<u64, String>> {
+        let Claim {
+            session,
+            app,
+            client_pid,
+            ..
+        } = *claim;
         if !valid_name(agent) {
             bail!("{agent:?} isn't a valid agent name: use lowercase letters, digits and hyphens");
         }
+        let (client, tag_refused) = self.worker_tag(agent, claim);
         let mut live = lock(&self.live);
         if let Some(h) = live.holders.get(agent)
             && h.session != session
@@ -361,6 +379,9 @@ impl Bus {
                 session: session.to_string(),
                 app: app.map(str::to_string),
                 client_pid,
+                client: client.clone(),
+                billing: claim.billing.cloned(),
+                tag_refused: tag_refused.clone(),
             },
         );
         if live
@@ -373,11 +394,53 @@ impl Bus {
         drop(live);
         self.notify();
         self.db().agent_live(agent, app, now_ms())?;
-        self.event(format!(
-            "{agent}: session started ({})",
-            app.unwrap_or("unknown app")
-        ));
+        let mut about = app.unwrap_or("unknown app").to_string();
+        if let Some(billing) = claim.billing {
+            about.push_str(&format!(", billed to {billing}"));
+        }
+        match (&client, &tag_refused) {
+            (Some(client), _) => about.push_str(&format!(", {client}'s worker")),
+            (None, Some(why)) => about.push_str(&format!("; not a worker: {why}")),
+            (None, None) => {}
+        }
+        self.event(format!("{agent}: session started ({about})"));
         Ok(Ok(token))
+    }
+
+    /// The client a claiming session is a worker for, or why its tag
+    /// doesn't hold. A worker must be billed to an API key, so a client's
+    /// work never lands on a subscription.
+    fn worker_tag(&self, agent: &str, claim: &Claim) -> (Option<String>, Option<String>) {
+        let Some(client) = claim
+            .client
+            .map(str::to_string)
+            .or_else(|| self.cfg.clients.get(agent).cloned())
+        else {
+            return (None, None);
+        };
+        if !valid_name(&client) {
+            return (
+                None,
+                Some(format!(
+                    "{client:?} isn't a valid client name: use lowercase letters, digits and hyphens"
+                )),
+            );
+        }
+        match claim.billing {
+            Some(b) if b.api_key() => (Some(client), None),
+            Some(b) => (
+                None,
+                Some(format!(
+                    "tagged for {client}, but billed to {b}, not an API key"
+                )),
+            ),
+            None => (
+                None,
+                Some(format!(
+                    "tagged for {client}, but how the session is billed couldn't be checked"
+                )),
+            ),
+        }
     }
 
     pub fn release(&self, agent: &str, token: u64) {
@@ -1244,15 +1307,15 @@ impl Bus {
                 .into_iter()
                 .map(|r| {
                     let is_live = Bus::is_live(&live, &r.name);
-                    let app = live
-                        .holders
-                        .get(&r.name)
-                        .and_then(|h| h.app.clone())
-                        .or(r.app);
+                    let holder = live.holders.get(&r.name);
+                    let app = holder.and_then(|h| h.app.clone()).or(r.app);
                     AgentInfo {
                         live: is_live,
                         app,
                         last_live: if is_live { Some(now) } else { r.last_live },
+                        client: holder.and_then(|h| h.client.clone()),
+                        billing: holder.and_then(|h| h.billing.clone()),
+                        tag_refused: holder.and_then(|h| h.tag_refused.clone()),
                         name: r.name,
                     }
                 })
@@ -1620,9 +1683,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_worker_must_be_billed_to_an_api_key() {
+        let mut cfg: Config = toml::from_str("alerts = false").unwrap();
+        cfg.clients.insert("work".into(), "acme".into());
+        let bus = Bus::start(cfg, Store::memory());
+        let billed = |method: &str| Billing {
+            method: method.into(),
+            plan: None,
+        };
+        let tag = |agent: &str, client: Option<&str>, billing: Option<&Billing>| {
+            bus.worker_tag(
+                agent,
+                &Claim {
+                    client,
+                    billing,
+                    ..Claim::default()
+                },
+            )
+        };
+        let api = billed("api_key");
+        assert_eq!(
+            tag("api", Some("acme"), Some(&api)),
+            (Some("acme".into()), None)
+        );
+        // The config tags `work` without TAILBUS_CLIENT.
+        assert_eq!(
+            tag("work", None, Some(&billed("third_party"))).0.as_deref(),
+            Some("acme")
+        );
+        let (client, why) = tag("api", Some("acme"), Some(&billed("claude.ai")));
+        assert!(client.is_none() && why.unwrap().contains("not an API key"));
+        let (client, why) = tag("api", Some("acme"), None);
+        assert!(client.is_none() && why.unwrap().contains("couldn't be checked"));
+        let (client, why) = tag("api", Some("Acme Corp"), Some(&api));
+        assert!(client.is_none() && why.unwrap().contains("isn't a valid client name"));
+        assert_eq!(tag("api", None, Some(&api)), (None, None));
+    }
+
+    #[test]
     fn a_turn_from_another_session_is_ignored() {
         let bus = bus();
-        bus.hold("api", "s1", None, 100).unwrap().unwrap();
+        let claim = Claim {
+            session: "s1",
+            client_pid: 100,
+            ..Claim::default()
+        };
+        bus.hold("api", &claim).unwrap().unwrap();
         assert_eq!(bus.turn("api", "s2", 200, true), None);
         // After /clear, the hook's session changes but its app is the same.
         assert_eq!(bus.turn("api", "s2", 100, true).as_deref(), Some("s1"));
