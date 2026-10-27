@@ -416,10 +416,14 @@ Decided on 2026-10-26:
 - **Allow for session** also returns, as `updatedPermissions`, the allow
   rules Claude Code suggested for the prompt (its
   `permission_suggestions`), with their destination set to `session`.
-  Suggested mode changes and directory grants are left out. With no
-  suggested rule, it's the exact command for Bash, or the whole tool
-  otherwise, and the alert names it. Similar calls stop asking until the
-  session ends, and nothing is written to a settings file.
+  Suggested mode changes are left out. With no suggested rule, it's the
+  exact command for Bash, or the whole tool otherwise, and the alert names
+  it. For a file outside the project, Claude Code suggests access to its
+  folder instead, since a rule alone would still be asked about. The
+  button grants that folder too, for the session, and the alert names it
+  with its machine, such as "access to `/private/tmp/x` on server".
+  Similar calls stop asking until the session ends, and nothing is written
+  to a settings file.
 - **Question carousels and plan approvals** (`AskUserQuestion` and
   `ExitPlanMode`) go through the permission flow too. Only you can answer
   them, at the terminal, so the hook and the bus pass them by, and no
@@ -629,7 +633,12 @@ a folder grant ("always allow access to `/private/tmp/claude-501` from
 this project"). Allow for session leaves folder grants out, so it fell
 back to the exact command, `Bash(touch …)`, and Claude Code's check on
 folders outside the project still asked. Inside the project (test 3
-above), the button works. Open: what the button should do here.
+above), the button works.
+
+Fixed the same day: the button now also grants the folder Claude Code
+suggested, and the alert names it with its machine. Run twice on a file in
+a new folder outside the project, the command asked once, and the session
+gained the folder as a working directory.
 
 ## /pipe: handing a task to another agent
 

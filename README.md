@@ -123,8 +123,9 @@ wins.
 - **The terminal still works.** Its own prompt stays open, and answering
   there withdraws the alerts.
 - **Allow for session** adds only the allow rule the dialog names, such as
-  `Bash(npm test)`, until that session ends. It never switches the
-  session's mode.
+  `Bash(npm test)`, until that session ends. For a file outside the
+  session's project, it also gives access to that folder, which the dialog
+  names along with its machine. It never switches the session's mode.
 - **Which Macs:** this one, and the bus on each of your other online Macs,
   meaning machines owned by your own Tailscale account, not ones you only
   allowed. Set `alerts = false` in a Mac's config to keep dialogs off it.

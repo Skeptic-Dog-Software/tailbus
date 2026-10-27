@@ -61,16 +61,16 @@ pub fn describe(tool: &str, input: &Value) -> String {
     out.join("\n")
 }
 
-/// The rules "Allow for session" adds, until the session ends: Claude
-/// Code's own suggested allow rules for the call, or failing those, this
-/// exact command for Bash and the whole tool for anything else. Suggested
-/// mode changes, such as accepting all edits, are left out, as are
-/// directory grants, so the button never allows more than it says.
+/// What "Allow for session" adds, until the session ends: Claude Code's
+/// own suggested allow rules for the call, or failing those, this exact
+/// command for Bash and the whole tool for anything else. Plus access to
+/// any folder outside the project it suggested, since for a file there the
+/// rule alone would still be asked about. Suggested mode changes, such as
+/// accepting all edits, are left out. The alert names all of it, so the
+/// button never allows more than it says.
 pub fn session_rules(tool: &str, input: &Value, suggestions: &Value) -> Vec<Value> {
-    let mut rules: Vec<Value> = suggestions
-        .as_array()
-        .into_iter()
-        .flatten()
+    let suggested = || suggestions.as_array().into_iter().flatten();
+    let mut rules: Vec<Value> = suggested()
         .filter(|s| s["type"] == "addRules" && s["behavior"] == "allow")
         .flat_map(|s| s["rules"].as_array().cloned().unwrap_or_default())
         .collect();
@@ -81,12 +81,35 @@ pub fn session_rules(tool: &str, input: &Value, suggestions: &Value) -> Vec<Valu
             _ => json!({"toolName": tool}),
         });
     }
-    vec![json!({
+    let mut updates = vec![json!({
         "type": "addRules",
         "rules": rules,
         "behavior": "allow",
         "destination": "session",
-    })]
+    })];
+    let folders: Vec<Value> = suggested()
+        .filter(|s| s["type"] == "addDirectories")
+        .flat_map(|s| s["directories"].as_array().cloned().unwrap_or_default())
+        .filter(Value::is_string)
+        .collect();
+    if !folders.is_empty() {
+        updates.push(json!({
+            "type": "addDirectories",
+            "directories": folders,
+            "destination": "session",
+        }));
+    }
+    updates
+}
+
+/// The folders "Allow for session" gives access to.
+fn folders(updates: &[Value]) -> Vec<&str> {
+    updates
+        .iter()
+        .filter(|u| u["type"] == "addDirectories")
+        .flat_map(|u| u["directories"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect()
 }
 
 /// `Bash(npm test)`, `Write`.
@@ -128,9 +151,18 @@ pub fn prompt(r: &Request) -> Prompt {
     }
     let mut buttons = vec!["Deny".to_string(), "Allow".to_string()];
     if !r.rules.is_empty() {
+        let mut covers = rules_text(r.rules);
+        let folders = folders(r.rules);
+        if !folders.is_empty() {
+            let machine = r.agent.rsplit_once('@').map_or(r.agent, |(_, m)| m);
+            covers.push_str(&format!(
+                ", and access to {} on {machine}",
+                folders.join(", ")
+            ));
+        }
         text.push_str(&format!(
             "\n\nAllow for session also allows, until that session ends: {}.",
-            alert::clean(&rules_text(r.rules), 400)
+            alert::clean(&covers, 400)
         ));
         buttons.push("Allow for session".into());
     }
@@ -180,12 +212,14 @@ mod tests {
         let bash = json!({"command": "npm test"});
         // What Claude Code suggested for a `touch`: a directory and a mode.
         let suggested = json!([
-            {"type": "addDirectories", "directories": ["/x"], "destination": "session"},
+            {"type": "addDirectories", "directories": ["/x"], "destination": "localSettings"},
             {"type": "setMode", "mode": "acceptEdits", "destination": "session"}
         ]);
         let rules = session_rules("Bash", &bash, &suggested);
         assert_eq!(rules_text(&rules), "Bash(npm test)");
-        assert_eq!(rules[0]["destination"], "session");
+        assert_eq!(folders(&rules), ["/x"]);
+        assert!(rules.iter().all(|u| u["destination"] == "session"));
+        assert!(rules.iter().all(|u| u["type"] != "setMode"));
 
         let suggested = json!([{"type": "addRules", "behavior": "allow", "destination": "localSettings",
                                 "rules": [{"toolName": "Bash", "ruleContent": "npm run *"}]}]);
@@ -222,6 +256,24 @@ mod tests {
                 .contains("until that session ends: Bash(touch marker.txt).")
         );
         assert_eq!(p.buttons, ["Deny", "Allow", "Allow for session"]);
+
+        // A file outside the project: the folder is named, with its machine.
+        let input = json!({"command": "touch /private/tmp/x/marker.txt"});
+        let suggested = json!([{"type": "addDirectories", "directories": ["/private/tmp/x"],
+                                "destination": "localSettings"}]);
+        let rules = session_rules("Bash", &input, &suggested);
+        let p = prompt(&Request {
+            agent: "work@server",
+            tool: "Bash",
+            input: &input,
+            cwd: "/Users/dana/Work",
+            woken_by: None,
+            rules: &rules,
+        });
+        assert!(p.text.contains(
+            "until that session ends: Bash(touch /private/tmp/x/marker.txt), \
+             and access to /private/tmp/x on server."
+        ));
     }
 
     #[test]
