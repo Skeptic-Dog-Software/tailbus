@@ -11,10 +11,10 @@ they send. Tailscale says which machine every connection comes from, and
 which account owns it.
 
 [DESIGN.md](DESIGN.md) has the design and the plan. Built so far: the bus
-itself, the CLI, the MCP tools, push into Claude Code, and the limits that
-stop agents answering each other forever, and permission alerts on your
-Macs. `/pipe`, which hands a whole task to an agent on another machine, is
-next.
+itself, the CLI, the MCP tools, push into Claude Code, the limits that stop
+agents answering each other forever, permission alerts on your Macs, and
+[`/pipe`](#pipe), which hands a whole task to an agent on another machine
+and gets back a reviewed result.
 
 ## Install
 
@@ -40,7 +40,8 @@ allow = ["someone@example.com", "build-box"]
 
 The same file sets the [handoff limit](#requests-responses-and-the-handoff-limit)
 (`handoff_limit = 6`, or `0` for none), and `alerts = false` stops this Mac
-showing tailbus's dialogs.
+showing tailbus's dialogs. A `[clients]` table tags
+[clients' workers](#pipe) here, such as `work = "acme"`.
 
 ## Agents and addresses
 
@@ -66,6 +67,7 @@ The plugin gives each session these tools:
 | `msg_inbox` | List messages not yet handled, and your own still open. |
 | `msg_thread` | Show a whole conversation. |
 | `peer_list` | List the agents you can reach. |
+| `pipe_send`, `pipe_questions`, `pipe_answers`, `pipe_result` | The steps of a [`/pipe`](#pipe). |
 
 Messages also arrive on their own. A background hook, armed when the session
 starts and after every turn, waits on the bus. When a request comes in, or
@@ -127,7 +129,50 @@ wins.
   Its prompts and pauses then show on your other Macs.
 
 Only a click on a dialog can answer an alert. Neither agent can, and
-nothing on the bus's socket can either.
+nothing on the bus's socket can either. Question carousels and plan
+approvals stay at the terminal, since only you can answer those.
+
+### /pipe
+
+```
+/pipe [--model <model>] [--effort <level>] <client or agent@machine> <task>
+```
+
+Hands a task to a **worker**, another Claude Code session, usually a
+client's and billed to that client's API key. The worker does all the work.
+Your session coordinates, so your own plan pays only for that.
+
+1. **The worker asks first, every time.** Its clarifying questions,
+   including which ACR dimensions to review, come back as a question
+   carousel for you. Your agent never answers them for you.
+2. **The work, then ACR.** The worker builds the result in subagents, then
+   has fresh reviewers attack it one dimension at a time, for up to 3
+   rounds (the `acr` skill has the method).
+3. **The result comes back:** what was done, the review of each dimension,
+   where reviewers disagreed, and the model and effort that actually ran.
+   Your agent shows it as it came, then its own interpretation, labeled as
+   its own.
+
+To ask the worker something about the result, just ask your agent.
+
+- **Just `/pipe`** asks for the worker, model and effort in a carousel,
+  then for the task.
+- **Model and effort** default to the worker's own model at `xhigh`.
+  `--model` takes `opus`, `sonnet`, `fable` or a model ID, and `--effort`
+  takes `low` to `max`.
+- **Workers.** Start a worker's session with `TAILBUS_CLIENT=<client>`, or
+  list it under `[clients]` in its machine's config. The tag holds only
+  while `claude auth status` says the session is billed to an API key.
+  `peer_list` shows each worker's client and billing, or why its tag was
+  refused. `/pipe` sends only to a live session.
+- **Hub sessions,** the ones that aren't workers, offer to `/pipe` work
+  that's clearly a client's instead of doing it.
+- **The handoff limit** doesn't count messages sent from a turn you
+  started, or right after you answered a carousel. The sending bus marks
+  them, not the agent.
+
+The plugin's own command is `/tailbus:pipe`. `tailbus setup claude` also
+installs `~/.claude/skills/pipe`, so `/pipe` works as typed.
 
 ## From the command line
 

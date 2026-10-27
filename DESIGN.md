@@ -413,10 +413,17 @@ Decided on 2026-10-26:
   **Allow** and **Allow for session**. The first answer wins, and the other
   alerts close. The dialog in the session's terminal stays open too, and
   answering there withdraws the alerts.
-- **Allow for session** also returns, as `updatedPermissions`, the rules
-  Claude Code suggested for the prompt (its `permission_suggestions`), with
-  their destination set to `session`. Similar calls stop asking until the
+- **Allow for session** also returns, as `updatedPermissions`, the allow
+  rules Claude Code suggested for the prompt (its
+  `permission_suggestions`), with their destination set to `session`.
+  Suggested mode changes and directory grants are left out. With no
+  suggested rule, it's the exact command for Bash, or the whole tool
+  otherwise, and the alert names it. Similar calls stop asking until the
   session ends, and nothing is written to a settings file.
+- **Question carousels and plan approvals** (`AskUserQuestion` and
+  `ExitPlanMode`) go through the permission flow too. Only you can answer
+  them, at the terminal, so the hook and the bus pass them by, and no
+  alert can deny one.
 - **Which prompts go out:**
   - Right away when a message from another agent started the session's
     turn, or when the session is headless.
@@ -439,9 +446,12 @@ Decided on 2026-10-26:
     start and end both show.
 - **Seeing that the terminal answered:**
   - Allowed there: `PostToolUse`, or `PostToolUseFailure`, fires for the
-    same tool and input.
-  - Denied there: nothing fires until the next prompt. So the alerts also
-    close at the session's next prompt and at the end of its turn.
+    same tool and the same input. Only that call closes the prompt's
+    alerts; another call to the same tool doesn't.
+  - Denied there: nothing fires. So the alerts also close when you next
+    type in that session. A wake, or the end of the session's turn,
+    doesn't close them, since a background subagent's prompt can still be
+    open then.
   - Claude Code doesn't stop the hook when the prompt is answered, so the
     bus ends it. The hook also exits when Claude Code does.
 - **Telling turns apart:** a wake from the bus starts a turn whose
@@ -611,11 +621,16 @@ were shown and clicked earlier.
 
 ## /pipe: handing a task to another agent
 
-Designed 2026-10-26, to build after permission alerts. You run
+Designed 2026-10-26 and built 2026-10-27. You run
 `/pipe <agent@machine> <task>` in a Claude Code session. The agent you name
 does the work, checks it with ACR, and sends back a detailed result. Your
 own session's agent presents that result to you, with its own reading of
 it.
+
+Plugin commands are always prefixed with the plugin's name, so the
+plugin's own command is `/tailbus:pipe`. `tailbus setup claude` also
+installs a personal `pipe` skill, so `/pipe` works as typed. Only you can
+start either one; Claude can't.
 
 1. **Only to a live agent.** If the agent you name has no live session,
    `/pipe` refuses, says so, and lists the agents that are live.
@@ -712,7 +727,8 @@ on the worker: that inside a session that was offered an
 
 ### /pipe build plan
 
-Not started as of 2026-10-26. In order:
+Built on 2026-10-27, in this order. Where the build differs from the
+plan, the step says so.
 
 1. **Messages** gain two optional fields, each stored in a new column on
    `inbox` and `sent`, added to older databases like `wakes`:
@@ -748,7 +764,9 @@ Not started as of 2026-10-26. In order:
      AskUserQuestion's shape: 1 to 4 questions, each with 2 to 4 options,
      and the bus checks it.
    - `pipe_answers(reply_to, answers)`, for the hub;
-   - `pipe_result(reply_to, result)`, for the worker.
+   - `pipe_result(reply_to, result)`, for the worker. As built, the ACR
+     report, the disagreements, and the model and effort that actually
+     ran are fields of their own, beside the result.
    Follow-ups use `msg_send`, in the same thread.
 6. **Wrappers per stage:**
    - **A task,** to the worker: you're the worker; ask questions first,
@@ -767,7 +785,9 @@ Not started as of 2026-10-26. In order:
      carousel;
    - `skills/acr/SKILL.md`, the ACR method below.
    The hub guard goes in the MCP server's instructions for every session
-   that isn't a worker.
+   that isn't a worker. Added in the build: a personal `pipe` skill in
+   `~/.claude/skills/pipe/`, so `/pipe` works without the plugin's prefix.
+   Setup replaces it only if tailbus wrote it.
 8. **Tests:**
    - unit tests;
    - then a hub session and a tagged test worker, both on this Mac, both
@@ -775,6 +795,39 @@ Not started as of 2026-10-26. In order:
    - a small task with a cheap model and effort, and a single ACR
      dimension;
    - then the whole thing across machines.
+   The first three ran (below). The run across machines hasn't yet.
+
+### /pipe tested on Claude Code 2.1.310
+
+Real sessions on this Mac, on 2026-10-27, against a test bus whose dialogs
+answered Allow. Both were on the Skeptic Dog account: a hub on its Max
+plan, and a worker tagged `testclient`, with `TAILBUS_TEST_AUTH_METHOD`
+standing in for an API key.
+
+| Step | Result |
+|---|---|
+| The hub runs `/tailbus:pipe --model sonnet --effort low testclient <task>` | The bus found the worker by its client name. The task carried the model and effort. |
+| The worker's questions | Four, with the ACR dimensions it proposed among them. The hub showed them as one carousel, exactly as given, and sent the answers back. |
+| The work and ACR | Built in a subagent. A reviewer (AI agent) for accuracy attacked it in a fresh one: no blockers, six non-blockers, each marked as a fact or a judgment call. Confirmed in one round. |
+| What ran | A hook of the user's blocks subagents below medium effort, so `low` ran at `medium`. The worker's result said so, and so did the hub's interpretation. |
+| The result | One response. The hub presented the worker's result as it came, then "My interpretation (mine, not the worker's)": warnings, and what no review covered. |
+
+Found and fixed:
+
+- **Prompts withdrawn while still open.** A background subagent's
+  permission prompt was withdrawn when its session's turn ended, or when
+  another call to the same tool finished. It then waited at the worker's
+  terminal until it was answered there. Now only that exact call
+  finishing, or your next typed prompt, settles a prompt.
+- **Carousels sent as alerts.** Showing a carousel raised a permission
+  alert, and Deny would have cancelled the questions. Carousels and plan
+  approvals now stay at the terminal.
+- **`/pipe` was an unknown command,** since the plugin's command is
+  `/tailbus:pipe`. Setup now also installs the personal `pipe` skill.
+
+Not tested yet: `/pipe` as typed, `/pipe` with nothing after it, a
+background subagent's prompt since the fix, and a pipe across machines to
+the real worker, which bills the client.
 
 ### ACR: adversarial convergence review
 
