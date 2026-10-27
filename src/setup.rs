@@ -121,6 +121,15 @@ pub fn claude(install: bool) -> Result<()> {
             }
         })),
     )?;
+    // The /pipe command, and the ACR method its workers follow.
+    write(
+        &plugin.join("commands/pipe.md"),
+        include_str!("../plugin/commands/pipe.md"),
+    )?;
+    write(
+        &plugin.join("skills/acr/SKILL.md"),
+        include_str!("../plugin/skills/acr/SKILL.md"),
+    )?;
     println!("Wrote the Claude Code plugin to {}", plugin.display());
 
     if !install {

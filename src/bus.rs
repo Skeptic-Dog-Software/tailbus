@@ -941,7 +941,19 @@ impl Bus {
         {
             bail!("{r:?} isn't a message ID");
         }
-        let to = Address::parse(to, &me.machine)?;
+        // A reply may leave out who it's to: the sender of what it answers.
+        let replying_to = match (to.trim(), &reply_to) {
+            ("", Some(r)) => match self.db().incoming(r)? {
+                Some(m) if name_part(&m.msg.to) == from => m.msg.from,
+                _ => bail!("{from} has no message {r} to reply to"),
+            },
+            ("", None) => bail!("the message needs a recipient"),
+            (to, _) => to.to_string(),
+        };
+        if let Some(p) = &pipe {
+            check_pipe(p)?;
+        }
+        let to = Address::parse(&replying_to, &me.machine)?;
         let now = now_ms();
         // Sending subscribes the sender, so replies have somewhere to go, and
         // counts as it being active.
@@ -1227,6 +1239,9 @@ impl Bus {
                 _ if msg.reply_to.as_deref().is_some_and(|r| !is_id(r)) => {
                     Some("bad reply_to ID".into())
                 }
+                _ if msg.pipe.as_ref().is_some_and(|p| check_pipe(p).is_err()) => {
+                    Some("bad /pipe model or effort".into())
+                }
                 _ => None,
             };
             if let Some(problem) = problem {
@@ -1356,6 +1371,73 @@ impl Bus {
     }
 
     /// Agents on this machine and on every online peer whose bus answers.
+    /// Where a `/pipe` task goes: a client name finds that client's live
+    /// worker, here or on a peer, and an address must have a live session.
+    /// Refuses otherwise, saying who is live.
+    pub fn pipe_target(&self, to: &str) -> Result<String> {
+        let peers = self.peers()?;
+        let lists = std::iter::once(&peers.here)
+            .chain(peers.machines.iter().filter_map(|m| m.agents.as_ref()));
+        let live: Vec<(String, Option<String>)> = lists
+            .flat_map(|l| {
+                l.agents
+                    .iter()
+                    .filter(|a| a.live)
+                    .map(|a| (format!("{}@{}", a.name, l.machine), a.client.clone()))
+            })
+            .collect();
+        let me = self.me()?;
+        let found: Vec<&String> = if to.contains('@') {
+            let addr = Address::parse(to, &me.machine)?.to_string();
+            live.iter()
+                .map(|(a, _)| a)
+                .filter(|a| **a == addr)
+                .collect()
+        } else {
+            let workers: Vec<&String> = live
+                .iter()
+                .filter(|(_, c)| c.as_deref() == Some(to))
+                .map(|(a, _)| a)
+                .collect();
+            if workers.is_empty() {
+                let here = format!("{to}@{}", me.machine);
+                live.iter()
+                    .map(|(a, _)| a)
+                    .filter(|a| **a == here)
+                    .collect()
+            } else {
+                workers
+            }
+        };
+        match found.as_slice() {
+            [one] => Ok(one.to_string()),
+            [] => {
+                let now: Vec<String> = live
+                    .iter()
+                    .map(|(a, c)| match c {
+                        Some(c) => format!("{a} ({c}'s worker)"),
+                        None => a.clone(),
+                    })
+                    .collect();
+                bail!(
+                    "no live session matches {to}, so the task wasn't sent. Live now: {}.",
+                    if now.is_empty() {
+                        "nobody".to_string()
+                    } else {
+                        now.join(", ")
+                    }
+                )
+            }
+            many => bail!(
+                "{to} has more than one live worker: {}. Name one of them.",
+                many.iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
     pub fn peers(&self) -> Result<Peers> {
         let here = self.agent_list()?;
         let status = self.status()?;
@@ -1409,6 +1491,26 @@ impl Bus {
             Err(e) => self.event(format!("pruning failed: {e:#}")),
         }
     }
+}
+
+/// The models and efforts a pipe task may ask for, as Claude Code names
+/// them. A model is an alias such as `opus`, or a full model ID.
+fn check_pipe(p: &Pipe) -> Result<()> {
+    if let Some(e) = &p.effort
+        && !matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
+    {
+        bail!("{e:?} isn't an effort level: use low, medium, high, xhigh or max");
+    }
+    if let Some(m) = &p.model
+        && (m.is_empty()
+            || m.len() > 64
+            || !m
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._[]".contains(&b)))
+    {
+        bail!("{m:?} isn't a model name: use an alias such as opus or sonnet, or a model ID");
+    }
+    Ok(())
 }
 
 /// A warning for a message to an agent that hasn't had a session lately,
@@ -1718,6 +1820,59 @@ pub(crate) mod tests {
         let (client, why) = tag("api", Some("Acme Corp"), Some(&api));
         assert!(client.is_none() && why.unwrap().contains("isn't a valid client name"));
         assert_eq!(tag("api", None, Some(&api)), (None, None));
+    }
+
+    #[test]
+    fn pipe_tasks_find_a_live_worker_by_client_or_address() {
+        let bus = bus();
+        *bus.status.lock().unwrap() = Some((
+            Instant::now(),
+            Status {
+                machine: "here".into(),
+                ipv4: None,
+                owner: "o".into(),
+                peers: Vec::new(),
+            },
+        ));
+        let api_key = Billing {
+            method: "api_key".into(),
+            plan: None,
+        };
+        bus.db().add_agent("work", 1).unwrap();
+        bus.hold(
+            "work",
+            &Claim {
+                session: "w",
+                client: Some("acme"),
+                billing: Some(&api_key),
+                ..Claim::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bus.pipe_target("acme").unwrap(), "work@here");
+        assert_eq!(bus.pipe_target("work@here").unwrap(), "work@here");
+        assert_eq!(bus.pipe_target("work").unwrap(), "work@here");
+        // api has no live session, and nobody works for globex.
+        let refused = bus.pipe_target("api@here").unwrap_err().to_string();
+        assert!(
+            refused.contains("Live now: work@here (acme's worker)"),
+            "{refused}"
+        );
+        assert!(bus.pipe_target("globex").is_err());
+    }
+
+    #[test]
+    fn pipe_settings_are_checked() {
+        let pipe = |model: Option<&str>, effort: Option<&str>| Pipe {
+            stage: crate::proto::PipeStage::Task,
+            model: model.map(Into::into),
+            effort: effort.map(Into::into),
+        };
+        assert!(check_pipe(&pipe(Some("claude-opus-5-5"), Some("xhigh"))).is_ok());
+        assert!(check_pipe(&pipe(None, None)).is_ok());
+        assert!(check_pipe(&pipe(None, Some("turbo"))).is_err());
+        assert!(check_pipe(&pipe(Some("opus\" onload=\""), None)).is_err());
     }
 
     #[test]

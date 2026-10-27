@@ -21,7 +21,7 @@ use crate::local::{
 };
 use crate::net;
 use crate::permission;
-use crate::proto::MAX_BATCH;
+use crate::proto::{MAX_BATCH, PipeStage};
 use crate::store::{Incoming, Store};
 use crate::util::{now_ms, valid_name};
 
@@ -290,6 +290,12 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             expects_reply,
             pipe,
         } => {
+            // A pipe task goes only to a live session, found by client name
+            // or address.
+            let to = match &pipe {
+                Some(p) if p.stage == PipeStage::Task => bus.pipe_target(&to)?,
+                _ => to,
+            };
             let sent = bus.send(&agent, &to, body, reply_to, expects_reply, pipe)?;
             conn.write(&sent)?;
         }
