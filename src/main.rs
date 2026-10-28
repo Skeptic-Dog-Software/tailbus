@@ -16,6 +16,7 @@ mod proto;
 mod setup;
 mod store;
 mod tailscale;
+mod usage;
 mod util;
 
 use std::env;
@@ -23,7 +24,7 @@ use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 
 use crate::config::Paths;
@@ -101,6 +102,15 @@ enum Cmd {
     Status,
     /// Follow the daemon's log of messages and sessions.
     Tail,
+    /// Count the tokens a Claude Code session used, with its subagents'.
+    Usage {
+        /// The session's ID, or its transcript's path.
+        session: String,
+        /// Count only from this time, such as 2026-10-27T17:51:33Z, or from
+        /// when this message was sent.
+        #[arg(long, value_name = "TIME OR ID")]
+        since: Option<String>,
+    },
     /// Run the daemon in the foreground.
     Daemon,
     /// Run the MCP server, as an agent app does for each session.
@@ -391,6 +401,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!("{} {}", rfc3339(e.at), e.text);
                     after = e.seq;
                 }
+            }
+        }
+        Cmd::Usage { session, since } => {
+            let path = if session.ends_with(".jsonl") {
+                PathBuf::from(&session)
+            } else {
+                usage::transcript(&session)
+                    .ok_or_else(|| anyhow!("found no transcript for session {session}"))?
+            };
+            let since = match since.as_deref() {
+                None => 0,
+                Some(s) => util::id_ms(s)
+                    .or_else(|| util::parse_rfc3339(s))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "--since takes a time, such as 2026-10-27T17:51:33Z, or a message ID"
+                        )
+                    })?,
+            };
+            let used = usage::measure(&path, since)?;
+            if used.total().responses == 0 {
+                println!("No token use recorded.");
+            } else {
+                println!("{}", usage::describe(&used));
             }
         }
     }

@@ -153,6 +153,8 @@ Your session coordinates, so your own plan pays only for that.
    rounds (the `acr` skill has the method).
 3. **The result comes back:** what was done, the review of each dimension,
    where reviewers disagreed, and the model and effort that actually ran.
+   It also has the tokens the worker and its subagents used, which tailbus
+   counts from their transcripts, so the agent doesn't report them itself.
    Your agent shows it as it came, then its own interpretation, labeled as
    its own.
 
@@ -189,6 +191,7 @@ installs `~/.claude/skills/pipe`, so `/pipe` works as typed.
 | `tailbus peers` | List the agents you can reach. |
 | `tailbus status` | Show the bus's state. |
 | `tailbus tail` | Follow messages and sessions as they happen. |
+| `tailbus usage <session>` | Count the tokens a Claude Code session and its subagents used, from their transcripts: input, output, cache writes and cache reads. `--since` takes a time or a message ID, such as a `/pipe` task's. |
 
 ## How it works
 

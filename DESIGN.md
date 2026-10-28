@@ -753,6 +753,67 @@ Verified on Claude Code 2.1.310: `claude auth status` prints JSON with
 on the worker: that inside a session that was offered an
 `ANTHROPIC_API_KEY` and declined it, the command reports the subscription.
 
+### Token counts and the subagent cap
+
+Designed 2026-10-28. A long run across machines can use hundreds of
+millions of tokens before anyone has agreed to it. So you agree to
+an estimate before a worker starts, and the worker keeps to it.
+
+- **Counts, not prices.** Estimates, approvals and reports are all token
+  counts. tailbus shows no prices.
+- **Measured by tailbus, not the agent.** The worker's bus reads Claude
+  Code's transcripts: the worker session's own, and each subagent's under
+  `<session>/subagents/`. It counts each API response once, by message ID,
+  from when the task was sent. It adds up input, output, cache writes and
+  cache reads, by model. Every result's "What ran" carries those totals,
+  and `tailbus usage` prints them for any session.
+- **The plan and the estimate.** After your answers, the worker sends a
+  plan with a new tool, `pipe_plan`: how many subagents research and
+  build, the ACR dimensions, the round cap, the model and the effort. Its
+  bus turns the plan into an estimate, from what subagents with the same
+  model, effort and role used on earlier tasks:
+  - **low:** every dimension confirmed in its first round;
+  - **expected:** as many rounds as earlier tasks took;
+  - **worst:** every dimension through all 3 rounds and a verify-only
+    round.
+
+  The estimate says how many earlier tasks it's based on. The first run
+  gives one so far: about 12.5 million tokens per subagent on Opus at
+  `xhigh`, and 11.8 million for the worker's own session.
+- **Agreeing to it.** Your session shows the plan and the estimate as a
+  carousel: approve up to the worst case, ask for a smaller plan, or
+  cancel. Your answer goes back like any other.
+- **Keeping to it.** In a worker's session during a pipe task, a
+  `PreToolUse` hook on the `Agent` tool refuses to start a subagent:
+  - before the plan is approved;
+  - once the task's measured total reaches the approved count. The worker
+    then asks you with `pipe_questions` whether to approve more, with a
+    fresh estimate for what's left, or to stop and send what's done;
+  - while the task already has as many subagents running as its cap
+    allows.
+
+  The refusal says why, so the worker knows what to do next. Subagents
+  used 95% of the first run's tokens, so the hook covers nearly all of
+  it. The worker's own session isn't stopped.
+- **The subagent cap.** At most 5 subagents run at once on any one task,
+  as `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=5` does on this Mac. A worker's
+  own settings may not set that. So the cap rides in the task, like the
+  model and effort, from the hub's config (`max_subagents`, default 5). A
+  subagent counts as running until its `.meta.json` says `finished`.
+- **Still to decide:** whether reaching the approved count stops the
+  worker or only warns, and whether small estimates go ahead without
+  asking. As designed, it stops, and always asks.
+
+Build order:
+
+1. **Measuring:** `tailbus usage`, and the totals in every result. Built
+   2026-10-28. `pipe_result` counts from the time in the task's ID, which
+   is when the hub sent it.
+2. **The subagent cap:** the hook, the `max_subagents` setting, and the
+   cap in the task.
+3. **The plan, the estimate and the approval,** then the hook's two
+   checks against the approved count.
+
 ### /pipe build plan
 
 Built on 2026-10-27, in this order. Where the build differs from the
@@ -823,7 +884,7 @@ plan, the step says so.
    - a small task with a cheap model and effort, and a single ACR
      dimension;
    - then the whole thing across machines.
-   The first three ran (below). The run across machines hasn't yet.
+   All of them ran (below).
 
 ### /pipe tested on Claude Code 2.1.310
 

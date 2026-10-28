@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use crate::format::{self, Tools};
 use crate::local::{self, Client, Held, Hello, Inbox, Peers, Request, Sent, Thread};
 use crate::proto::{Billing, MAX_BATCH, Pipe, PipeStage};
+use crate::{usage, util};
 
 /// Revisions this server speaks. Claude Code also offers 2026-07-28, but
 /// a server on that revision can't become a channel later, so it's left out.
@@ -355,16 +356,19 @@ impl Server {
                 )
             }
             "pipe_result" => {
+                let task = need("reply_to")?;
                 let body = format!(
                     "## Result\n\n{}\n\n## ACR report\n\n{}\n\n## Where reviewers disagreed\n\n{}\n\n\
-                     ## What ran\n\nModel: {}. Effort: {}.",
+                     ## What ran\n\nModel: {}. Effort: {}.\n\nTokens, counted by tailbus from the \
+                     worker's transcripts, from when the task was sent: {}",
                     need("result")?.trim(),
                     need("acr")?.trim(),
                     need("disagreements")?.trim(),
                     need("model")?.trim(),
                     need("effort")?.trim(),
+                    self.tokens_since(&task),
                 );
-                self.pipe_reply(need("reply_to")?, body, false, PipeStage::Result)
+                self.pipe_reply(task, body, false, PipeStage::Result)
             }
             "msg_ack" => {
                 let _: Value = local::call(
@@ -394,6 +398,21 @@ impl Server {
                 Ok(format::peers(&peers))
             }
             _ => bail!("there's no tool {name}"),
+        }
+    }
+
+    /// What this session and its subagents used since `task` was sent. The
+    /// ID says when.
+    fn tokens_since(&self, task: &str) -> String {
+        let Some(since) = util::id_ms(task) else {
+            return "not counted, since the task's ID doesn't say when it was sent.".into();
+        };
+        let Some(path) = usage::transcript(&self.session) else {
+            return "not counted, since tailbus found no transcript for this session.".into();
+        };
+        match usage::measure(&path, since) {
+            Ok(used) => usage::describe(&used),
+            Err(e) => format!("not counted: {e:#}."),
         }
     }
 
@@ -593,7 +612,7 @@ fn tools() -> Value {
         },
         {
             "name": "pipe_result",
-            "description": "For a worker on a /pipe task: send the hub the detailed result, once, after the work and its ACR. Report only what each review actually covered.",
+            "description": "For a worker on a /pipe task: send the hub the detailed result, once, after the work and its ACR. Report only what each review actually covered. tailbus adds the tokens you and your subagents used, counted from your transcripts, so don't report them yourself.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

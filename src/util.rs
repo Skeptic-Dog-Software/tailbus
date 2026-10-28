@@ -38,6 +38,17 @@ pub fn is_id(s: &str) -> bool {
     s.len() == 26 && s.bytes().all(|b| CROCKFORD.contains(&b))
 }
 
+/// When an ID was made, in milliseconds: its first 48 bits.
+pub fn id_ms(id: &str) -> Option<i64> {
+    if !is_id(id) {
+        return None;
+    }
+    id.bytes().take(10).try_fold(0i64, |ms, b| {
+        let digit = CROCKFORD.iter().position(|&c| c == b)?;
+        Some(ms * 32 + digit as i64)
+    })
+}
+
 /// Agent and machine names: lowercase letters, digits and hyphens, so a name
 /// can't carry anything else into a notice or a prompt.
 pub fn valid_name(s: &str) -> bool {
@@ -166,6 +177,37 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// Reads `2026-10-23T14:42:46.637Z`, as Claude Code's transcripts write
+/// times, or `rfc3339`'s own form without the fraction. UTC only.
+pub fn parse_rfc3339(s: &str) -> Option<i64> {
+    let (date, time) = s.strip_suffix('Z')?.split_once('T')?;
+    let mut ymd = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (ymd.next()??, ymd.next()??, ymd.next()??);
+    let (hms, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let mut hms = hms.splitn(3, ':').map(|p| p.parse::<i64>().ok());
+    let (h, min, sec) = (hms.next()??, hms.next()??, hms.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let ms = match fraction {
+        "" => 0,
+        f if f.bytes().all(|b| b.is_ascii_digit()) => format!("{f:0<3}")[..3].parse().ok()?,
+        _ => return None,
+    };
+    Some((days_from_civil(y, m, d) * 86_400 + h * 3600 + min * 60 + sec) * 1000 + ms)
+}
+
+/// Howard Hinnant's algorithm the other way: (year, month, day) to days
+/// since 1970-01-01.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// `just now`, `5m ago`, `3h ago`, `2d ago`.
 pub fn ago(then: i64, now: i64) -> String {
     let s = (now - then).max(0) / 1000;
@@ -190,6 +232,12 @@ mod tests {
         assert!(is_id(&new_id()));
         assert_ne!(new_id(), new_id());
         assert!(!is_id("0000000000000000000000000I"));
+        assert_eq!(
+            id_ms(&ulid(1_793_196_173_546, u128::MAX)),
+            Some(1_793_196_173_546)
+        );
+        assert_eq!(id_ms("01M61D4A7AN5PDZ56KWS6GHNNM"), Some(1_793_196_173_546));
+        assert_eq!(id_ms("not an id"), None);
     }
 
     #[test]
@@ -221,6 +269,20 @@ mod tests {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(1_793_210_645_000), "2026-10-28T18:04:05Z");
         assert_eq!(rfc3339(951_782_400_000), "2000-02-29T00:00:00Z");
+        for ms in [0, 951_782_400_000, 1_793_210_645_000] {
+            assert_eq!(parse_rfc3339(&rfc3339(ms)), Some(ms));
+        }
+        assert_eq!(
+            parse_rfc3339("2026-10-23T14:42:46.637Z"),
+            Some(1_792_766_566_637)
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-23T14:42:46.6Z"),
+            Some(1_792_766_566_600)
+        );
+        assert_eq!(parse_rfc3339("2026-10-23 14:42:46Z"), None);
+        assert_eq!(parse_rfc3339("2026-13-23T14:42:46Z"), None);
+        assert_eq!(parse_rfc3339("2026-10-23T14:42:46+01:00"), None);
         assert_eq!(ago(0, 59_000), "just now");
         assert_eq!(ago(0, 7_200_000), "2h ago");
     }
