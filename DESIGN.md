@@ -808,7 +808,9 @@ Build order:
 
 1. **Measuring:** `tailbus usage`, and the totals in every result. Built
    2026-10-28. `pipe_result` counts from the time in the task's ID, which
-   is when the hub sent it.
+   is when the hub sent it. Checked on the first run's transcripts: tailbus
+   counted 237,942,187 tokens for its 19 subagents, exactly what the work
+   agent had added up itself.
 2. **The subagent cap:** the hook, the `max_subagents` setting, and the
    cap in the task.
 3. **The plan, the estimate and the approval,** then the hook's two
