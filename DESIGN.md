@@ -820,7 +820,9 @@ Build order:
    - A task is open from when it's sent until its worker sends the result,
      for at most 7 days.
    - Running means a `.meta.json` without `finished`, written since the
-     task was sent, whose subagent has written in the last hour. A
+     task was sent, whose subagent has written in the last hour. "Since"
+     allows a minute's slack: the task's time is the hub's clock, and
+     Linux keeps file times a few milliseconds behind its clock. A
      subagent the hook let start counts too, by its tool call's ID, until
      its `.meta.json` appears, so parallel calls can't all slip past.
    - With the daemon down, the hook says nothing, and there's no cap.

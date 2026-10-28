@@ -30,6 +30,9 @@ const TASK_DAYS: i64 = 7;
 /// How long a subagent the hook let start may take to show up in its
 /// session's folder before it stops counting as running.
 const STARTING_MS: i64 = 120_000;
+/// How far the clocks of two machines, or a file's time and the clock, may
+/// disagree.
+const CLOCK_SLACK_MS: i64 = 60_000;
 const STATUS_TTL: Duration = Duration::from_secs(10);
 const WHOIS_TTL: Duration = Duration::from_secs(60);
 const MAX_EVENTS: usize = 1000;
@@ -894,7 +897,9 @@ impl Bus {
             .pipe
             .and_then(|p| p.max_subagents)
             .map_or(ours, |theirs| theirs.clamp(1, ours));
-        let found = usage::subagents(transcript, task.msg.created_at, now);
+        // The task's time is the hub's clock, and Linux keeps file times a
+        // few milliseconds behind the clock, so leave some slack.
+        let found = usage::subagents(transcript, task.msg.created_at - CLOCK_SLACK_MS, now);
         let mut live = lock(&self.live);
         // Ones let through but not yet in the folder count as running too,
         // so a burst of parallel calls can't all slip past.

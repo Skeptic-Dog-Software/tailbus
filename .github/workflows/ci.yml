@@ -5,12 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Linux only: no macOS runner is available to this repository. Run the same
+# checks on a Mac before pushing.
 jobs:
   check:
-    strategy:
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
