@@ -173,6 +173,15 @@ pub fn prompt(r: &Request) -> Prompt {
     }
 }
 
+/// A `PreToolUse` hook's output that stops a tool call, telling Claude why.
+pub fn refuse_tool(why: &str) -> Value {
+    json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": why,
+    }})
+}
+
 /// The `PermissionRequest` hook's output for a choice from the alert.
 pub fn decision(choice: usize, machine: &str, rules: &[Value]) -> Value {
     let decision = match choice {

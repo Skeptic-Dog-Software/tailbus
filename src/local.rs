@@ -91,6 +91,16 @@ pub enum Request {
         tool: String,
         input: serde_json::Value,
     },
+    /// The subagent hook: whether a session may start another subagent. The
+    /// reply is a `Verdict`, with the hook's refusal if it may not.
+    Subagent {
+        agent: String,
+        /// The session's transcript, beside which its subagents' are kept.
+        transcript: String,
+        /// The tool call that would start it.
+        #[serde(default)]
+        tool_use_id: String,
+    },
     /// The messages just received were handed on.
     Confirm,
     Ack {

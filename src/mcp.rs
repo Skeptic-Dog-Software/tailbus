@@ -324,6 +324,7 @@ impl Server {
                             stage: PipeStage::Task,
                             model: str_arg("model"),
                             effort: str_arg("effort"),
+                            max_subagents: None,
                         }),
                     },
                 )?;
@@ -436,6 +437,7 @@ impl Server {
                     stage,
                     model: None,
                     effort: None,
+                    max_subagents: None,
                 }),
             },
         )?;

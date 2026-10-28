@@ -436,6 +436,21 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             bus.tool_done(&agent, &tool, &serde_json::to_string(&input)?);
             conn.write(&serde_json::json!({}))?;
         }
+        Request::Subagent {
+            agent,
+            transcript,
+            tool_use_id,
+        } => {
+            check_name(&agent)?;
+            let refused = if transcript.is_empty() {
+                None
+            } else {
+                bus.subagent_refused(&agent, transcript.as_ref(), &tool_use_id)?
+            };
+            conn.write(&Verdict {
+                output: refused.map(|why| permission::refuse_tool(&why)),
+            })?;
+        }
         Request::Confirm => bail!("there's nothing to confirm"),
         Request::Ack { agent, id } => {
             check_name(&agent)?;

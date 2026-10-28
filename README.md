@@ -43,7 +43,8 @@ allow = ["someone@example.com", "build-box"]
 The same file sets the [handoff limit](#requests-responses-and-the-handoff-limit)
 (`handoff_limit = 6`, or `0` for none), and `alerts = false` stops this Mac
 showing tailbus's dialogs. A `[clients]` table tags
-[clients' workers](#pipe) here, such as `work = "acme"`.
+[clients' workers](#pipe) here, such as `work = "acme"`, and
+`max_subagents = 5` caps the subagents a `/pipe` task runs at once.
 
 ## Agents and addresses
 
@@ -170,6 +171,10 @@ To ask the worker something about the result, just ask your agent.
   while `claude auth status` says the session is billed to an API key.
   `peer_list` shows each worker's client and billing, or why its tag was
   refused. `/pipe` sends only to a live session.
+- **At most 5 subagents at once** on any task. The hub's bus sends its
+  `max_subagents` with each task, and the worker keeps to the smaller of
+  that and its own. A hook on the worker refuses a subagent past the cap,
+  and the worker starts it once another finishes.
 - **Hub sessions,** the ones that aren't workers, offer to `/pipe` work
   that's clearly a client's instead of doing it.
 - **The handoff limit** doesn't count messages sent from a turn you

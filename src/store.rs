@@ -428,6 +428,25 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The `/pipe` task `agent` is working on: the newest one sent since
+    /// `since` that it hasn't sent a result for.
+    pub fn open_task(&self, agent: &str, since: i64) -> Result<Option<Incoming>> {
+        Ok(self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT {INCOMING} FROM inbox AS task
+                     WHERE agent = ?1 AND created_at >= ?2 AND pipe LIKE '%\"stage\":\"task\"%'
+                       AND NOT EXISTS (SELECT 1 FROM sent WHERE sent.reply_to = task.id
+                                       AND sent.pipe LIKE '%\"stage\":\"result\"%')
+                     ORDER BY seq DESC LIMIT 1"
+                ),
+                params![agent, since],
+                incoming,
+            )
+            .optional()?)
+    }
+
     pub fn ack(&self, agent: &str, id: &str, now: i64) -> Result<Acked> {
         let row: Option<(String, Option<i64>)> = self
             .db
@@ -1021,6 +1040,7 @@ mod tests {
             stage: PipeStage::Task,
             model: Some("sonnet".into()),
             effort: Some("high".into()),
+            max_subagents: Some(5),
         });
         m.attended = true;
         s.store_incoming(&m, "o", 1).unwrap();
@@ -1028,6 +1048,35 @@ mod tests {
         s.record_sent(&m, SendState::Queued, 1).unwrap();
         assert_eq!(s.outgoing("a").unwrap().unwrap().msg, m);
         assert_eq!(s.due_sends(10, 10).unwrap()[0].item, m);
+    }
+
+    #[test]
+    fn a_task_is_open_until_its_result_is_sent() {
+        let s = Store::memory();
+        s.add_agent("work", 1).unwrap();
+        let step = |stage| {
+            Some(Pipe {
+                stage,
+                model: None,
+                effort: None,
+                max_subagents: None,
+            })
+        };
+        let mut task = msg("t", "hub@h", "work@w", None);
+        task.pipe = step(PipeStage::Task);
+        s.store_incoming(&task, "o", 1).unwrap();
+        assert_eq!(s.open_task("work", 0).unwrap().unwrap().msg.id, "t");
+        assert!(s.open_task("work", task.created_at + 1).unwrap().is_none());
+        assert!(s.open_task("hub", 0).unwrap().is_none());
+
+        let mut questions = msg("q", "work@w", "hub@h", Some("t"));
+        questions.pipe = step(PipeStage::Questions);
+        s.record_sent(&questions, SendState::Stored, 2).unwrap();
+        assert!(s.open_task("work", 0).unwrap().is_some());
+        let mut result = msg("r", "work@w", "hub@h", Some("t"));
+        result.pipe = step(PipeStage::Result);
+        s.record_sent(&result, SendState::Stored, 3).unwrap();
+        assert!(s.open_task("work", 0).unwrap().is_none());
     }
 
     #[test]

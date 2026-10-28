@@ -115,6 +115,10 @@ pub fn claude(install: bool) -> Result<()> {
                     {"type": "command", "command": exe, "args": ["hook", "permission"],
                      "timeout": PERMISSION_HOOK_TIMEOUT_SECS}
                 ]}],
+                // Holds a /pipe task to its cap on subagents running at once.
+                "PreToolUse": [{"matcher": "Agent|Task", "hooks": [
+                    {"type": "command", "command": exe, "args": ["hook", "subagent"], "timeout": 10}
+                ]}],
                 "PostToolUse": [{"hooks": [done.clone()]}],
                 "PostToolUseFailure": [{"hooks": [done]}],
                 "Stop": [{"hooks": [wait]}]

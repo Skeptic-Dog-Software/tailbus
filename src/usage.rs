@@ -1,12 +1,13 @@
-//! Token use, counted from Claude Code's transcripts: a session's own, and
-//! its subagents', with each API response counted once. Counts only, never
-//! prices.
+//! What a Claude Code session's transcripts say about its use: the tokens
+//! it and its subagents used, with each API response counted once, and
+//! which subagents are still running. Counts only, never prices.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -126,6 +127,54 @@ pub fn measure(transcript: &Path, since: i64) -> Result<Usage> {
         usage.models.insert(model);
     }
     Ok(usage)
+}
+
+/// A subagent whose transcript hasn't changed for this long has stopped,
+/// even if nothing says it finished: its session was killed, say.
+const STALE_MS: i64 = 60 * 60 * 1000;
+
+/// A session's subagents, from the `.meta.json` Claude Code keeps for each.
+#[derive(Debug, Default)]
+pub struct Subagents {
+    /// Not finished, and active since `since`.
+    pub running: usize,
+    /// The tool calls that started each one, finished or not.
+    pub started_by: HashSet<String>,
+}
+
+pub fn subagents(transcript: &Path, since: i64, now: i64) -> Subagents {
+    let mut found = Subagents::default();
+    let Ok(entries) = fs::read_dir(transcript.with_extension("").join("subagents")) else {
+        return found;
+    };
+    let modified = |path: &Path| {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_millis() as i64)
+    };
+    for meta in entries.flatten().map(|e| e.path()) {
+        let Some(stem) = meta
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".meta.json"))
+        else {
+            continue;
+        };
+        let Ok(info) = fs::read(&meta).map(|b| serde_json::from_slice::<Value>(&b)) else {
+            continue;
+        };
+        let info = info.unwrap_or_default();
+        if let Some(id) = info["toolUseId"].as_str() {
+            found.started_by.insert(id.to_string());
+        }
+        let last = modified(&meta).max(modified(&meta.with_file_name(format!("{stem}.jsonl"))));
+        if info["finished"] != true && last >= since.max(now - STALE_MS) {
+            found.running += 1;
+        }
+    }
+    found
 }
 
 /// Adds a transcript's API responses to `calls`, by message ID, and returns
@@ -280,6 +329,35 @@ mod tests {
              1 subagent 1,602."
         );
         assert_eq!(describe(&Usage::default()), "none recorded.");
+    }
+
+    #[test]
+    fn running_subagents_are_the_unfinished_recent_ones() {
+        let dir = env::temp_dir().join(format!("tailbus-subagents-{}", new_id()));
+        let folder = dir.join("s1/subagents");
+        fs::create_dir_all(&folder).unwrap();
+        let transcript = dir.join("s1.jsonl");
+        let meta = |name: &str, json: &str| {
+            fs::write(folder.join(format!("{name}.meta.json")), json).unwrap();
+        };
+        meta("agent-a", r#"{"toolUseId":"toolu_a","finished":true}"#);
+        meta("agent-b", r#"{"toolUseId":"toolu_b"}"#);
+        fs::write(folder.join("agent-b.jsonl"), "").unwrap();
+        meta("agent-c", r#"{"toolUseId":"toolu_c","finished":false}"#);
+        meta("agent-d", "not yet written");
+
+        let now = crate::util::now_ms();
+        let found = subagents(&transcript, now - 60_000, now);
+        assert_eq!(found.running, 3);
+        assert_eq!(found.started_by.len(), 3);
+        // Started before the task, or quiet for an hour: not running.
+        assert_eq!(subagents(&transcript, now + 60_000, now).running, 0);
+        assert_eq!(
+            subagents(&transcript, 0, now + STALE_MS + 60_000).running,
+            0
+        );
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(subagents(&transcript, 0, now).running, 0);
     }
 
     #[test]

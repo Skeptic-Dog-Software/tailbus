@@ -89,10 +89,12 @@ fn pipe_wrappers(out: &mut String, stage: impl Fn(PipeStage) -> bool) {
              has no model setting, ask there too: go on with what will run, or stop.\n\
              2. When the answers arrive, do the work. Build in subagents started with the \
              task's model and effort, as its tag gives them, and otherwise your own model \
-             at xhigh.\n\
+             at xhigh. Have no more subagents running at once than its max-subagents, or 5 \
+             if it gives none: tailbus refuses any more, so start the next when one \
+             finishes.\n\
              3. Review the work with ACR: load the tailbus acr skill and follow it, with the \
-             dimensions your hub's user chose. At most 3 rounds, and at most 5 reviewers at \
-             once, each started with that same model and effort.\n\
+             dimensions your hub's user chose. At most 3 rounds, each reviewer started with \
+             that same model and effort.\n\
              4. Send everything back once with pipe_result (reply_to: the task's id). \
              Report only what each review actually covered.\n\
              Don't hand any of the work back to the hub. You send it only questions and the \
@@ -158,6 +160,9 @@ pub fn tagged(item: &Item) -> String {
         }
         if let Some(effort) = &p.effort {
             let _ = write!(attrs, " effort=\"{}\"", attr(effort));
+        }
+        if let Some(n) = p.max_subagents {
+            let _ = write!(attrs, " max-subagents=\"{n}\"");
         }
     }
     let _ = write!(attrs, " sent=\"{}\"", rfc3339(m.created_at));
@@ -403,11 +408,12 @@ mod tests {
             stage: PipeStage::Task,
             model: Some("sonnet".into()),
             effort: Some("high".into()),
+            max_subagents: Some(5),
         });
         let text = messages_for_agent(&[task], Tools::Mcp);
         assert!(text.contains("You're the worker"));
         assert!(text.contains("pipe_questions") && text.contains("acr skill"));
-        assert!(text.contains(r#"pipe="task" model="sonnet" effort="high""#));
+        assert!(text.contains(r#"pipe="task" model="sonnet" effort="high" max-subagents="5""#));
         // The general wrapper for requests doesn't apply to it.
         assert!(!text.contains("A request (kind="));
 
@@ -418,6 +424,7 @@ mod tests {
             stage: PipeStage::Result,
             model: None,
             effort: None,
+            max_subagents: None,
         });
         let text = messages_for_agent(&[result], Tools::Mcp);
         assert!(text.contains("Your interpretation, marked as yours"));

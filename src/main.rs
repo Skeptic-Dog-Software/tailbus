@@ -148,6 +148,7 @@ enum HookCmd {
     Wait,
     Permission,
     ToolDone,
+    Subagent,
 }
 
 #[derive(Subcommand)]
@@ -228,6 +229,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 HookCmd::Wait => hook::wait(&socket, explicit),
                 HookCmd::Permission => hook::permission(&socket, explicit),
                 HookCmd::ToolDone => hook::tool_done(&socket, explicit),
+                HookCmd::Subagent => hook::subagent(&socket, explicit),
             };
         }
         Cmd::Setup {

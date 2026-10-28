@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,14 +16,20 @@ use crate::config::Config;
 use crate::local::{Event, Inbox, Item, PeerMachine, Peers, Sent};
 use crate::net;
 use crate::proto::{
-    AgentInfo, AgentList, Billing, MAX_BATCH, MAX_BODY, Message, MessageBatch, Pipe, Receipt,
-    ReceiptBatch, SendState, StoreResult, StoreResults, StoreStatus,
+    AgentInfo, AgentList, Billing, MAX_BATCH, MAX_BODY, Message, MessageBatch, Pipe, PipeStage,
+    Receipt, ReceiptBatch, SendState, StoreResult, StoreResults, StoreStatus,
 };
 use crate::store::{Acked, Incoming, Store, Stored, machine_part, name_part};
 use crate::tailscale::{Status, Tailscale, Whois};
+use crate::usage;
 use crate::util::{Address, is_id, new_id, now_ms, valid_name};
 
 const DAY_MS: i64 = 86_400_000;
+/// How long a `/pipe` task can stay open, waiting for its result.
+const TASK_DAYS: i64 = 7;
+/// How long a subagent the hook let start may take to show up in its
+/// session's folder before it stops counting as running.
+const STARTING_MS: i64 = 120_000;
 const STATUS_TTL: Duration = Duration::from_secs(10);
 const WHOIS_TTL: Duration = Duration::from_secs(60);
 const MAX_EVENTS: usize = 1000;
@@ -76,6 +83,10 @@ struct Live {
     turns: HashMap<String, Turn>,
     /// Permission prompts the agents' hooks are holding, by ID.
     perms: HashMap<String, Perm>,
+    /// Subagents the hook let start, by the ID of the tool call starting
+    /// each, with its session's transcript and when, until they show up in
+    /// the transcript's folder.
+    starting: HashMap<String, (PathBuf, i64)>,
 }
 
 /// Handoffs to an agent's sessions in a row, without its user typing.
@@ -864,6 +875,51 @@ impl Bus {
         }
     }
 
+    /// Whether a session may start another subagent: why not, if its agent
+    /// is on a `/pipe` task that already has as many running as its cap.
+    /// Outside a task there's no cap.
+    pub fn subagent_refused(
+        &self,
+        agent: &str,
+        transcript: &Path,
+        tool_use_id: &str,
+    ) -> Result<Option<String>> {
+        let now = now_ms();
+        let Some(task) = self.db().open_task(agent, now - TASK_DAYS * DAY_MS)? else {
+            return Ok(None);
+        };
+        let ours = self.cfg.max_subagents.max(1);
+        let cap = task
+            .msg
+            .pipe
+            .and_then(|p| p.max_subagents)
+            .map_or(ours, |theirs| theirs.clamp(1, ours));
+        let found = usage::subagents(transcript, task.msg.created_at, now);
+        let mut live = lock(&self.live);
+        // Ones let through but not yet in the folder count as running too,
+        // so a burst of parallel calls can't all slip past.
+        live.starting
+            .retain(|id, (_, at)| now - *at < STARTING_MS && !found.started_by.contains(id));
+        let starting = live
+            .starting
+            .values()
+            .filter(|(t, _)| t == transcript)
+            .count();
+        let running = found.running + starting;
+        if running >= cap as usize {
+            return Ok(Some(format!(
+                "tailbus: this /pipe task already has {running} subagent{} running, and its \
+                 cap is {cap} at once. Start this one after one of them finishes.",
+                if running == 1 { "" } else { "s" }
+            )));
+        }
+        if !tool_use_id.is_empty() {
+            live.starting
+                .insert(tool_use_id.to_string(), (transcript.to_path_buf(), now));
+        }
+        Ok(None)
+    }
+
     fn perms_done(&self, agent: &str) {
         let mut live = lock(&self.live);
         let mut any = false;
@@ -949,8 +1005,11 @@ impl Bus {
             ("", None) => bail!("the message needs a recipient"),
             (to, _) => to.to_string(),
         };
-        if let Some(p) = &pipe {
+        let mut pipe = pipe;
+        if let Some(p) = &mut pipe {
             check_pipe(p)?;
+            // The cap comes from this bus's config, not the agent.
+            p.max_subagents = (p.stage == PipeStage::Task).then_some(self.cfg.max_subagents.max(1));
         }
         let to = Address::parse(&replying_to, &me.machine)?;
         let now = now_ms();
@@ -1873,11 +1932,89 @@ pub(crate) mod tests {
             stage: crate::proto::PipeStage::Task,
             model: model.map(Into::into),
             effort: effort.map(Into::into),
+            max_subagents: None,
         };
         assert!(check_pipe(&pipe(Some("claude-opus-5-5"), Some("xhigh"))).is_ok());
         assert!(check_pipe(&pipe(None, None)).is_ok());
         assert!(check_pipe(&pipe(None, Some("turbo"))).is_err());
         assert!(check_pipe(&pipe(Some("opus\" onload=\""), None)).is_err());
+    }
+
+    #[test]
+    fn a_pipe_task_caps_the_subagents_running_at_once() {
+        let cfg: Config = toml::from_str("alerts = false\nmax_subagents = 2").unwrap();
+        let bus = Bus::start(cfg, Store::memory());
+        *bus.me.write().unwrap() = Some(Me {
+            machine: "here".into(),
+            owner: "o".into(),
+            ipv4: None,
+        });
+        bus.db().add_agent("work", 1).unwrap();
+        let dir = std::env::temp_dir().join(format!("tailbus-cap-{}", new_id()));
+        let folder = dir.join("s1/subagents");
+        std::fs::create_dir_all(&folder).unwrap();
+        let transcript = dir.join("s1.jsonl");
+        let meta = |id: &str, finished: bool| {
+            let json = serde_json::json!({"toolUseId": id, "finished": finished});
+            std::fs::write(folder.join(format!("{id}.meta.json")), json.to_string()).unwrap();
+        };
+        let refused = |id: &str| bus.subagent_refused("work", &transcript, id).unwrap();
+        let step = |stage, max_subagents| Pipe {
+            stage,
+            model: None,
+            effort: None,
+            max_subagents,
+        };
+
+        // Outside a task there's no cap.
+        for id in ["a", "b", "c"] {
+            meta(id, false);
+        }
+        assert_eq!(refused("x"), None);
+
+        let task = step(PipeStage::Task, Some(99));
+        let sent = bus
+            .send("hub", "work@here", "Do it".into(), None, None, Some(task))
+            .unwrap();
+        // The cap is the sending bus's, whatever the agent asked for.
+        let stored = bus.db().incoming(&sent.id).unwrap().unwrap();
+        assert_eq!(stored.msg.pipe.unwrap().max_subagents, Some(2));
+
+        for id in ["a", "b", "c"] {
+            meta(id, false);
+        }
+        let why = refused("x").unwrap();
+        assert!(
+            why.contains("3 subagents running, and its cap is 2"),
+            "{why}"
+        );
+        meta("a", true);
+        meta("b", true);
+        // Room for one more, but not a second before the first shows up.
+        assert_eq!(refused("x"), None);
+        assert!(refused("y").is_some());
+        // Once it shows up it counts once, and once it finishes there's room.
+        meta("x", false);
+        assert!(refused("y").is_some());
+        meta("x", true);
+        assert_eq!(refused("y"), None);
+
+        // Sending the result ends the task, and the cap with it.
+        let result = step(PipeStage::Result, None);
+        bus.send(
+            "work",
+            "",
+            "## Result".into(),
+            Some(sent.id),
+            None,
+            Some(result),
+        )
+        .unwrap();
+        for id in ["d", "e", "f"] {
+            meta(id, false);
+        }
+        assert_eq!(refused("z"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

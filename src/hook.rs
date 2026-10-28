@@ -44,6 +44,11 @@ struct Input {
     /// `PermissionRequest`: the permission updates Claude Code suggests.
     #[serde(default)]
     permission_suggestions: serde_json::Value,
+    #[serde(default)]
+    transcript_path: String,
+    /// `PreToolUse`: the call's ID.
+    #[serde(default)]
+    tool_use_id: String,
 }
 
 fn input() -> Input {
@@ -209,6 +214,31 @@ pub fn tool_done(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
             input: input.tool_input.clone(),
         },
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// PreToolUse, for the Agent tool: refuses a subagent beyond its `/pipe`
+/// task's cap. Otherwise it says nothing, and the call goes on to the usual
+/// permission check. With the daemon down there's no cap.
+pub fn subagent(socket: &Path, explicit: Option<String>) -> Result<ExitCode> {
+    if !in_claude_code() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let input = input();
+    let verdict = local::call::<Verdict>(
+        socket,
+        &Request::Subagent {
+            agent: agent_for(explicit, &input),
+            transcript: input.transcript_path.clone(),
+            tool_use_id: input.tool_use_id.clone(),
+        },
+    );
+    if let Ok(Verdict {
+        output: Some(output),
+    }) = verdict
+    {
+        println!("{output}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 

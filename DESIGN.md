@@ -800,9 +800,10 @@ an estimate before a worker starts, and the worker keeps to it.
   own settings may not set that. So the cap rides in the task, like the
   model and effort, from the hub's config (`max_subagents`, default 5). A
   subagent counts as running until its `.meta.json` says `finished`.
-- **Still to decide:** whether reaching the approved count stops the
-  worker or only warns, and whether small estimates go ahead without
-  asking. As designed, it stops, and always asks.
+- **Decided 2026-10-28:** the cap counts subagents running at once, not
+  the total, which the approved count limits instead. Reaching the
+  approved count stops new subagents and asks you; it doesn't just warn.
+  Every task waits for your approval, however small its estimate.
 
 Build order:
 
@@ -812,7 +813,22 @@ Build order:
    counted 237,942,187 tokens for its 19 subagents, exactly what the work
    agent had added up itself.
 2. **The subagent cap:** the hook, the `max_subagents` setting, and the
-   cap in the task.
+   cap in the task. Built 2026-10-28:
+   - The hub's bus sets the cap on each task it sends, whatever the agent
+     asked for. The worker's bus keeps to the smaller of that and its own
+     `max_subagents`.
+   - A task is open from when it's sent until its worker sends the result,
+     for at most 7 days.
+   - Running means a `.meta.json` without `finished`, written since the
+     task was sent, whose subagent has written in the last hour. A
+     subagent the hook let start counts too, by its tool call's ID, until
+     its `.meta.json` appears, so parallel calls can't all slip past.
+   - With the daemon down, the hook says nothing, and there's no cap.
+   - Tested on Claude Code 2.1.312, with a test bus capped at 1. Asked to
+     start two background subagents at once, a session got the first.
+     Claude Code refused the second with the hook's reason: "this /pipe
+     task already has 1 subagent running, and its cap is 1 at once. Start
+     this one after one of them finishes."
 3. **The plan, the estimate and the approval,** then the hook's two
    checks against the approved count.
 

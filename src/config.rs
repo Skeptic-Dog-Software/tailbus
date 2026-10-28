@@ -113,6 +113,15 @@ pub struct Config {
     /// key. `TAILBUS_CLIENT` can tag a session instead.
     #[serde(default)]
     pub clients: std::collections::HashMap<String, String>,
+    /// The most subagents a `/pipe` task may have running at once. A hub
+    /// sends its own with each task, and a worker keeps to the smaller of
+    /// that and this.
+    #[serde(default = "default_max_subagents")]
+    pub max_subagents: u32,
+}
+
+fn default_max_subagents() -> u32 {
+    5
 }
 
 fn default_port() -> u16 {
@@ -161,6 +170,7 @@ mod tests {
         assert!(cfg.alerts);
         assert_eq!(cfg.ask_after_secs, 60);
         assert!(cfg.clients.is_empty());
+        assert_eq!(cfg.max_subagents, 5);
         let cfg: Config = toml::from_str("[clients]\nwork = \"acme\"").unwrap();
         assert_eq!(cfg.clients["work"], "acme");
 
