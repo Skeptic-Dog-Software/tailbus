@@ -874,8 +874,6 @@ A second run, on 2026-10-27 on Claude Code 2.1.311, the same way:
   reloading the plugin's servers, but the hub's `tailbus mcp` kept the same
   process. After updating tailbus, restart sessions.
 
-Not tested yet: a pipe across machines to the real worker, which bills the
-client.
 
 ### ACR: adversarial convergence review
 
