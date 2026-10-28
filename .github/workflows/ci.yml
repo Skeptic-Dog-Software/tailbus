@@ -1,15 +1,20 @@
 name: CI
 
+# Runs on the org's self-hosted runner, never GitHub's.
+
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
-# Linux only: no macOS runner is available to this repository. Run the same
-# checks on a Mac before pushing.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

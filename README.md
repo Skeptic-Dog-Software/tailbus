@@ -225,5 +225,5 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-CI runs these on Linux only, since no macOS runner is available, so run
+CI runs these on the org's self-hosted runner, which isn't a Mac, so run
 them on a Mac before pushing.
