@@ -219,7 +219,7 @@ fn read(
 }
 
 /// `1,234,567`.
-fn count(n: u64) -> String {
+pub fn count(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {

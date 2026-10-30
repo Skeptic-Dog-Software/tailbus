@@ -661,18 +661,23 @@ start either one; Claude can't.
    never answers them for you. The first carousel always includes the ACR
    dimensions the remote agent proposes for the task, to keep, drop or add
    to.
-3. **The work, then ACR,** on the remote machine (see
+3. **A plan you approve.** The remote agent sends its plan, and its bus
+   adds an estimate in tokens. You approve it, ask for a smaller one, or
+   cancel (see [Token counts](#token-counts-and-the-subagent-cap)).
+4. **The work, then ACR,** on the remote machine (see
    [ACR](#acr-adversarial-convergence-review)).
-4. **The result comes back** as one response: what was done or found, the
+5. **The result comes back** as one response: what was done or found, the
    ACR report for each dimension, and the record of where reviewers
    disagreed. It stays in both machines' buses, so `tailbus thread <id>`
    shows it from either Mac for the usual 30 days.
-5. **Your agent presents it** in two clearly marked parts:
+6. **Your agent presents it** in two clearly marked parts:
    - the remote agent's result, as it came;
    - its own interpretation, labeled as such: warnings, what it agrees or
      disagrees with, and what it can't rule on for lack of context.
-6. **Follow-ups.** Your agent can ask the remote agent for clarifying
+7. **Follow-ups.** Your agent can ask the remote agent for clarifying
    context, as ordinary requests in the same thread.
+8. **Cancelling.** You can stop the task at any point. The remote agent
+   starts no more subagents, and sends back what it has done.
 
 **Model and effort.** `/pipe [--model <model>] [--effort <level>] <agent or
 client> <task>` sets what does the work remotely.
@@ -787,8 +792,8 @@ an estimate before a worker starts, and the worker keeps to it.
   `PreToolUse` hook on the `Agent` tool refuses to start a subagent:
   - before the plan is approved;
   - once the task's measured total reaches the approved count. The worker
-    then asks you with `pipe_questions` whether to approve more, with a
-    fresh estimate for what's left, or to stop and send what's done;
+    then sends a plan for what's left with `pipe_plan`, which you approve
+    the same way, or stops and sends what's done;
   - while the task already has as many subagents running as its cap
     allows.
 
@@ -832,7 +837,30 @@ Build order:
      task already has 1 subagent running, and its cap is 1 at once. Start
      this one after one of them finishes."
 3. **The plan, the estimate and the approval,** then the hook's two
-   checks against the approved count.
+   checks against the approved count. Built 2026-10-30, with a way to
+   cancel a task added:
+   - Three new stages, each a tool: `pipe_plan` from the worker,
+     `pipe_approve` from the hub (approve, a smaller plan, or cancel), and
+     `pipe_cancel` from the hub at any time. Each carries the task's ID,
+     which the sending bus sets.
+   - The worker's bus adds the estimate to the plan, and the plan's text
+     to its body. The estimate goes by the worker's earlier results whose
+     first plan had the same model and effort. Each result now carries the
+     tokens it used, split into the session's and the subagents'. With no
+     such result, it uses the first run's figures and 2 reviews per
+     dimension, and says so.
+   - Approving allows the worst case plus what the task had used when the
+     plan was made. The hub's bus refuses an approval unless its session's
+     user is in the loop: they typed the prompt, or just answered a
+     carousel. It also sets the approved count from the plan, whatever the
+     agent passed.
+   - The worker's hook takes the approved count from its own sent plan,
+     not from the approval, so a hub can't raise it. Only the task's own
+     hub agent can approve or cancel it.
+   - A cancel stops new subagents at once, and asks the worker for a
+     result with what's done. The result also acknowledges the cancel.
+   - The hook's checks, in order: cancelled, not yet approved, approved
+     tokens used up, then the cap.
 
 ### /pipe build plan
 

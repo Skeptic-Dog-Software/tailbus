@@ -70,7 +70,7 @@ The plugin gives each session these tools:
 | `msg_inbox` | List messages not yet handled, and your own still open. |
 | `msg_thread` | Show a whole conversation. |
 | `peer_list` | List the agents you can reach. |
-| `pipe_send`, `pipe_questions`, `pipe_answers`, `pipe_result` | The steps of a [`/pipe`](#pipe). |
+| `pipe_send`, `pipe_questions`, `pipe_answers`, `pipe_plan`, `pipe_approve`, `pipe_cancel`, `pipe_result` | The steps of a [`/pipe`](#pipe). |
 
 Messages also arrive on their own. A background hook, armed when the session
 starts and after every turn, waits on the bus. When a request comes in, or
@@ -149,17 +149,29 @@ Your session coordinates, so your own plan pays only for that.
 1. **The worker asks first, every time.** Its clarifying questions,
    including which ACR dimensions to review, come back as a question
    carousel for you. Your agent never answers them for you.
-2. **The work, then ACR.** The worker builds the result in subagents, then
+2. **You approve its plan, every time.** The worker then sends its plan:
+   how many subagents research and build, the ACR dimensions and rounds,
+   and the model and effort. Its bus adds an estimate of the tokens it will
+   use, low, expected and worst, from what earlier tasks used. You approve
+   up to the worst case, ask for a smaller plan, or cancel, in a carousel.
+   Your agent can't approve it for you: the bus refuses an approval unless
+   you just answered a carousel or typed in the session.
+3. **The work, then ACR.** The worker builds the result in subagents, then
    has fresh reviewers attack it one dimension at a time, for up to 3
-   rounds (the `acr` skill has the method).
-3. **The result comes back:** what was done, the review of each dimension,
+   rounds (the `acr` skill has the method). A hook on the worker refuses
+   to start a subagent before the plan is approved, or once the task has
+   used the approved tokens. The worker can then send a plan for what's
+   left, which you approve the same way, or stop and send what's done.
+4. **The result comes back:** what was done, the review of each dimension,
    where reviewers disagreed, and the model and effort that actually ran.
    It also has the tokens the worker and its subagents used, which tailbus
    counts from their transcripts, so the agent doesn't report them itself.
    Your agent shows it as it came, then its own interpretation, labeled as
    its own.
 
-To ask the worker something about the result, just ask your agent.
+To ask the worker something about the result, just ask your agent. To stop
+a task partway, ask your agent to cancel it: the worker starts no more
+subagents, and sends back what it has done.
 
 - **Just `/pipe`** asks for the worker, model and effort in a carousel,
   then for the task.
@@ -173,8 +185,12 @@ To ask the worker something about the result, just ask your agent.
   refused. `/pipe` sends only to a live session.
 - **At most 5 subagents at once** on any task. The hub's bus sends its
   `max_subagents` with each task, and the worker keeps to the smaller of
-  that and its own. A hook on the worker refuses a subagent past the cap,
-  and the worker starts it once another finishes.
+  that and its own. The same hook refuses a subagent past the cap, and the
+  worker starts it once another finishes.
+- **Estimates** start from the first run across machines, about 12.5
+  million tokens per subagent on Opus at `xhigh`, until the worker has
+  finished tasks of its own on the plan's model and effort. They're token
+  counts only, never prices.
 - **Hub sessions,** the ones that aren't workers, offer to `/pipe` work
   that's clearly a client's instead of doing it.
 - **The handoff limit** doesn't count messages sent from a turn you

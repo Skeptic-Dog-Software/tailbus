@@ -35,7 +35,8 @@ pub struct Message {
 }
 
 /// A `/pipe` message: a task handed to a worker, the worker's clarifying
-/// questions and the user's answers, and the worker's result.
+/// questions and the user's answers, its plan and the user's approval, and
+/// the worker's result. The hub can cancel the task at any point.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pipe {
     pub stage: PipeStage,
@@ -49,6 +50,36 @@ pub struct Pipe {
     /// hub's bus sets it, not the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_subagents: Option<u32>,
+    /// The ID of the task a plan, an approval, a cancel or a result belongs
+    /// to. The sending bus sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// A plan's contents, with the estimate the worker's bus made of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Box<Plan>>,
+    /// On an approval, the tokens the task may use in all. On a "smaller
+    /// plan" answer, `None`. The hub's bus sets it from the plan, not the
+    /// agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<u64>,
+    /// On a result, the tokens the task used, as tailbus counted them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<Used>,
+}
+
+impl Pipe {
+    pub fn new(stage: PipeStage) -> Pipe {
+        Pipe {
+            stage,
+            model: None,
+            effort: None,
+            max_subagents: None,
+            task: None,
+            plan: None,
+            approved: None,
+            used: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +88,69 @@ pub enum PipeStage {
     Task,
     Questions,
     Answers,
+    Plan,
+    Approval,
+    Cancel,
     Result,
+}
+
+impl PipeStage {
+    /// As it's serialized.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PipeStage::Task => "task",
+            PipeStage::Questions => "questions",
+            PipeStage::Answers => "answers",
+            PipeStage::Plan => "plan",
+            PipeStage::Approval => "approval",
+            PipeStage::Cancel => "cancel",
+            PipeStage::Result => "result",
+        }
+    }
+}
+
+/// What a worker means to run for a task, or for what's left of one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plan {
+    /// Subagents that research and build.
+    pub researchers: u32,
+    pub builders: u32,
+    /// The ACR dimensions, one reviewer each per round.
+    pub dimensions: Vec<String>,
+    /// ACR's round cap, 1 to 3.
+    pub rounds: u32,
+    pub model: String,
+    pub effort: String,
+    /// What the task had used when the plan was made, counted by tailbus.
+    #[serde(default)]
+    pub used_so_far: u64,
+    /// Set by the worker's bus, not the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
+}
+
+/// A plan's tokens, from what earlier tasks used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Estimate {
+    /// Every dimension confirmed in its first round.
+    pub low: u64,
+    /// As many rounds as earlier tasks took.
+    pub expected: u64,
+    /// Every dimension through every round and a verify-only round.
+    pub worst: u64,
+    /// What approving it allows the task in all: the worst case plus what
+    /// the task had already used.
+    pub budget: u64,
+    /// What the figures come from.
+    pub basis: String,
+}
+
+/// The tokens a task used, split as `tailbus usage` splits them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Used {
+    pub session: u64,
+    pub subagents: u64,
+    pub subagent_count: u32,
 }
 
 impl Message {

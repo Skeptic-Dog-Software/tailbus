@@ -13,11 +13,12 @@ use anyhow::{Context, Result, bail};
 use crate::alert;
 use crate::ask::{self, Asks, Prompt};
 use crate::config::Config;
+use crate::format;
 use crate::local::{Event, Inbox, Item, PeerMachine, Peers, Sent};
 use crate::net;
 use crate::proto::{
-    AgentInfo, AgentList, Billing, MAX_BATCH, MAX_BODY, Message, MessageBatch, Pipe, PipeStage,
-    Receipt, ReceiptBatch, SendState, StoreResult, StoreResults, StoreStatus,
+    AgentInfo, AgentList, Billing, Estimate, MAX_BATCH, MAX_BODY, Message, MessageBatch, Pipe,
+    PipeStage, Plan, Receipt, ReceiptBatch, SendState, StoreResult, StoreResults, StoreStatus,
 };
 use crate::store::{Acked, Incoming, Store, Stored, machine_part, name_part};
 use crate::tailscale::{Status, Tailscale, Whois};
@@ -879,8 +880,10 @@ impl Bus {
     }
 
     /// Whether a session may start another subagent: why not, if its agent
-    /// is on a `/pipe` task that already has as many running as its cap.
-    /// Outside a task there's no cap.
+    /// is on a `/pipe` task that was cancelled, whose plan isn't approved,
+    /// that has used the tokens its plan was approved for, or that already
+    /// has as many subagents running as its cap. Outside a task, nothing
+    /// stops one.
     pub fn subagent_refused(
         &self,
         agent: &str,
@@ -891,6 +894,48 @@ impl Bus {
         let Some(task) = self.db().open_task(agent, now - TASK_DAYS * DAY_MS)? else {
             return Ok(None);
         };
+        // Only the task's own hub can approve or cancel it.
+        let steps = self.db().pipe_steps(agent, &task.msg.id, &task.msg.from)?;
+        let stage = |s: &Incoming| s.msg.pipe.as_ref().map(|p| p.stage);
+        if steps.iter().any(|s| stage(s) == Some(PipeStage::Cancel)) {
+            return Ok(Some(
+                "tailbus: your hub's user cancelled this /pipe task, so start no more \
+                 subagents. Stop the ones still running, and send pipe_result (reply_to: the \
+                 task's id) with what's done, saying it was cancelled."
+                    .into(),
+            ));
+        }
+        // What the latest approval allows comes from the worker's own plan,
+        // whatever the approval says.
+        let approved = steps
+            .iter()
+            .rev()
+            .filter(|s| s.msg.pipe.as_ref().is_some_and(|p| p.approved.is_some()))
+            .find_map(|s| {
+                let plan = self.db().outgoing(s.msg.reply_to.as_deref()?).ok()??;
+                plan.msg.pipe?.plan?.estimate.map(|e| e.budget)
+            });
+        let Some(budget) = approved else {
+            return Ok(Some(
+                "tailbus: this /pipe task's plan isn't approved yet, so it can't start \
+                 subagents. Send your plan with pipe_plan (reply_to: the task's id), and wait \
+                 for your hub's answer."
+                    .into(),
+            ));
+        };
+        let used = usage::measure(transcript, task.msg.created_at - CLOCK_SLACK_MS)
+            .map(|u| u.total().total())
+            .unwrap_or(0);
+        if used >= budget {
+            return Ok(Some(format!(
+                "tailbus: this /pipe task has used {} tokens, and its approved plan allows {}, \
+                 so it can't start more subagents. Send a plan for what's left with pipe_plan, \
+                 which asks your hub's user to approve more, or stop and send pipe_result \
+                 with what's done.",
+                usage::count(used),
+                usage::count(budget)
+            )));
+        }
         let ours = self.cfg.max_subagents.max(1);
         let cap = task
             .msg
@@ -986,6 +1031,17 @@ impl Bus {
         if !valid_name(from) {
             bail!("{from:?} isn't a valid agent name: use lowercase letters, digits and hyphens");
         }
+        if let Some(r) = &reply_to
+            && !is_id(r)
+        {
+            bail!("{r:?} isn't a message ID");
+        }
+        let mut to = to.trim().to_string();
+        let mut body = body;
+        let mut pipe = pipe;
+        if let Some(p) = &mut pipe {
+            self.pipe_step(from, &mut to, reply_to.as_deref(), p, &mut body)?;
+        }
         if body.trim().is_empty() {
             bail!("the message is empty");
         }
@@ -996,13 +1052,8 @@ impl Bus {
                 MAX_BODY / 1024
             );
         }
-        if let Some(r) = &reply_to
-            && !is_id(r)
-        {
-            bail!("{r:?} isn't a message ID");
-        }
         // A reply may leave out who it's to: the sender of what it answers.
-        let replying_to = match (to.trim(), &reply_to) {
+        let replying_to = match (to.as_str(), &reply_to) {
             ("", Some(r)) => match self.db().incoming(r)? {
                 Some(m) if name_part(&m.msg.to) == from => m.msg.from,
                 _ => bail!("{from} has no message {r} to reply to"),
@@ -1010,12 +1061,6 @@ impl Bus {
             ("", None) => bail!("the message needs a recipient"),
             (to, _) => to.to_string(),
         };
-        let mut pipe = pipe;
-        if let Some(p) = &mut pipe {
-            check_pipe(p)?;
-            // The cap comes from this bus's config, not the agent.
-            p.max_subagents = (p.stage == PipeStage::Task).then_some(self.cfg.max_subagents.max(1));
-        }
         let to = Address::parse(&replying_to, &me.machine)?;
         let now = now_ms();
         // Sending subscribes the sender, so replies have somewhere to go, and
@@ -1031,7 +1076,7 @@ impl Bus {
             created_at: now,
             pipe,
             // The bus says so, not the agent.
-            attended: lock(&self.live).turns.get(from).is_some_and(|t| t.attended),
+            attended: self.attended(from),
         };
 
         let (state, warning) = if to.machine == me.machine {
@@ -1105,6 +1150,28 @@ impl Bus {
                 self.receipt(&sender, r, SendState::Acknowledged)?;
             }
         }
+        // A result answers a cancel of its task too. The task's own row says
+        // which hub sent it: taken in a statement of its own, so the lock is
+        // let go before the next one.
+        let result_of = match &msg.pipe {
+            Some(p) if p.stage == PipeStage::Result => p.task.as_deref(),
+            _ => None,
+        };
+        let hub = match result_of {
+            Some(task) => self.db().incoming(task)?.map(|t| t.msg.from),
+            None => None,
+        };
+        if let (Some(task), Some(hub)) = (result_of, hub) {
+            let steps = self.db().pipe_steps(from, task, &hub)?;
+            for cancel in steps.iter().filter(|s| s.acked_at.is_none()).filter(|s| {
+                s.msg
+                    .pipe
+                    .as_ref()
+                    .is_some_and(|p| p.stage == PipeStage::Cancel)
+            }) {
+                self.ack(from, &cancel.msg.id)?;
+            }
+        }
         self.event(format!(
             "{} -> {}: {} ({})",
             msg.from,
@@ -1119,6 +1186,138 @@ impl Bus {
             state: state.as_str().into(),
             warning,
         })
+    }
+
+    /// Checks a `/pipe` step, and fills in what its bus sets rather than its
+    /// agent: the task it belongs to, a task's subagent cap, a plan's
+    /// estimate, and an approval's tokens and wording. A cancel can name
+    /// the task it stops, and then goes to that task's worker.
+    fn pipe_step(
+        &self,
+        from: &str,
+        to: &mut String,
+        reply_to: Option<&str>,
+        p: &mut Pipe,
+        body: &mut String,
+    ) -> Result<()> {
+        check_pipe(p)?;
+        let plan = p.plan.take();
+        let approve = p.approved.take().is_some();
+        let used = p.used.take();
+        p.max_subagents = None;
+        p.task = None;
+        // The step this one answers, from `from`'s own queue.
+        let answers = |stage: PipeStage| -> Result<Incoming> {
+            let found = match reply_to {
+                Some(r) => self.db().incoming(r)?,
+                None => None,
+            };
+            found
+                .filter(|m| name_part(&m.msg.to) == from)
+                .filter(|m| m.msg.pipe.as_ref().is_some_and(|p| p.stage == stage))
+                .with_context(|| {
+                    format!(
+                        "reply_to needs the id of the {} this answers",
+                        stage.as_str()
+                    )
+                })
+        };
+        let note = match body.trim() {
+            "" => String::new(),
+            note => format!("\n\nFrom the hub: {note}"),
+        };
+        match p.stage {
+            PipeStage::Task => p.max_subagents = Some(self.cfg.max_subagents.max(1)),
+            PipeStage::Questions | PipeStage::Answers => {}
+            PipeStage::Plan => {
+                let task = answers(PipeStage::Task)?;
+                let mut plan = plan.context("a plan needs its contents")?;
+                check_plan(&plan)?;
+                let estimate = self.estimate(from, &plan)?;
+                body.push_str(&format::plan(&plan, &estimate));
+                plan.estimate = Some(estimate);
+                p.plan = Some(plan);
+                p.task = Some(task.msg.id);
+            }
+            PipeStage::Approval => {
+                let plan = answers(PipeStage::Plan)?;
+                let step = plan.msg.pipe.unwrap_or_else(|| Pipe::new(PipeStage::Plan));
+                let budget = step
+                    .plan
+                    .and_then(|p| p.estimate)
+                    .map(|e| e.budget)
+                    .context("that plan has no estimate to approve")?;
+                p.task = step.task;
+                if approve {
+                    if !self.attended(from) {
+                        bail!(
+                            "an approval needs your user: show them the plan with \
+                             AskUserQuestion, then send the answer they chose"
+                        );
+                    }
+                    p.approved = Some(budget);
+                    *body = format!(
+                        "Approved: the task may use up to {} tokens in all, counted from when \
+                         it was sent.{note}",
+                        usage::count(budget)
+                    );
+                } else {
+                    *body = format!("Not approved: send a smaller plan with pipe_plan.{note}");
+                }
+            }
+            PipeStage::Cancel => {
+                let own = match reply_to {
+                    Some(r) => self.db().outgoing(r)?,
+                    None => None,
+                }
+                .filter(|t| name_part(&t.msg.from) == from)
+                .filter(|t| {
+                    t.msg
+                        .pipe
+                        .as_ref()
+                        .is_some_and(|p| p.stage == PipeStage::Task)
+                });
+                match own {
+                    Some(task) => {
+                        p.task = Some(task.msg.id);
+                        *to = task.msg.to;
+                    }
+                    None => {
+                        let plan = answers(PipeStage::Plan).context(
+                            "reply_to needs the id of the task you sent, or of its plan",
+                        )?;
+                        p.task = plan.msg.pipe.and_then(|p| p.task);
+                    }
+                }
+                *body = format!("Cancelled by your hub's user.{note}");
+            }
+            PipeStage::Result => {
+                p.task = Some(answers(PipeStage::Task)?.msg.id);
+                p.used = used;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `agent`'s user is in the loop in its current turn.
+    fn attended(&self, agent: &str) -> bool {
+        lock(&self.live)
+            .turns
+            .get(agent)
+            .is_some_and(|t| t.attended)
+    }
+
+    /// What `plan` will likely use, from `agent`'s earlier tasks whose plan
+    /// had the same model and effort.
+    fn estimate(&self, agent: &str, plan: &Plan) -> Result<Estimate> {
+        let (plans, results) = {
+            let db = self.db();
+            (
+                db.sent_steps(agent, "plan")?,
+                db.sent_steps(agent, "result")?,
+            )
+        };
+        Ok(estimate(plan, &earlier(&plans, &results, plan)))
     }
 
     /// Sends what's due in the outbox, and receipts owed to other machines.
@@ -1576,6 +1775,137 @@ fn check_pipe(p: &Pipe) -> Result<()> {
     Ok(())
 }
 
+fn check_plan(plan: &Plan) -> Result<()> {
+    check_pipe(&Pipe {
+        model: Some(plan.model.clone()),
+        effort: Some(plan.effort.clone()),
+        ..Pipe::new(PipeStage::Plan)
+    })?;
+    if !(1..=3).contains(&plan.rounds) {
+        bail!("a plan's `rounds` is ACR's round cap, from 1 to 3");
+    }
+    if !(1..=10).contains(&plan.dimensions.len()) {
+        bail!("a plan names 1 to 10 ACR dimensions");
+    }
+    if plan
+        .dimensions
+        .iter()
+        .any(|d| d.trim().is_empty() || d.chars().count() > 60 || d.contains('\n'))
+    {
+        bail!("each ACR dimension is a name of at most 60 characters");
+    }
+    if plan.researchers + plan.builders > 50 {
+        bail!("a plan has at most 50 researchers and builders");
+    }
+    Ok(())
+}
+
+/// The first run across machines, on 2026-10-28: 19 subagents on Opus at
+/// xhigh used 237,942,187 tokens, and the worker's own session 11,790,487.
+const FIRST_RUN_PER_SUBAGENT: u64 = 12_523_273;
+const FIRST_RUN_SESSION: u64 = 11_790_487;
+/// Reviews per ACR dimension to expect, with no earlier task to go by.
+const DEFAULT_REVIEWS: f64 = 2.0;
+
+/// An earlier task's figures, from its result and its first plan.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Earlier {
+    per_subagent: f64,
+    session: u64,
+    /// Reviews per ACR dimension, when there were any.
+    reviews: Option<f64>,
+}
+
+/// The earlier tasks whose first plan had `like`'s model and effort, and
+/// whose result says what they used.
+fn earlier(plans: &[Message], results: &[Message], like: &Plan) -> Vec<Earlier> {
+    results
+        .iter()
+        .filter_map(|r| {
+            let step = r.pipe.as_ref()?;
+            let used = step.used?;
+            let task = step.task.as_deref()?;
+            // The first plan covers the whole task; later ones, what was left.
+            let plan = plans
+                .iter()
+                .filter_map(|m| m.pipe.as_ref())
+                .find(|p| p.task.as_deref() == Some(task))?
+                .plan
+                .as_ref()?;
+            let same = plan.model.eq_ignore_ascii_case(&like.model)
+                && plan.effort.eq_ignore_ascii_case(&like.effort);
+            if !same || used.subagent_count == 0 {
+                return None;
+            }
+            let fixed = plan.researchers + plan.builders;
+            let dimensions = plan.dimensions.len() as u32;
+            let reviews = (dimensions > 0 && used.subagent_count > fixed)
+                .then(|| f64::from(used.subagent_count - fixed) / f64::from(dimensions));
+            Some(Earlier {
+                per_subagent: used.subagents as f64 / f64::from(used.subagent_count),
+                session: used.session,
+                reviews,
+            })
+        })
+        .collect()
+}
+
+/// A plan's tokens: its subagents at what each used on earlier tasks, plus
+/// the worker's own session. Researchers and builders run once. Each ACR
+/// dimension gets one review at best, as many as earlier tasks averaged as
+/// expected, and every round plus a verify-only one at worst.
+fn estimate(plan: &Plan, earlier: &[Earlier]) -> Estimate {
+    let dimensions = plan.dimensions.len() as f64;
+    let fixed = f64::from(plan.researchers + plan.builders);
+    let most = f64::from(plan.rounds + 1);
+    let (per_subagent, session, reviews, basis) = if earlier.is_empty() {
+        (
+            FIRST_RUN_PER_SUBAGENT as f64,
+            FIRST_RUN_SESSION,
+            DEFAULT_REVIEWS,
+            format!(
+                "No earlier task here had a plan on {} at {}, so this goes by the first run \
+                 across machines, on 2026-10-28: about 12.5 million tokens for each of its 19 \
+                 subagents on Opus at xhigh, and 11.8 million for the worker's own session. \
+                 Treat it as rough.",
+                plan.model, plan.effort
+            ),
+        )
+    } else {
+        let n = earlier.len();
+        let per_subagent = earlier.iter().map(|e| e.per_subagent).sum::<f64>() / n as f64;
+        let session = earlier.iter().map(|e| e.session).sum::<u64>() / n as u64;
+        let counted: Vec<f64> = earlier.iter().filter_map(|e| e.reviews).collect();
+        let reviews = match counted.len() {
+            0 => DEFAULT_REVIEWS,
+            k => counted.iter().sum::<f64>() / k as f64,
+        };
+        (
+            per_subagent,
+            session,
+            reviews,
+            format!(
+                "{n} earlier task{} here on {} at {}: about {} tokens per subagent, {} for the \
+                 worker's own session, and {reviews:.1} reviews per dimension.",
+                if n == 1 { "" } else { "s" },
+                plan.model,
+                plan.effort,
+                usage::count(per_subagent.round() as u64),
+                usage::count(session),
+            ),
+        )
+    };
+    let tokens = |subagents: f64| (subagents * per_subagent).round() as u64 + session;
+    let worst = tokens(fixed + dimensions * most);
+    Estimate {
+        low: tokens(fixed + dimensions),
+        expected: tokens(fixed + dimensions * reviews.clamp(1.0, most)),
+        worst,
+        budget: plan.used_so_far + worst,
+        basis,
+    }
+}
+
 /// A warning for a message to an agent that hasn't had a session lately,
 /// which usually means a misaddress.
 fn staleness(addr: &str, live: bool, last_live: Option<i64>, now: i64) -> Option<String> {
@@ -1597,6 +1927,8 @@ fn staleness(addr: &str, live: bool, last_live: Option<i64>, now: i64) -> Option
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::proto::Used;
+    use crate::util::rfc3339;
 
     #[test]
     fn backs_off_to_a_minute() {
@@ -1934,10 +2266,9 @@ pub(crate) mod tests {
     #[test]
     fn pipe_settings_are_checked() {
         let pipe = |model: Option<&str>, effort: Option<&str>| Pipe {
-            stage: crate::proto::PipeStage::Task,
             model: model.map(Into::into),
             effort: effort.map(Into::into),
-            max_subagents: None,
+            ..Pipe::new(PipeStage::Task)
         };
         assert!(check_pipe(&pipe(Some("claude-opus-5-5"), Some("xhigh"))).is_ok());
         assert!(check_pipe(&pipe(None, None)).is_ok());
@@ -1945,9 +2276,10 @@ pub(crate) mod tests {
         assert!(check_pipe(&pipe(Some("opus\" onload=\""), None)).is_err());
     }
 
-    #[test]
-    fn a_pipe_task_caps_the_subagents_running_at_once() {
-        let cfg: Config = toml::from_str("alerts = false\nmax_subagents = 2").unwrap();
+    /// A bus on machine "here" with a hub and a worker, for `/pipe` tests,
+    /// and a transcript folder for the worker's session.
+    fn pipe_bus(cfg: &str) -> (Arc<Bus>, PathBuf) {
+        let cfg: Config = toml::from_str(cfg).unwrap();
         let bus = Bus::start(cfg, Store::memory());
         *bus.me.write().unwrap() = Some(Me {
             machine: "here".into(),
@@ -1955,21 +2287,77 @@ pub(crate) mod tests {
             ipv4: None,
         });
         bus.db().add_agent("work", 1).unwrap();
-        let dir = std::env::temp_dir().join(format!("tailbus-cap-{}", new_id()));
+        let dir = std::env::temp_dir().join(format!("tailbus-pipe-{}", new_id()));
+        std::fs::create_dir_all(dir.join("s1/subagents")).unwrap();
+        (bus, dir)
+    }
+
+    fn a_plan(rounds: u32) -> Plan {
+        Plan {
+            researchers: 1,
+            builders: 2,
+            dimensions: vec!["correctness".into(), "risk".into()],
+            rounds,
+            model: "opus".into(),
+            effort: "xhigh".into(),
+            used_so_far: 0,
+            estimate: None,
+        }
+    }
+
+    /// Sends a task from hub to work, and work's plan for it. Returns the
+    /// task's ID and the plan's.
+    fn task_and_plan(bus: &Bus) -> (String, String) {
+        let task = bus
+            .send(
+                "hub",
+                "work@here",
+                "Do it".into(),
+                None,
+                None,
+                Some(Pipe::new(PipeStage::Task)),
+            )
+            .unwrap();
+        let plan = bus
+            .send(
+                "work",
+                "",
+                "One researcher, two builders, then ACR.".into(),
+                Some(task.id.clone()),
+                Some(true),
+                Some(Pipe {
+                    plan: Some(Box::new(a_plan(3))),
+                    ..Pipe::new(PipeStage::Plan)
+                }),
+            )
+            .unwrap();
+        (task.id, plan.id)
+    }
+
+    fn approve(bus: &Bus, plan: &str) -> Result<Sent> {
+        bus.send(
+            "hub",
+            "",
+            String::new(),
+            Some(plan.into()),
+            Some(false),
+            Some(Pipe {
+                approved: Some(1),
+                ..Pipe::new(PipeStage::Approval)
+            }),
+        )
+    }
+
+    #[test]
+    fn a_pipe_task_caps_the_subagents_running_at_once() {
+        let (bus, dir) = pipe_bus("alerts = false\nmax_subagents = 2");
         let folder = dir.join("s1/subagents");
-        std::fs::create_dir_all(&folder).unwrap();
         let transcript = dir.join("s1.jsonl");
         let meta = |id: &str, finished: bool| {
             let json = serde_json::json!({"toolUseId": id, "finished": finished});
             std::fs::write(folder.join(format!("{id}.meta.json")), json.to_string()).unwrap();
         };
         let refused = |id: &str| bus.subagent_refused("work", &transcript, id).unwrap();
-        let step = |stage, max_subagents| Pipe {
-            stage,
-            model: None,
-            effort: None,
-            max_subagents,
-        };
 
         // Outside a task there's no cap.
         for id in ["a", "b", "c"] {
@@ -1977,13 +2365,31 @@ pub(crate) mod tests {
         }
         assert_eq!(refused("x"), None);
 
-        let task = step(PipeStage::Task, Some(99));
+        let task = Pipe {
+            max_subagents: Some(99),
+            ..Pipe::new(PipeStage::Task)
+        };
         let sent = bus
             .send("hub", "work@here", "Do it".into(), None, None, Some(task))
             .unwrap();
         // The cap is the sending bus's, whatever the agent asked for.
         let stored = bus.db().incoming(&sent.id).unwrap().unwrap();
         assert_eq!(stored.msg.pipe.unwrap().max_subagents, Some(2));
+        let plan = bus
+            .send(
+                "work",
+                "",
+                "Plan".into(),
+                Some(sent.id.clone()),
+                Some(true),
+                Some(Pipe {
+                    plan: Some(Box::new(a_plan(1))),
+                    ..Pipe::new(PipeStage::Plan)
+                }),
+            )
+            .unwrap();
+        bus.turn("hub", "h1", 2, true).unwrap();
+        approve(&bus, &plan.id).unwrap();
 
         for id in ["a", "b", "c"] {
             meta(id, false);
@@ -2005,14 +2411,13 @@ pub(crate) mod tests {
         assert_eq!(refused("y"), None);
 
         // Sending the result ends the task, and the cap with it.
-        let result = step(PipeStage::Result, None);
         bus.send(
             "work",
             "",
             "## Result".into(),
             Some(sent.id),
             None,
-            Some(result),
+            Some(Pipe::new(PipeStage::Result)),
         )
         .unwrap();
         for id in ["d", "e", "f"] {
@@ -2020,6 +2425,233 @@ pub(crate) mod tests {
         }
         assert_eq!(refused("z"), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pipe_task_waits_for_its_plan_to_be_approved_and_keeps_to_it() {
+        let (bus, dir) = pipe_bus("alerts = false");
+        let transcript = dir.join("s1.jsonl");
+        let refused = || bus.subagent_refused("work", &transcript, "").unwrap();
+        let (task, plan) = task_and_plan(&bus);
+        assert!(refused().unwrap().contains("plan isn't approved yet"));
+
+        // The worker's bus adds the estimate, and the hub sees it.
+        let shown = bus.db().incoming(&plan).unwrap().unwrap();
+        assert!(shown.msg.body.starts_with("One researcher, two builders"));
+        assert!(shown.msg.body.contains("## Estimate, by tailbus"));
+        let step = shown.msg.pipe.unwrap();
+        assert_eq!(step.task.as_deref(), Some(task.as_str()));
+        let estimate = step.plan.unwrap().estimate.unwrap();
+        // 3 researchers and builders, and 2 dimensions through 3 rounds and
+        // a verify-only one, at the first run's figures.
+        assert_eq!(
+            estimate.worst,
+            11 * FIRST_RUN_PER_SUBAGENT + FIRST_RUN_SESSION
+        );
+        assert_eq!(estimate.budget, estimate.worst);
+
+        // Only the user can approve, so not from a turn another agent started.
+        let why = approve(&bus, &plan).unwrap_err().to_string();
+        assert!(why.contains("an approval needs your user"), "{why}");
+        // Asking for a smaller plan doesn't need them, and approves nothing.
+        bus.send(
+            "hub",
+            "",
+            "Fewer builders".into(),
+            Some(plan.clone()),
+            Some(false),
+            Some(Pipe::new(PipeStage::Approval)),
+        )
+        .unwrap();
+        assert!(refused().unwrap().contains("plan isn't approved yet"));
+
+        // The user answered a carousel, so the approval goes, with the
+        // plan's own budget whatever the agent said.
+        bus.tool_done("hub", "AskUserQuestion", "{}");
+        let ok = approve(&bus, &plan).unwrap();
+        let approval = bus.db().incoming(&ok.id).unwrap().unwrap();
+        assert_eq!(approval.msg.pipe.unwrap().approved, Some(estimate.budget));
+        assert!(
+            approval
+                .msg
+                .body
+                .starts_with("Approved: the task may use up to ")
+        );
+        assert_eq!(refused(), None);
+
+        // Past the budget, nothing more starts.
+        let line = serde_json::json!({
+            "type": "assistant", "timestamp": rfc3339(now_ms() + 1000),
+            "message": {"id": "m1", "model": "claude-opus-5-5", "usage": {
+                "input_tokens": 1, "output_tokens": 1,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": estimate.budget,
+            }},
+        });
+        std::fs::write(&transcript, line.to_string()).unwrap();
+        let why = refused().unwrap();
+        assert!(why.contains("its approved plan allows"), "{why}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_hub_can_cancel_its_task() {
+        let (bus, dir) = pipe_bus("alerts = false");
+        let transcript = dir.join("s1.jsonl");
+        let refused = || bus.subagent_refused("work", &transcript, "").unwrap();
+        let (task, plan) = task_and_plan(&bus);
+        bus.turn("hub", "h1", 2, true).unwrap();
+        approve(&bus, &plan).unwrap();
+        assert_eq!(refused(), None);
+
+        // Naming its own task finds the worker.
+        let cancel = bus
+            .send(
+                "hub",
+                "",
+                "Out of time".into(),
+                Some(task.clone()),
+                Some(true),
+                Some(Pipe::new(PipeStage::Cancel)),
+            )
+            .unwrap();
+        assert_eq!(cancel.to, "work@here");
+        let got = bus.db().incoming(&cancel.id).unwrap().unwrap();
+        assert!(
+            got.msg
+                .body
+                .contains("Cancelled by your hub's user.\n\nFrom the hub: Out of time")
+        );
+        assert!(refused().unwrap().contains("cancelled this /pipe task"));
+
+        // The result answers the cancel too, and ends the task.
+        bus.send(
+            "work",
+            "",
+            "## Result\n\nCancelled.".into(),
+            Some(task),
+            None,
+            Some(Pipe::new(PipeStage::Result)),
+        )
+        .unwrap();
+        assert!(
+            bus.db()
+                .incoming(&cancel.id)
+                .unwrap()
+                .unwrap()
+                .acked_at
+                .is_some()
+        );
+        assert_eq!(refused(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plans_and_answers_must_answer_the_right_step() {
+        let (bus, dir) = pipe_bus("alerts = false");
+        let (task, plan) = task_and_plan(&bus);
+        // A plan answers a task, and an approval a plan.
+        let plan_step = || {
+            Some(Pipe {
+                plan: Some(Box::new(a_plan(2))),
+                ..Pipe::new(PipeStage::Plan)
+            })
+        };
+        assert!(
+            bus.send(
+                "work",
+                "",
+                "x".into(),
+                Some(plan.clone()),
+                None,
+                plan_step()
+            )
+            .is_err()
+        );
+        bus.turn("hub", "h1", 2, true).unwrap();
+        assert!(approve(&bus, &task).is_err());
+        let bad = Some(Pipe {
+            plan: Some(Box::new(Plan {
+                rounds: 4,
+                ..a_plan(3)
+            })),
+            ..Pipe::new(PipeStage::Plan)
+        });
+        let why = bus
+            .send("work", "", "x".into(), Some(task), None, bad)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("round cap, from 1 to 3"), "{why}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn estimates_go_by_earlier_tasks_on_the_same_model_and_effort() {
+        let plan = a_plan(3);
+        // No earlier task: the first run's figures, and 2 reviews each.
+        let first = estimate(&plan, &[]);
+        let at = |n: u64| n * FIRST_RUN_PER_SUBAGENT + FIRST_RUN_SESSION;
+        assert_eq!(first.low, at(5));
+        assert_eq!(first.expected, at(7));
+        assert_eq!(first.worst, at(11));
+        assert!(first.basis.contains("first run across machines"));
+
+        // One earlier task with the same plan: 3 + 3 reviews per dimension,
+        // so 9 subagents at 1M each, and a 2M session.
+        let msg = |id: &str, pipe: Pipe| Message {
+            id: id.into(),
+            from: "work@here".into(),
+            to: "hub@here".into(),
+            body: String::new(),
+            reply_to: None,
+            expects_reply: false,
+            created_at: 0,
+            pipe: Some(pipe),
+            attended: false,
+        };
+        let plans = [msg(
+            "p",
+            Pipe {
+                task: Some("t".into()),
+                plan: Some(Box::new(a_plan(3))),
+                ..Pipe::new(PipeStage::Plan)
+            },
+        )];
+        let used = Used {
+            session: 2_000_000,
+            subagents: 9_000_000,
+            subagent_count: 9,
+        };
+        let results = [msg(
+            "r",
+            Pipe {
+                task: Some("t".into()),
+                used: Some(used),
+                ..Pipe::new(PipeStage::Result)
+            },
+        )];
+        let found = earlier(&plans, &results, &plan);
+        assert_eq!(
+            found,
+            [Earlier {
+                per_subagent: 1_000_000.0,
+                session: 2_000_000,
+                reviews: Some(3.0),
+            }]
+        );
+        let next = estimate(&plan, &found);
+        assert_eq!(next.low, 7_000_000);
+        assert_eq!(next.expected, 11_000_000);
+        assert_eq!(next.worst, 13_000_000);
+        assert!(
+            next.basis
+                .starts_with("1 earlier task here on opus at xhigh")
+        );
+        // Another effort doesn't count.
+        let high = Plan {
+            effort: "high".into(),
+            ..a_plan(3)
+        };
+        assert!(earlier(&plans, &results, &high).is_empty());
     }
 
     #[test]

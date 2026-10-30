@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::format::{self, Tools};
 use crate::local::{self, Client, Held, Hello, Inbox, Peers, Request, Sent, Thread};
-use crate::proto::{Billing, MAX_BATCH, Pipe, PipeStage};
+use crate::proto::{Billing, MAX_BATCH, Pipe, PipeStage, Plan, Used};
 use crate::{usage, util};
 
 /// Revisions this server speaks. Claude Code also offers 2026-07-28, but
@@ -321,10 +321,9 @@ impl Server {
                         reply_to: None,
                         expects_reply: Some(true),
                         pipe: Some(Pipe {
-                            stage: PipeStage::Task,
                             model: str_arg("model"),
                             effort: str_arg("effort"),
-                            max_subagents: None,
+                            ..Pipe::new(PipeStage::Task)
                         }),
                     },
                 )?;
@@ -341,7 +340,7 @@ impl Server {
                     need("reply_to")?,
                     serde_json::to_string_pretty(questions)?,
                     true,
-                    PipeStage::Questions,
+                    Pipe::new(PipeStage::Questions),
                 )
             }
             "pipe_answers" => {
@@ -353,11 +352,92 @@ impl Server {
                     need("reply_to")?,
                     serde_json::to_string_pretty(answers)?,
                     false,
-                    PipeStage::Answers,
+                    Pipe::new(PipeStage::Answers),
                 )
+            }
+            "pipe_plan" => {
+                let task = need("reply_to")?;
+                let count = |k: &str| {
+                    args[k]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(|| anyhow!("pipe_plan needs `{k}`, a count"))
+                };
+                let dimensions = args["dimensions"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let plan = Plan {
+                    researchers: count("researchers")?,
+                    builders: count("builders")?,
+                    dimensions,
+                    rounds: count("rounds")?,
+                    model: need("model")?,
+                    effort: need("effort")?,
+                    used_so_far: self.usage_since(&task).map_or(0, |u| u.total().total()),
+                    estimate: None,
+                };
+                let sent = self.pipe_reply(
+                    task,
+                    need("summary")?,
+                    true,
+                    Pipe {
+                        plan: Some(Box::new(plan)),
+                        ..Pipe::new(PipeStage::Plan)
+                    },
+                )?;
+                Ok(format!(
+                    "{sent} tailbus added its estimate. Wait for your hub's answer: tailbus \
+                     refuses subagents until the plan is approved."
+                ))
+            }
+            "pipe_approve" => {
+                let reply_to = need("reply_to")?;
+                let note = str_arg("note").unwrap_or_default();
+                let decision = need("decision")?;
+                let (expects_reply, pipe) = match decision.as_str() {
+                    // The bus sets how many tokens, from the plan.
+                    "approve" => (
+                        false,
+                        Pipe {
+                            approved: Some(0),
+                            ..Pipe::new(PipeStage::Approval)
+                        },
+                    ),
+                    "smaller" => (false, Pipe::new(PipeStage::Approval)),
+                    "cancel" => (true, Pipe::new(PipeStage::Cancel)),
+                    other => bail!("`decision` is approve, smaller or cancel, not {other:?}"),
+                };
+                self.pipe_reply(reply_to, note, expects_reply, pipe)
+            }
+            "pipe_cancel" => {
+                let sent = self.pipe_reply(
+                    need("task")?,
+                    str_arg("note").unwrap_or_default(),
+                    true,
+                    Pipe::new(PipeStage::Cancel),
+                )?;
+                Ok(format!(
+                    "{sent} The worker stops, and sends back what it has done as its result."
+                ))
             }
             "pipe_result" => {
                 let task = need("reply_to")?;
+                let usage = self.usage_since(&task);
+                let tokens = match &usage {
+                    Ok(u) => usage::describe(u),
+                    Err(why) => why.clone(),
+                };
+                let used = usage.ok().map(|u| Used {
+                    session: u.session.total(),
+                    subagents: u.subagents.total(),
+                    subagent_count: u32::try_from(u.subagent_count).unwrap_or(u32::MAX),
+                });
                 let body = format!(
                     "## Result\n\n{}\n\n## ACR report\n\n{}\n\n## Where reviewers disagreed\n\n{}\n\n\
                      ## What ran\n\nModel: {}. Effort: {}.\n\nTokens, counted by tailbus from the \
@@ -367,9 +447,17 @@ impl Server {
                     need("disagreements")?.trim(),
                     need("model")?.trim(),
                     need("effort")?.trim(),
-                    self.tokens_since(&task),
+                    tokens,
                 );
-                self.pipe_reply(task, body, false, PipeStage::Result)
+                self.pipe_reply(
+                    task,
+                    body,
+                    false,
+                    Pipe {
+                        used,
+                        ..Pipe::new(PipeStage::Result)
+                    },
+                )
             }
             "msg_ack" => {
                 let _: Value = local::call(
@@ -402,19 +490,14 @@ impl Server {
         }
     }
 
-    /// What this session and its subagents used since `task` was sent. The
-    /// ID says when.
-    fn tokens_since(&self, task: &str) -> String {
-        let Some(since) = util::id_ms(task) else {
-            return "not counted, since the task's ID doesn't say when it was sent.".into();
-        };
-        let Some(path) = usage::transcript(&self.session) else {
-            return "not counted, since tailbus found no transcript for this session.".into();
-        };
-        match usage::measure(&path, since) {
-            Ok(used) => usage::describe(&used),
-            Err(e) => format!("not counted: {e:#}."),
-        }
+    /// What this session and its subagents used since `task` was sent, or
+    /// why it wasn't counted. The ID says when.
+    fn usage_since(&self, task: &str) -> Result<usage::Usage, String> {
+        let since = util::id_ms(task)
+            .ok_or("not counted, since the task's ID doesn't say when it was sent.")?;
+        let path = usage::transcript(&self.session)
+            .ok_or("not counted, since tailbus found no transcript for this session.")?;
+        usage::measure(&path, since).map_err(|e| format!("not counted: {e:#}."))
     }
 
     /// A pipe step that answers `reply_to`, sent to whoever sent that.
@@ -423,7 +506,7 @@ impl Server {
         reply_to: String,
         body: String,
         expects_reply: bool,
-        stage: PipeStage,
+        pipe: Pipe,
     ) -> Result<String> {
         let sent: Sent = local::call(
             &self.socket,
@@ -433,12 +516,7 @@ impl Server {
                 body,
                 reply_to: Some(reply_to),
                 expects_reply: Some(expects_reply),
-                pipe: Some(Pipe {
-                    stage,
-                    model: None,
-                    effort: None,
-                    max_subagents: None,
-                }),
+                pipe: Some(pipe),
             },
         )?;
         Ok(format::sent(&sent))
@@ -609,6 +687,52 @@ fn tools() -> Value {
                     "answers": {"type": "object", "description": "Each question's text, mapped to your user's answer"}
                 },
                 "required": ["reply_to", "answers"]
+            },
+            "annotations": acts
+        },
+        {
+            "name": "pipe_plan",
+            "description": "For a worker on a /pipe task: once the hub has answered your questions, send your plan, which tailbus turns into a token estimate for the hub's user to approve. Start no subagents until it's approved; tailbus refuses them. Send a new plan for what's left if tailbus says the approved tokens are used up.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reply_to": {"type": "string", "description": "The id of the task"},
+                    "summary": {"type": "string", "description": "What you'll do, briefly, for the hub's user"},
+                    "researchers": {"type": "integer", "minimum": 0, "description": "Subagents that research"},
+                    "builders": {"type": "integer", "minimum": 0, "description": "Subagents that build"},
+                    "dimensions": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string"}, "description": "The ACR dimensions the hub's user chose"},
+                    "rounds": {"type": "integer", "minimum": 1, "maximum": 3, "description": "ACR's round cap"},
+                    "model": {"type": "string", "description": "The model the subagents will run on"},
+                    "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"], "description": "The effort they'll run at"}
+                },
+                "required": ["reply_to", "summary", "researchers", "builders", "dimensions", "rounds", "model", "effort"]
+            },
+            "annotations": acts
+        },
+        {
+            "name": "pipe_approve",
+            "description": "For the hub on a /pipe task: send your user's answer to the worker's plan, after showing it to them with AskUserQuestion. tailbus refuses an approval unless your user just answered, and sets the approved tokens from the plan's estimate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reply_to": {"type": "string", "description": "The id of the plan"},
+                    "decision": {"type": "string", "enum": ["approve", "smaller", "cancel"], "description": "Approve up to the worst case, ask for a smaller plan, or cancel the task"},
+                    "note": {"type": "string", "description": "Anything your user added"}
+                },
+                "required": ["reply_to", "decision"]
+            },
+            "annotations": acts
+        },
+        {
+            "name": "pipe_cancel",
+            "description": "For the hub: cancel a /pipe task you sent, when your user asks. The worker stops starting subagents, and sends back what it has done as its result.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "The id of the task you sent"},
+                    "note": {"type": "string", "description": "Why, if your user said"}
+                },
+                "required": ["task"]
             },
             "annotations": acts
         },

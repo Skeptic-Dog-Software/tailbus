@@ -447,6 +447,32 @@ impl Store {
             .optional()?)
     }
 
+    /// The later steps of `task` that `sender` sent `agent`: its approvals
+    /// and cancels, oldest first.
+    pub fn pipe_steps(&self, agent: &str, task: &str, sender: &str) -> Result<Vec<Incoming>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {INCOMING} FROM inbox
+             WHERE agent = ?1 AND sender = ?3 AND pipe LIKE '%\"task\":\"' || ?2 || '\"%'
+             ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map(params![agent, task, sender], incoming)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The `/pipe` steps of one stage that `agent` has sent, oldest first,
+    /// such as its plans and results.
+    pub fn sent_steps(&self, agent: &str, stage: &str) -> Result<Vec<Message>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {OUTGOING} FROM sent
+             WHERE agent = ?1 AND pipe LIKE '%\"stage\":\"' || ?2 || '\"%'
+             ORDER BY created_at"
+        ))?;
+        let rows = stmt.query_map(params![agent, stage], outgoing)?;
+        Ok(rows
+            .map(|r| r.map(|o| o.msg))
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn ack(&self, agent: &str, id: &str, now: i64) -> Result<Acked> {
         let row: Option<(String, Option<i64>)> = self
             .db
@@ -1037,10 +1063,10 @@ mod tests {
         s.add_agent("sim", 1).unwrap();
         let mut m = msg("a", "x@t", "sim@h", None);
         m.pipe = Some(Pipe {
-            stage: PipeStage::Task,
             model: Some("sonnet".into()),
             effort: Some("high".into()),
             max_subagents: Some(5),
+            ..Pipe::new(PipeStage::Task)
         });
         m.attended = true;
         s.store_incoming(&m, "o", 1).unwrap();
@@ -1054,14 +1080,7 @@ mod tests {
     fn a_task_is_open_until_its_result_is_sent() {
         let s = Store::memory();
         s.add_agent("work", 1).unwrap();
-        let step = |stage| {
-            Some(Pipe {
-                stage,
-                model: None,
-                effort: None,
-                max_subagents: None,
-            })
-        };
+        let step = |stage| Some(Pipe::new(stage));
         let mut task = msg("t", "hub@h", "work@w", None);
         task.pipe = step(PipeStage::Task);
         s.store_incoming(&task, "o", 1).unwrap();
@@ -1077,6 +1096,38 @@ mod tests {
         result.pipe = step(PipeStage::Result);
         s.record_sent(&result, SendState::Stored, 3).unwrap();
         assert!(s.open_task("work", 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn finds_a_tasks_later_steps_by_sender() {
+        let s = Store::memory();
+        s.add_agent("work", 1).unwrap();
+        let step = |id: &str, from: &str, stage, task: &str| {
+            let mut m = msg(id, from, "work@w", Some("p"));
+            m.pipe = Some(Pipe {
+                task: Some(task.into()),
+                ..Pipe::new(stage)
+            });
+            m
+        };
+        s.store_incoming(&step("a", "hub@h", PipeStage::Approval, "t1"), "o", 1)
+            .unwrap();
+        s.store_incoming(&step("b", "hub@h", PipeStage::Cancel, "t2"), "o", 1)
+            .unwrap();
+        // Only the task's own hub counts.
+        s.store_incoming(&step("c", "other@h", PipeStage::Approval, "t1"), "o", 1)
+            .unwrap();
+        let ids = |v: Vec<Incoming>| v.into_iter().map(|i| i.msg.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.pipe_steps("work", "t1", "hub@h").unwrap()), ["a"]);
+        assert_eq!(ids(s.pipe_steps("work", "t2", "hub@h").unwrap()), ["b"]);
+        assert!(s.pipe_steps("work", "t3", "hub@h").unwrap().is_empty());
+
+        let mut plan = msg("p", "work@w", "hub@h", Some("t1"));
+        plan.pipe = step("x", "w", PipeStage::Plan, "t1").pipe;
+        s.record_sent(&plan, SendState::Stored, 2).unwrap();
+        let plans = s.sent_steps("work", "plan").unwrap();
+        assert_eq!(plans.len(), 1);
+        assert!(s.sent_steps("work", "result").unwrap().is_empty());
     }
 
     #[test]
