@@ -5,6 +5,7 @@
 mod change;
 mod config;
 mod flow;
+mod keep;
 mod plan;
 mod report;
 mod roles;
@@ -138,7 +139,7 @@ fn user_config_path(paths: &Paths) -> PathBuf {
 }
 
 fn run_dir(paths: &Paths, id: &str) -> PathBuf {
-    paths.state.join("acr").join(id)
+    keep::dir(paths).join(id)
 }
 
 fn flags(t: &Target) -> Flags {
@@ -370,6 +371,7 @@ fn post(run: &Run, cfg: &Config, pr: u64) -> Result<()> {
 /// Prints a run's report, and says what to do next.
 fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<ExitCode> {
     save(paths, run, cfg)?;
+    keep::finished(paths, run, true)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&report::report(run, cfg))?
@@ -416,26 +418,9 @@ fn setting<'a>(
     })
 }
 
-/// The most earlier reviews an expected cost is taken from.
-const HISTORY_RUNS: usize = 20;
-
-/// The last finished reviews of `repo` on this machine.
+/// What earlier reviews of `repo` say, from ACR's history.
 fn history(paths: &Paths, repo: &Path) -> plan::History {
-    let same = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let want = same(repo);
-    let Ok(entries) = fs::read_dir(paths.state.join("acr")) else {
-        return plan::History::default();
-    };
-    let mut runs: Vec<Run> = entries
-        .flatten()
-        .filter_map(|e| fs::read(e.path().join("run.json")).ok())
-        .filter_map(|bytes| serde_json::from_slice::<Run>(&bytes).ok())
-        .filter(|r| matches!(r.status, Status::Confirmed | Status::Stopped))
-        .filter(|r| same(&r.repo) == want)
-        .collect();
-    runs.sort_by(|a, b| a.id.cmp(&b.id));
-    let newest = runs.len().saturating_sub(HISTORY_RUNS);
-    plan::History::of(&runs[newest..])
+    plan::History::of(keep::history(paths, repo))
 }
 
 fn describe_plan(plan: &plan::Plan) {
@@ -534,6 +519,7 @@ fn describe_plan(plan: &plan::Plan) {
 }
 
 pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<ExitCode> {
+    keep::prune(paths);
     match command {
         AcrCmd::Schema => print!("{SCHEMA}"),
         AcrCmd::Validate { file, repo, base } => {
@@ -641,6 +627,8 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
                 e.seen = true;
             }
             save(paths, &run, &cfg)?;
+            // One round, forced, says nothing about how many reviews take.
+            keep::finished(paths, &run, false)?;
             let score = flow::score(&run, &known)?;
             println!("{}", serde_json::to_string_pretty(&score)?);
         }

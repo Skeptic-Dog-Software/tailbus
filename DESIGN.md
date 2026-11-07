@@ -518,6 +518,32 @@ about 8.
 Rejected: `--mode json` on stdout. The reply would then have to be dug out of
 an event stream, where the session already has everything.
 
+#### What's kept, and for how long
+
+Added 2026-11-07: everything tailbus writes cleans itself up, often, and
+cheaply.
+
+- **The database gives space back.** Deleting rows only marks pages free, so
+  the file never shrank, and nor did the WAL: 4.1 MB on `server` beside
+  a 196 KB database. Now it's `auto_vacuum = INCREMENTAL`, which an existing
+  database takes on with one `VACUUM` when the daemon opens it, and each
+  hourly prune frees pages and empties the WAL, with `journal_size_limit`
+  so it can't stay large.
+- **Logs are cut, not rotated.** launchd holds the daemon's and bridges' log
+  files open, so a rename would leave them writing to the old file. They
+  append instead, set when they start, so a log cut back to its last lines
+  under them stays whole.
+- **ACR keeps a line, not a review.** An expected cost needs each lens's
+  rounds, not the findings, so a finished review adds one line to
+  `history.jsonl`, under a lock, with the last 20 per repository kept.
+  Reading it costs one small file, where reading the reviews would cost all
+  of them. Benchmarks force one round, so they're left out. A finished
+  review's diffs go at once, and its report after 7 days. One waiting for a
+  person is taken as left after 30. Every `tailbus acr` command cleans up
+  first, going by file times, with nothing read.
+- *Not changed:* a message that's never delivered or answered is kept until
+  it is, as delivery promises.
+
 #### omp on `server`, checked 2026-11-06 on omp 18.17.0
 
 No real model: a stand-in on `127.0.0.1` returned canned text.

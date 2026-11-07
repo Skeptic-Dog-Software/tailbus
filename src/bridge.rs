@@ -42,7 +42,7 @@ use crate::proto::{
 };
 use crate::run_usage::UsageFrom;
 use crate::setup;
-use crate::util::{ago, is_id, new_id, now_ms, valid_name};
+use crate::util::{LOG_KEEP, LOG_MAX, ago, is_id, new_id, now_ms, valid_name};
 
 /// What `tailbus status` shows a bridge's sessions as.
 const APP: &str = "tailbus-bridge";
@@ -1071,6 +1071,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Runs a bridge until it's told to stop.
 pub fn run(paths: &Paths, agent: &str) -> Result<()> {
+    crate::util::append_to_logs();
     let cfg = load(paths, agent)?;
     paths.make_state_dir()?;
     let bus = Config::load(&paths.config)?;
@@ -1412,6 +1413,10 @@ impl Bridge {
         }
         *pruned = Some(Instant::now());
         drop(pruned);
+        let log = self.dir.join("bridge.log");
+        if matches!(crate::util::trim_log(&log, LOG_MAX, LOG_KEEP), Ok(true)) {
+            self.log(format!("cut {} back to its last lines", log.display()));
+        }
         let age = Duration::from_secs(u64::from(self.cfg.log_retention_days) * 86_400);
         let Ok(entries) = fs::read_dir(self.dir.join("log")) else {
             return;

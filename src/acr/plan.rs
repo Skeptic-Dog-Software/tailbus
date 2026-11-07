@@ -2,15 +2,16 @@
 //! needs no model, which is what makes a dry run possible.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::change::Change;
 use super::config::{Binding, Config, Lens, PerCall, Role, Tier};
-use super::flow::{Run, Status};
+use super::flow::{Run, Status, Usage};
 
 /// Roughly how many bytes make a token.
 const BYTES_PER_TOKEN: usize = 4;
@@ -220,33 +221,56 @@ fn mean(values: &[u32]) -> Option<f64> {
         .then(|| values.iter().map(|&n| f64::from(n)).sum::<f64>() / values.len() as f64)
 }
 
+/// A finished review, as history keeps it: a line, where the review's own
+/// files are many and go after a week.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Record {
+    pub id: String,
+    pub repo: PathBuf,
+    /// The rounds each lens took.
+    pub lenses: BTreeMap<String, u32>,
+    /// One for each round after the first.
+    pub fixes: u32,
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub usd: Option<f64>,
+}
+
+impl Record {
+    /// None for a review that isn't finished, since one still going would
+    /// make reviews look shorter than they are, or that reviewed nothing.
+    pub fn of(run: &Run) -> Option<Record> {
+        if !matches!(run.status, Status::Confirmed | Status::Stopped) {
+            return None;
+        }
+        let lenses: BTreeMap<String, u32> = run
+            .lenses
+            .values()
+            .filter(|l| !l.rounds.is_empty())
+            .map(|l| (l.id.clone(), l.rounds.len() as u32))
+            .collect();
+        let most = lenses.values().copied().max()?;
+        Some(Record {
+            id: run.id.clone(),
+            repo: run.repo.clone(),
+            lenses,
+            fixes: most - 1,
+            tokens: run.usage.iter().map(Usage::tokens).sum(),
+            usd: run.usage.iter().map(|u| u.usd).sum(),
+        })
+    }
+}
+
 impl History {
-    /// From finished runs. One that's still going would make reviews look
-    /// shorter than they are.
-    pub fn of<'a>(runs: impl IntoIterator<Item = &'a Run>) -> History {
+    pub fn of(records: impl IntoIterator<Item = Record>) -> History {
         let mut history = History::default();
-        for run in runs {
-            if !matches!(run.status, Status::Confirmed | Status::Stopped) {
-                continue;
-            }
-            let taken: Vec<(&str, u32)> = run
-                .lenses
-                .values()
-                .filter(|l| !l.rounds.is_empty())
-                .map(|l| (l.id.as_str(), l.rounds.len() as u32))
-                .collect();
-            let Some(most) = taken.iter().map(|(_, n)| *n).max() else {
-                continue;
-            };
+        for record in records {
             history.runs += 1;
-            for (id, n) in taken {
-                history
-                    .lens_rounds
-                    .entry(id.to_string())
-                    .or_default()
-                    .push(n);
+            for (id, n) in record.lenses {
+                history.lens_rounds.entry(id).or_default().push(n);
             }
-            history.fixes.push(most - 1);
+            history.fixes.push(record.fixes);
         }
         history
     }

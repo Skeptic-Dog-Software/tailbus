@@ -587,6 +587,14 @@ a crash mid-round means starting over.
   in `~/.local/state/tailbus/`, readable only by you. A message handed to a
   session stays pending until it's answered or acknowledged. If that session
   ends first, the agent's next session gets it again.
+- **Cleaning up.** Every hour the bus deletes finished messages older than
+  `retention_days` (default 30) and attachments no open message needs, gives
+  the freed space back to the system, and empties SQLite's WAL file. The
+  daemon's and each bridge's logs are cut back to about their last 256 KiB
+  once they pass 1 MiB, and a bridge's run logs go after
+  `log_retention_days`. ACR keeps one line of history for each finished
+  review, the last 20 per repository. A finished review's diffs go when it
+  finishes, and the rest after 7 days. One left waiting goes after 30.
 - **Between machines.** Buses talk HTTP with JSON bodies on each machine's
   tailnet address, port 4747, which WireGuard encrypts. Each request is
   checked with `tailscale whois`. A message waits in the sender's outbox

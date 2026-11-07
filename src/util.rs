@@ -1,8 +1,8 @@
 //! Small helpers: the clock, message IDs, and agent and machine names.
 
 use std::fmt;
-use std::fs::File;
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -219,9 +219,70 @@ pub fn ago(then: i64, now: i64) -> String {
     }
 }
 
+/// A log is cut back when it passes this, in bytes.
+pub const LOG_MAX: u64 = 1 << 20;
+/// What's kept of it: about the last this many bytes, from a line's start.
+pub const LOG_KEEP: u64 = 256 << 10;
+
+/// Cuts a log that's grown past `max` bytes back to about its last `keep`,
+/// from the start of a line. Whoever writes it must append, as
+/// `append_to_logs` makes this process do, or they'd write past the end.
+pub fn trim_log(path: &Path, max: u64, keep: u64) -> io::Result<bool> {
+    let len = fs::metadata(path)?.len();
+    if len <= max {
+        return Ok(false);
+    }
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    file.seek(SeekFrom::Start(len.saturating_sub(keep)))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    let start = tail.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1);
+    file.set_len(0)?;
+    // Appended, so a line written meanwhile isn't written over.
+    OpenOptions::new()
+        .append(true)
+        .open(path)?
+        .write_all(&tail[start..])?;
+    Ok(true)
+}
+
+/// Makes this process's stdout and stderr append, so a log they go to can
+/// be cut back under them. launchd's log files are these.
+pub fn append_to_logs() {
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: reads and sets the flags of this process's own descriptors.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 && flags & libc::O_APPEND == 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_APPEND);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_log_keeps_its_last_whole_lines() {
+        let dir = std::env::temp_dir().join(format!("tb-log-{}", &new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("daemon.log");
+        let lines: String = (0..1000).map(|n| format!("line {n:04}\n")).collect();
+        fs::write(&log, &lines).unwrap();
+        assert!(!trim_log(&log, 20_000, 100).unwrap(), "short enough");
+        // A writer that appends, as launchd's log is once append_to_logs runs.
+        let mut writer = OpenOptions::new().append(true).open(&log).unwrap();
+        assert!(trim_log(&log, 1000, 100).unwrap());
+        let kept = fs::read_to_string(&log).unwrap();
+        assert!(kept.len() <= 100 && kept.starts_with("line "), "{kept:?}");
+        assert!(kept.ends_with("line 0999\n"));
+        writer.write_all(b"after\n").unwrap();
+        let kept = fs::read_to_string(&log).unwrap();
+        assert!(kept.ends_with("line 0999\nafter\n"), "{kept:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn ulids_sort_by_time() {

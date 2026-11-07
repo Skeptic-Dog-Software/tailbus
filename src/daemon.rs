@@ -37,7 +37,11 @@ const MAX_CALL_WAIT: u64 = 7 * 86_400;
 const MAX_PERMISSION_WAIT: Duration = Duration::from_secs(86_400);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// How often the daemon's own log is looked at, to be cut back.
+const LOG_TRIM_EVERY: Duration = Duration::from_secs(3600);
+
 pub fn run(paths: &Paths) -> Result<()> {
+    crate::util::append_to_logs();
     paths.make_state_dir()?;
     let cfg = Config::load(&paths.config)?;
     let socket = paths.socket();
@@ -50,6 +54,21 @@ pub fn run(paths: &Paths) -> Result<()> {
     let _ = fs::remove_file(&socket);
     let store = Store::open(&paths.db())?;
     let bus = Bus::start(cfg, store, paths.attachments());
+    {
+        // launchd's log for the daemon, which nothing else cuts back.
+        let (bus, log) = (bus.clone(), paths.log());
+        thread::spawn(move || {
+            loop {
+                if matches!(
+                    crate::util::trim_log(&log, crate::util::LOG_MAX, crate::util::LOG_KEEP),
+                    Ok(true)
+                ) {
+                    bus.event(format!("cut {} back to its last lines", log.display()));
+                }
+                thread::sleep(LOG_TRIM_EVERY);
+            }
+        });
+    }
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("listening on {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;

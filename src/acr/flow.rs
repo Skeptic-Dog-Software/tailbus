@@ -462,7 +462,8 @@ pub fn start(
 ) -> Result<Run> {
     let mut run = Run {
         id: id.to_string(),
-        repo: repo.to_path_buf(),
+        // Whole, so that history finds it from anywhere.
+        repo: repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf()),
         base: base.to_string(),
         head: head.map(str::to_string),
         tier: String::new(),
@@ -1189,6 +1190,32 @@ lenses:
     }
 
     #[test]
+    fn a_finished_review_is_noted_once_and_tidied() {
+        let cfg = plain("exception", 3, 1);
+        let (run, _) = go(&cfg, &["a.src"], &Fake::new(defect_in("alpha", 1)));
+        let home = std::env::temp_dir().join(format!("tb-done-{}", &new_id()[14..]));
+        let paths = crate::config::Paths {
+            config: home.join("config.toml"),
+            state: home.clone(),
+        };
+        let review = super::super::keep::dir(&paths).join(&run.id);
+        fs::create_dir_all(&review).unwrap();
+        fs::write(review.join("round-1.diff"), "+x").unwrap();
+        fs::write(review.join("run.json"), "{}").unwrap();
+        super::super::keep::finished(&paths, &run, true).unwrap();
+        super::super::keep::finished(&paths, &run, true).unwrap();
+        assert!(
+            !review.join("round-1.diff").exists(),
+            "a finished review needs no diffs"
+        );
+        assert!(review.join("run.json").exists());
+        let noted = super::super::keep::history(&paths, &run.repo);
+        assert_eq!(noted.len(), 1, "noted once");
+        assert_eq!(noted[0].lenses["alpha"], 2);
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
     fn history_is_the_rounds_finished_reviews_took() {
         let prices = "costs: {prices: {example/glm-flash: {input_per_mtok: 1, output_per_mtok: 2}, \
                       opus: {input_per_mtok: 5, output_per_mtok: 25}}}";
@@ -1199,7 +1226,12 @@ lenses:
         let waiting = config("per-round", 3, 1, "", "");
         let (unfinished, _) = go(&waiting, &["a.src"], &Fake::new(defect_in("alpha", 9)));
         assert_eq!(unfinished.status, Status::Waiting);
-        let history = plan::History::of([&done, &unfinished]);
+        assert!(plan::Record::of(&unfinished).is_none());
+        let record = plan::Record::of(&done).unwrap();
+        assert_eq!(record.lenses["alpha"], 2);
+        assert_eq!(record.lenses["beta"], 1);
+        assert_eq!(record.fixes, 1);
+        let history = plan::History::of([record]);
         assert_eq!(history.runs, 1, "only a finished review counts");
         let plan = plan::dry_run(&cfg, &change(&["a.src"]), &history).unwrap();
         let (low, expected, worst) = (

@@ -218,6 +218,11 @@ pub fn name_part(addr: &str) -> &str {
     addr.split_once('@').map_or(addr, |(n, _)| n)
 }
 
+/// SQLite's `auto_vacuum = INCREMENTAL`.
+const INCREMENTAL: i64 = 2;
+/// The most a WAL file keeps once it's emptied, in bytes.
+const WAL_LIMIT: i64 = 1 << 20;
+
 impl Store {
     /// Opens the database, creating it readable by this user only.
     pub fn open(path: &Path) -> Result<Store> {
@@ -237,7 +242,17 @@ impl Store {
     }
 
     fn init(db: Connection) -> Result<Store> {
+        // Pages that pruning frees go back to the system, a few at a time.
+        // A database from before this takes it on with one VACUUM, which
+        // only this daemon could be holding up.
+        let vacuum: i64 = db.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
+        if vacuum != INCREMENTAL {
+            db.pragma_update(None, "auto_vacuum", INCREMENTAL)?;
+            let _ = db.execute_batch("VACUUM");
+        }
         db.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
+        // The WAL is cut back to this when it's emptied, so it can't stay large.
+        db.pragma_update(None, "journal_size_limit", WAL_LIMIT)?;
         // FULL, so an acknowledged store survives a crash or power loss.
         db.pragma_update(None, "synchronous", "FULL")?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -829,6 +844,17 @@ impl Store {
         n += self
             .db
             .execute("DELETE FROM receipts WHERE at < ?1", [before])?;
+        if n > 0 {
+            // It frees a page each step, so it's stepped to the end.
+            let mut vacuum = self.db.prepare("PRAGMA incremental_vacuum")?;
+            let mut steps = vacuum.query([])?;
+            while steps.next()?.is_some() {}
+        }
+        // Folds the WAL into the database and empties it, unless a reader
+        // is in the way, and then it's next time.
+        let _ = self
+            .db
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         Ok(n)
     }
 
@@ -1191,6 +1217,40 @@ mod tests {
         let plans = s.sent_steps("work", "plan").unwrap();
         assert_eq!(plans.len(), 1);
         assert!(s.sent_steps("work", "result").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_database_gives_back_what_pruning_frees() {
+        let dir = std::env::temp_dir().join(format!("tb-db-{}", &crate::util::new_id()[14..]));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bus.db");
+        // One from before, which never gave anything back.
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(old);
+        let s = Store::open(&path).unwrap();
+        let mode: i64 =
+            s.db.pragma_query_value(None, "auto_vacuum", |r| r.get(0))
+                .unwrap();
+        assert_eq!(mode, INCREMENTAL);
+        s.add_agent("sim", 1).unwrap();
+        let body = "x".repeat(4000);
+        for n in 0..200 {
+            let mut m = msg(&format!("m{n}"), "x@t", "sim@h", None);
+            m.body = body.clone();
+            s.store_incoming(&m, "o", 1).unwrap();
+            s.ack("sim", &format!("m{n}"), 10).unwrap();
+        }
+        assert_eq!(s.prune(11).unwrap(), 200);
+        let free: i64 =
+            s.db.pragma_query_value(None, "freelist_count", |r| r.get(0))
+                .unwrap();
+        assert_eq!(free, 0, "freed pages went back");
+        let wal = std::fs::metadata(dir.join("bus.db-wal")).map_or(0, |m| m.len());
+        assert_eq!(wal, 0, "the WAL was emptied");
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
