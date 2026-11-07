@@ -223,7 +223,7 @@ fn route(bus: &Bus, req: &mut tiny_http::Request) -> Result<Value, Reject> {
             let results = bus.accept(&who, batch).map_err(internal)?;
             Ok(serde_json::to_value(results).map_err(|e| internal(e.into()))?)
         }
-        (Method::Post, "/v1/receipts") => {
+        (Method::Post, "/v1/receipts" | "/v2/receipts") => {
             let batch: ReceiptBatch = read_json(req)?;
             bus.accept_receipts(&who, batch).map_err(internal)?;
             Ok(json!({}))
@@ -643,7 +643,10 @@ mod tests {
             attended: false,
             ext: needed.clone(),
         };
-        bus.db().store_incoming(&msg, "o", 1).unwrap();
+        // Stored now: one stored long ago would be stale, and need nothing.
+        bus.db()
+            .store_incoming(&msg, "o", crate::util::now_ms())
+            .unwrap();
         bus.prune();
         assert!(!bus.attachments.has(&old));
         assert!(bus.attachments.has(&needed.unwrap().attachments[0]));

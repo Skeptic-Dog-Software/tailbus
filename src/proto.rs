@@ -328,7 +328,8 @@ impl Message {
 }
 
 /// How far a sent message has got. States only move forward, except that
-/// any state can become `Failed`.
+/// any state can become `Failed`, and any before `Acknowledged` can become
+/// `Stale`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SendState {
@@ -342,6 +343,10 @@ pub enum SendState {
     Acknowledged,
     /// It can't be delivered, for example because there's no such agent.
     Failed,
+    /// It expired, undelivered or unanswered after `retention_days`, and
+    /// evaporates after `stale_days`. A recipient's bus says so with a
+    /// receipt.
+    Stale,
 }
 
 impl SendState {
@@ -352,6 +357,7 @@ impl SendState {
             SendState::Delivered => "delivered",
             SendState::Acknowledged => "acknowledged",
             SendState::Failed => "failed",
+            SendState::Stale => "stale",
         }
     }
 
@@ -361,12 +367,15 @@ impl SendState {
             "stored" => SendState::Stored,
             "delivered" => SendState::Delivered,
             "acknowledged" => SendState::Acknowledged,
+            "stale" => SendState::Stale,
             _ => SendState::Failed,
         }
     }
 }
 
-/// Tells a message's sender that it was delivered or acknowledged.
+/// Tells a message's sender that it was delivered or acknowledged, or that
+/// it went stale. Stale receipts go by `/v2/receipts`, which a bus that
+/// can't read them doesn't have.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
     pub id: String,

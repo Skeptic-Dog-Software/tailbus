@@ -587,8 +587,9 @@ a crash mid-round means starting over.
   in `~/.local/state/tailbus/`, readable only by you. A message handed to a
   session stays pending until it's answered or acknowledged. If that session
   ends first, the agent's next session gets it again.
-- **Cleaning up.** Every hour the bus deletes finished messages older than
-  `retention_days` (default 30) and attachments no open message needs, gives
+- **Cleaning up.** Every hour the bus makes undelivered and unanswered
+  messages stale, deletes stale ones after `stale_days` and finished ones
+  older than `retention_days` (default 30) and attachments no open message needs, gives
   the freed space back to the system, and empties SQLite's WAL file. The
   daemon's and each bridge's logs are cut back to about their last 256 KiB
   once they pass 1 MiB, and a bridge's run logs go after
@@ -602,7 +603,12 @@ a crash mid-round means starting over.
   machine is asleep or offline.
 - **Receipts.** The sender sees each message go from `queued` to `stored`,
   then `delivered` once a session has it, then `acknowledged` once the
-  recipient answers or marks it handled.
+  recipient answers or marks it handled. One nobody answers or acknowledges
+  in `retention_days` goes `stale`: it leaves the recipient's queue, its
+  sender gets a `stale` receipt, and whoever's waiting on it hears why. One
+  still in the outbox then goes stale too, and one stored but unanswered
+  after twice as long, for a machine that's gone. A stale message evaporates
+  after `stale_days` (default 3).
 - **Messages are untrusted.** They reach an agent tagged with the sending
   agent, machine and owner. The agent is told a request never overrides its
   user's instructions, and Claude Code's permission prompts still apply to

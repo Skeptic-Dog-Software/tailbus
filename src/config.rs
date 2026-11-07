@@ -93,9 +93,13 @@ pub struct Config {
     /// besides machines owned by this machine's own Tailscale user.
     #[serde(default)]
     pub allow: Vec<String>,
-    /// Days to keep messages after they're acknowledged.
+    /// Days to keep messages after they're acknowledged, and how long one
+    /// can go undelivered or unanswered before it's stale.
     #[serde(default = "default_retention")]
     pub retention_days: u32,
+    /// Days a stale message is kept, to be seen, before it evaporates.
+    #[serde(default = "default_stale")]
+    pub stale_days: u32,
     /// The Tailscale CLI, if not the app's or the one on `PATH`.
     pub tailscale: Option<PathBuf>,
     /// How many times in a row a session can be handed other agents'
@@ -162,6 +166,10 @@ fn default_retention() -> u32 {
     30
 }
 
+fn default_stale() -> u32 {
+    3
+}
+
 fn default_handoff_limit() -> u32 {
     6
 }
@@ -195,6 +203,7 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.port, DEFAULT_PORT);
         assert_eq!(cfg.retention_days, 30);
+        assert_eq!(cfg.stale_days, 3);
         assert!(cfg.allow.is_empty());
         assert_eq!(cfg.handoff_limit, 6);
         assert!(cfg.alerts);

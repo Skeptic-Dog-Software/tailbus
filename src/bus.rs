@@ -1271,7 +1271,7 @@ impl Bus {
             None
         };
         Ok(match settled {
-            Some(s) if s.state == SendState::Failed => {
+            Some(s) if matches!(s.state, SendState::Failed | SendState::Stale) => {
                 bail!("{}", s.error.unwrap_or_else(|| "not delivered".into()))
             }
             Some(s) => (s.state, lock(&self.notes).remove(&msg.id)),
@@ -1323,7 +1323,7 @@ impl Bus {
             bail!("{agent} sent no message {id}");
         };
         Ok(match sent.state {
-            SendState::Failed => Some(Awaited::Undelivered {
+            SendState::Failed | SendState::Stale => Some(Awaited::Undelivered {
                 why: sent.error.unwrap_or_else(|| "not delivered".into()),
             }),
             SendState::Acknowledged
@@ -1621,18 +1621,30 @@ impl Bus {
                         }
                     },
                 };
-                for chunk in items.chunks(MAX_BATCH) {
-                    let batch = ReceiptBatch {
-                        receipts: chunk.iter().map(|d| d.item.receipt.clone()).collect(),
-                    };
-                    let sent =
-                        net::post::<_, serde_json::Value>(http, ip, port, "/v1/receipts", &batch);
-                    for d in chunk {
-                        match &sent {
-                            Ok(_) => self.db().drop_receipt(d.item.seq)?,
-                            Err(_) => self
-                                .db()
-                                .retry_receipt(d.item.seq, now + backoff(d.attempts))?,
+                // A bus that can't read a stale receipt would refuse the
+                // whole batch, so those go by a route it doesn't have.
+                let (stale, plain): (Vec<_>, Vec<_>) = items
+                    .iter()
+                    .partition(|d| d.item.receipt.state == SendState::Stale);
+                for (route, list) in [("/v1/receipts", plain), ("/v2/receipts", stale)] {
+                    for chunk in list.chunks(MAX_BATCH) {
+                        let batch = ReceiptBatch {
+                            receipts: chunk.iter().map(|d| d.item.receipt.clone()).collect(),
+                        };
+                        let sent = net::post::<_, serde_json::Value>(http, ip, port, route, &batch);
+                        // An old bus can't take it now or later. Its sender
+                        // will find the message stale by itself.
+                        let never = sent.as_ref().is_err_and(|e| {
+                            e.downcast_ref::<net::HttpError>()
+                                .is_some_and(net::HttpError::is_final)
+                        });
+                        for d in chunk {
+                            if sent.is_ok() || never {
+                                self.db().drop_receipt(d.item.seq)?;
+                            } else {
+                                self.db()
+                                    .retry_receipt(d.item.seq, now + backoff(d.attempts))?;
+                            }
                         }
                     }
                 }
@@ -2042,14 +2054,50 @@ impl Bus {
     }
 
     pub fn prune(&self) {
-        let before = now_ms() - i64::from(self.cfg.retention_days) * DAY_MS;
-        match self.db().prune(before) {
+        let now = now_ms();
+        let before = now - i64::from(self.cfg.retention_days) * DAY_MS;
+        // Undelivered and unanswered messages go stale, and their senders
+        // hear. One that reached its machine has twice as long, so that
+        // machine's word comes first.
+        // Bound first: a guard held through the match would deadlock receipt().
+        let expired = self.db().expire_incoming(before, now);
+        match expired {
+            Ok(gone) => {
+                for (id, sender) in &gone {
+                    if let Err(e) = self.receipt(sender, id, SendState::Stale) {
+                        self.event(format!("couldn't tell {sender} that {id} is stale: {e:#}"));
+                    }
+                }
+                if !gone.is_empty() {
+                    self.event(format!(
+                        "{} message(s) went unanswered for {} days and are stale",
+                        gone.len(),
+                        self.cfg.retention_days
+                    ));
+                }
+            }
+            Err(e) => self.event(format!("expiring messages failed: {e:#}")),
+        }
+        let twice = now - 2 * i64::from(self.cfg.retention_days) * DAY_MS;
+        let expired = self.db().expire_outgoing(before, twice, now);
+        match expired {
+            Ok(0) => {}
+            Ok(n) => self.event(format!(
+                "{n} sent message(s) went stale, undelivered or unanswered"
+            )),
+            Err(e) => self.event(format!("expiring sent messages failed: {e:#}")),
+        }
+        // Stale ones are kept a little, to be seen, then evaporate.
+        let stale_before = now - i64::from(self.cfg.stale_days) * DAY_MS;
+        let pruned = self.db().prune(before, stale_before);
+        match pruned {
             Ok(0) => {}
             Ok(n) => self.event(format!("pruned {n} finished messages")),
             Err(e) => self.event(format!("pruning failed: {e:#}")),
         }
         let age = u64::from(self.cfg.attachment_retention_days) * 86_400;
-        match self.db().attachments_in_use() {
+        let in_use = self.db().attachments_in_use();
+        match in_use {
             Ok(used) => {
                 let gone = self.attachments.prune(Duration::from_secs(age), &used);
                 if gone > 0 {
@@ -2294,6 +2342,26 @@ pub(crate) mod tests {
             ipv4: None,
         });
         bus
+    }
+
+    #[test]
+    fn a_message_nobody_answers_expires_and_its_sender_hears() {
+        let bus = bus_on("here", 1, "retention_days = 0\nstale_days = 0");
+        bus.db().add_agent("sim", 1).unwrap();
+        bus.db().add_agent("api", 1).unwrap();
+        let sent = bus
+            .send("sim", "api", "anyone?".into(), None, Some(true), None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        bus.prune();
+        assert!(bus.db().open_incoming("api").unwrap().is_empty());
+        let out = bus.db().outgoing(&sent.id).unwrap().unwrap();
+        assert_eq!(out.state, SendState::Stale);
+        assert_eq!(out.error.as_deref(), Some(crate::store::GAVE_UP));
+        // After stale_days, it evaporates.
+        std::thread::sleep(Duration::from_millis(5));
+        bus.prune();
+        assert!(bus.db().outgoing(&sent.id).unwrap().is_none());
     }
 
     fn arrive(bus: &Bus, id: &str, expects_reply: bool) {

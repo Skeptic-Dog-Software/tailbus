@@ -541,8 +541,16 @@ cheaply.
   review's diffs go at once, and its report after 7 days. One waiting for a
   person is taken as left after 30. Every `tailbus acr` command cleans up
   first, going by file times, with nothing read.
-- *Not changed:* a message that's never delivered or answered is kept until
-  it is, as delivery promises.
+- **Undelivered isn't forever.** A message nobody answers or acknowledges
+  in `retention_days` goes stale: out of every queue at once, kept
+  `stale_days` (default 3) to be seen, then gone. Its sender gets a `stale`
+  receipt, a new state, so it never reads as answered or as failed, and
+  whoever's waiting hears why. A bus too old to read one would refuse the
+  whole batch, ordinary receipts and all, so stale receipts go by
+  `/v2/receipts`, which such a bus answers with 404, and they're dropped.
+  The sender's own outbox gives up too: a message still queued after
+  `retention_days`, or stored and unanswered after twice that, for a
+  recipient that's gone or too old to say.
 
 #### omp on `server`, checked 2026-11-06 on omp 18.17.0
 

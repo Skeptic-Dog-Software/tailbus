@@ -218,6 +218,9 @@ pub fn name_part(addr: &str) -> &str {
     addr.split_once('@').map_or(addr, |(n, _)| n)
 }
 
+/// Why a message is stale when its recipient's machine gave up on it.
+pub const GAVE_UP: &str = "the recipient's machine gave up waiting for it to be answered";
+
 /// SQLite's `auto_vacuum = INCREMENTAL`.
 const INCREMENTAL: i64 = 2;
 /// The most a WAL file keeps once it's emptied, in bytes.
@@ -267,6 +270,7 @@ impl Store {
             ("sent", "attended", "INTEGER NOT NULL DEFAULT 0"),
             ("inbox", "ext", "TEXT"),
             ("sent", "ext", "TEXT"),
+            ("inbox", "stale_at", "INTEGER"),
         ] {
             let has = db
                 .prepare(&format!(
@@ -701,7 +705,7 @@ impl Store {
             "SELECT {OUTGOING} FROM sent WHERE agent = ?1 AND (
                 state = 'queued'
                 OR (expects_reply AND state IN ('stored', 'delivered'))
-                OR (state = 'failed' AND updated_at >= ?2))
+                OR (state IN ('failed', 'stale') AND updated_at >= ?2))
              ORDER BY created_at"
         ))?;
         let rows = stmt.query_map(params![agent, since], outgoing)?;
@@ -717,15 +721,68 @@ impl Store {
         if machine_part(&sent.msg.to) != machine
             || sent.state == SendState::Failed
             || sent.state >= receipt.state
+            || sent.state == SendState::Stale
             || !matches!(
                 receipt.state,
-                SendState::Delivered | SendState::Acknowledged
+                SendState::Delivered | SendState::Acknowledged | SendState::Stale
             )
         {
             return Ok(false);
         }
-        self.set_send_state(&receipt.id, receipt.state, None, now)?;
+        // A recipient giving up can't undo an answer.
+        if receipt.state == SendState::Stale && sent.state == SendState::Acknowledged {
+            return Ok(false);
+        }
+        let why = (receipt.state == SendState::Stale).then_some(GAVE_UP);
+        self.set_send_state(&receipt.id, receipt.state, why, now)?;
         Ok(true)
+    }
+
+    /// Makes stale the messages here that nobody acknowledged or answered,
+    /// stored before `before`. They leave every queue, as if acknowledged,
+    /// and evaporate later. Returns each one's ID and sender, so they can be
+    /// told.
+    pub fn expire_incoming(&self, before: i64, now: i64) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, sender FROM inbox
+             WHERE acked_at IS NULL AND stale_at IS NULL AND stored_at < ?1",
+        )?;
+        let gone = stmt
+            .query_map([before], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        self.db.execute(
+            "UPDATE inbox SET stale_at = ?2, acked_at = ?2
+             WHERE acked_at IS NULL AND stale_at IS NULL AND stored_at < ?1",
+            params![before, now],
+        )?;
+        Ok(gone)
+    }
+
+    /// Makes stale the messages from here that never reached their machine,
+    /// sent before `undelivered`, and those that reached it but were never
+    /// answered, sent before `unanswered`. Whoever's waiting on one hears.
+    /// Returns how many.
+    pub fn expire_outgoing(&self, undelivered: i64, unanswered: i64, now: i64) -> Result<usize> {
+        let days = |ms: i64| (now - ms) / 86_400_000;
+        let mut n = self.db.execute(
+            "UPDATE sent SET state = 'stale', error = ?2, updated_at = ?3
+             WHERE state = 'queued' AND created_at < ?1",
+            params![
+                undelivered,
+                format!("it couldn't be delivered in {} days", days(undelivered)),
+                now
+            ],
+        )?;
+        n += self.db.execute(
+            "UPDATE sent SET state = 'stale', error = ?2, updated_at = ?3
+             WHERE state IN ('stored', 'delivered') AND created_at < ?1",
+            params![
+                unanswered,
+                format!("it went unanswered for {} days", days(unanswered)),
+                now
+            ],
+        )?;
+        Ok(n)
     }
 
     // Receipts owed to other machines.
@@ -832,14 +889,24 @@ impl Store {
 
     /// Deletes acknowledged and failed messages, and stuck receipts, older
     /// than `before`. Messages that aren't acknowledged are kept however old.
-    pub fn prune(&self, before: i64) -> Result<usize> {
+    /// Deletes finished messages from before `before`, and stale ones that
+    /// went stale before `stale_before`.
+    pub fn prune(&self, before: i64, stale_before: i64) -> Result<usize> {
         let mut n = self.db.execute(
             "DELETE FROM inbox WHERE acked_at IS NOT NULL AND acked_at < ?1",
             [before],
         )?;
         n += self.db.execute(
+            "DELETE FROM inbox WHERE stale_at IS NOT NULL AND stale_at < ?1",
+            [stale_before],
+        )?;
+        n += self.db.execute(
             "DELETE FROM sent WHERE state IN ('acknowledged', 'failed') AND updated_at < ?1",
             [before],
+        )?;
+        n += self.db.execute(
+            "DELETE FROM sent WHERE state = 'stale' AND updated_at < ?1",
+            [stale_before],
         )?;
         n += self
             .db
@@ -1242,7 +1309,7 @@ mod tests {
             s.store_incoming(&m, "o", 1).unwrap();
             s.ack("sim", &format!("m{n}"), 10).unwrap();
         }
-        assert_eq!(s.prune(11).unwrap(), 200);
+        assert_eq!(s.prune(11, 0).unwrap(), 200);
         let free: i64 =
             s.db.pragma_query_value(None, "freelist_count", |r| r.get(0))
                 .unwrap();
@@ -1254,6 +1321,85 @@ mod tests {
     }
 
     #[test]
+    fn unanswered_messages_expire_and_say_who_sent_them() {
+        let s = Store::memory();
+        s.add_agent("sim", 1).unwrap();
+        for (id, at) in [("old", 10), ("new", 100), ("done", 10)] {
+            s.store_incoming(&msg(id, "x@t", "sim@h", None), "o", at)
+                .unwrap();
+        }
+        s.ack("sim", "done", 20).unwrap();
+        let gone = s.expire_incoming(50, 60).unwrap();
+        assert_eq!(gone, [("old".to_string(), "x@t".to_string())]);
+        assert_eq!(ids(&s.open_incoming("sim").unwrap()), ["new"]);
+        assert!(s.expire_incoming(50, 70).unwrap().is_empty(), "stale once");
+        // Kept while it's newly stale, then it evaporates.
+        assert_eq!(s.prune(0, 60).unwrap(), 0);
+        assert_eq!(s.prune(0, 61).unwrap(), 1);
+    }
+
+    #[test]
+    fn sent_messages_expire_undelivered_or_unanswered() {
+        let s = Store::memory();
+        let at = |id: &str, created: i64| Message {
+            created_at: created,
+            ..msg(id, "me@here", "you@there", None)
+        };
+        for (id, created, state) in [
+            ("queued", 10, SendState::Queued),
+            ("stored", 10, SendState::Stored),
+            ("answered", 10, SendState::Acknowledged),
+            ("recent", 100, SendState::Queued),
+        ] {
+            s.record_sent(&at(id, created), state, created).unwrap();
+        }
+        let state = |id| s.outgoing(id).unwrap().unwrap().state;
+        assert_eq!(s.expire_outgoing(50, 5, 200).unwrap(), 1);
+        assert_eq!(state("queued"), SendState::Stale);
+        assert_eq!(state("stored"), SendState::Stored, "it has longer");
+        assert_eq!(state("recent"), SendState::Queued);
+        assert_eq!(s.expire_outgoing(50, 50, 200).unwrap(), 1);
+        assert_eq!(state("stored"), SendState::Stale);
+        assert_eq!(state("answered"), SendState::Acknowledged);
+        let why = s.outgoing("queued").unwrap().unwrap().error.unwrap();
+        assert!(why.contains("delivered"), "{why}");
+        // Stale evaporates on its own clock, finished ones on theirs.
+        assert_eq!(s.prune(0, 201).unwrap(), 2);
+        assert!(s.outgoing("queued").unwrap().is_none());
+        assert!(s.outgoing("answered").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_recipient_that_gave_up_fails_the_message_unless_it_was_answered() {
+        let s = Store::memory();
+        let to_there = |id| msg(id, "me@here", "you@there", None);
+        s.record_sent(&to_there("a"), SendState::Stored, 1).unwrap();
+        s.record_sent(&to_there("b"), SendState::Acknowledged, 1)
+            .unwrap();
+        let stale = |id: &str| Receipt {
+            id: id.into(),
+            state: SendState::Stale,
+            at: 5,
+        };
+        assert!(!s.apply_receipt("elsewhere", &stale("a"), 5).unwrap());
+        assert!(s.apply_receipt("there", &stale("a"), 5).unwrap());
+        let a = s.outgoing("a").unwrap().unwrap();
+        assert_eq!(a.state, SendState::Stale);
+        assert_eq!(a.error.as_deref(), Some(GAVE_UP));
+        // Nothing moves a stale message on, and it can't undo an answer.
+        let delivered = Receipt {
+            state: SendState::Delivered,
+            ..stale("a")
+        };
+        assert!(!s.apply_receipt("there", &delivered, 6).unwrap());
+        assert!(!s.apply_receipt("there", &stale("b"), 5).unwrap());
+        assert_eq!(
+            s.outgoing("b").unwrap().unwrap().state,
+            SendState::Acknowledged
+        );
+    }
+
+    #[test]
     fn prunes_only_finished_messages() {
         let s = Store::memory();
         s.add_agent("sim", 1).unwrap();
@@ -1262,8 +1408,8 @@ mod tests {
         s.store_incoming(&msg("b", "x@t", "sim@h", None), "o", 1)
             .unwrap();
         s.ack("sim", "a", 10).unwrap();
-        assert_eq!(s.prune(5).unwrap(), 0);
-        assert_eq!(s.prune(11).unwrap(), 1);
+        assert_eq!(s.prune(5, 0).unwrap(), 0);
+        assert_eq!(s.prune(11, 0).unwrap(), 1);
         assert_eq!(s.open_incoming("sim").unwrap().len(), 1);
     }
 }
