@@ -71,6 +71,9 @@ pub struct RunOptions {
     pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// How hard the agent thinks, such as `high`, in the agent's own words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// A file held by its hash on each bus it reaches.
@@ -140,6 +143,8 @@ pub struct Applied {
     pub workdir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// A `/pipe` message: a task handed to a worker, the worker's clarifying

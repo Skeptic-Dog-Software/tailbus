@@ -261,6 +261,7 @@ path = "/Users/you/.local/bin:/usr/bin:/bin"
 | `{ATTACHMENTS_DIR}` | `args`, `message` | Where the run's copies of the request's attachments are. |
 | `{MODEL}` | `args` | The request's model, or `model`. |
 | `{TOOLS}` | `options.tools_args` | The tools a request named, joined with commas. |
+| `{EFFORT}` | `options.effort_args` | The effort a request named. |
 | `{FILE:/path}` | `args`, `message` | A file's text, with only `{AGENT}` filled in. For a system prompt. |
 | `{MESSAGE}`, `{BODY}` | `message` | The message tagged with its sender and owner, and its bare text. |
 
@@ -350,6 +351,7 @@ models = ["some/other-model"]
 | `timeout` | `options.max_timeout_secs`, or else `timeout_secs` | Seconds. |
 | `workdir` | `options.workdirs`, and `working_directory` | A directory to run in. |
 | `model` | `options.models`, and `model` | Needs `{MODEL}` in `args`. |
+| `effort` | `options.efforts`, with `{EFFORT}` in `options.effort_args` | How hard it thinks, such as `high`. The arguments are added only when a request names one. |
 
 Be careful what `tools` promises. A flag such as omp's `--tools` doesn't limit
 MCP tools, so naming connectors in `options.tools` means the agent has to

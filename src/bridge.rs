@@ -158,6 +158,13 @@ pub struct Allowed {
     /// Models a request may choose, besides `model`.
     #[serde(default)]
     pub models: Vec<String>,
+    /// Efforts a request may choose, such as `high`.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// Added to the arguments when a request names an effort. `{EFFORT}` is
+    /// the one it named.
+    #[serde(default)]
+    pub effort_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -186,6 +193,8 @@ struct Plan {
     timeout: u64,
     workdir: PathBuf,
     model: Option<String>,
+    /// Set when the request named one.
+    effort: Option<String>,
     /// Set when the request narrowed the tools.
     tools: Option<Vec<String>>,
 }
@@ -198,6 +207,7 @@ impl Plan {
             timeout: self.timeout,
             workdir: self.workdir.display().to_string(),
             model: self.model.clone(),
+            effort: self.effort.clone(),
         }
     }
 }
@@ -308,6 +318,9 @@ impl Settings {
         if wants_model && self.model.is_none() {
             bail!("args use {{MODEL}}, so `model` has to say which one is the default");
         }
+        if self.args.iter().any(|a| a.contains("{EFFORT}")) {
+            bail!("{{EFFORT}} belongs in options.effort_args, used only when a request names one");
+        }
         if self.args.iter().any(|a| a.contains("{TOOLS}")) {
             bail!("{{TOOLS}} belongs in options.tools_args, used only when a request names tools");
         }
@@ -334,6 +347,14 @@ impl Allowed {
         }
         if !self.models.is_empty() && !wants_model {
             bail!("options.models needs {{MODEL}} in args, or a request's model would do nothing");
+        }
+        if !self.efforts.is_empty() && !self.effort_args.iter().any(|a| a.contains("{EFFORT}")) {
+            bail!(
+                "options.efforts needs {{EFFORT}} in options.effort_args, or it would do nothing"
+            );
+        }
+        if let Some(bad) = self.efforts.iter().find(|e| !plain_tool(e)) {
+            bail!("{bad:?} can't be an effort in options.efforts");
         }
         if self.max_timeout_secs.is_some_and(|m| m < timeout_secs) {
             bail!("options.max_timeout_secs is less than timeout_secs");
@@ -371,6 +392,7 @@ impl Settings {
             timeout: self.timeout_secs,
             workdir: self.working_directory.clone(),
             model: self.model.clone(),
+            effort: None,
             tools: None,
         };
         let Some(options) = options else {
@@ -426,6 +448,14 @@ impl Settings {
                 ));
             }
             plan.model = Some(model.clone());
+        }
+        if let Some(effort) = &options.effort {
+            if !self.options.efforts.contains(effort) {
+                return Err(format!(
+                    "effort {effort:?} isn't one this agent's config allows"
+                ));
+            }
+            plan.effort = Some(effort.clone());
         }
         Ok(plan)
     }
@@ -2018,6 +2048,7 @@ impl Bridge {
             ("ATTACHMENTS_DIR", attachments_text.as_ref()),
             ("MODEL", plan.model.as_deref().unwrap_or_default()),
             ("TOOLS", tools.as_deref().unwrap_or_default()),
+            ("EFFORT", plan.effort.as_deref().unwrap_or_default()),
             ("MESSAGE", tagged.as_str()),
             ("BODY", msg.body.as_str()),
         ];
@@ -2033,6 +2064,11 @@ impl Bridge {
         }
         if tools.is_some() {
             for arg in &self.cfg.options.tools_args {
+                command.arg(expand(arg, &vars)?);
+            }
+        }
+        if plan.effort.is_some() {
+            for arg in &self.cfg.options.effort_args {
                 command.arg(expand(arg, &vars)?);
             }
         }
@@ -3005,6 +3041,8 @@ mod tests {
         sessions = ["per-sender"]
         max_timeout_secs = 100
         models = ["m2", "my model"]
+        efforts = ["high"]
+        effort_args = ["--thinking", "{EFFORT}"]
         "#;
 
     fn generous(rig: &Rig, script: &str) -> Settings {
@@ -3042,6 +3080,7 @@ mod tests {
             timeout: Some(100),
             workdir: Some(rig.dir.join("home").display().to_string()),
             model: some("m2"),
+            effort: some("high"),
         })
         .unwrap();
         assert_eq!(narrowed.tools, tools);
@@ -3049,6 +3088,7 @@ mod tests {
         assert_eq!(narrowed.timeout, 100);
         assert_eq!(narrowed.workdir, rig.dir.join("home"));
         assert_eq!(narrowed.model.as_deref(), Some("m2"));
+        assert_eq!(narrowed.effort.as_deref(), Some("high"));
 
         let widened = [
             RunOptions {
@@ -3073,6 +3113,10 @@ mod tests {
             },
             RunOptions {
                 model: some("m3"),
+                ..RunOptions::default()
+            },
+            RunOptions {
+                effort: some("max"),
                 ..RunOptions::default()
             },
         ];
@@ -3160,7 +3204,11 @@ mod tests {
                 model: Some(value.to_string()),
                 ..RunOptions::default()
             };
-            for options in [as_tool, as_session, as_workdir, as_model] {
+            let as_effort = RunOptions {
+                effort: Some(value.to_string()),
+                ..RunOptions::default()
+            };
+            for options in [as_tool, as_session, as_workdir, as_model, as_effort] {
                 assert!(cfg.plan(Some(&options)).is_err(), "{options:?}");
             }
         }
@@ -3203,6 +3251,8 @@ mod tests {
         refused(|c| c.options.models.push("m".into()), "{MODEL}");
         refused(|c| c.args.push("{MODEL}".into()), "default");
         refused(|c| c.args.push("{TOOLS}".into()), "tools_args");
+        refused(|c| c.args.push("{EFFORT}".into()), "effort_args");
+        refused(|c| c.options.efforts.push("high".into()), "{EFFORT}");
         refused(|c| c.options.max_timeout_secs = Some(1), "max_timeout_secs");
         refused(|c| c.options.workdirs.push("rel".into()), "absolute");
         assert!(toml::from_str::<Allowed>("nope = 1").is_err());
@@ -3246,6 +3296,7 @@ mod tests {
             timeout: Some(50),
             workdir: Some(workdir.clone()),
             model: Some("my model".into()),
+            effort: Some("high".into()),
             ..RunOptions::default()
         };
         let id = rig.ask_body_with("--auto-approve; touch owned", with(options));
@@ -3255,6 +3306,7 @@ mod tests {
         assert!(body.contains("[--tools]\n[read,mcp__jira_query]"), "{body}");
         // One argument, spaces and all, because no shell is involved.
         assert!(body.contains("[--model]\n[my model]"), "{body}");
+        assert!(body.contains("[--thinking]\n[high]"), "{body}");
         assert!(body.contains(&format!("cwd: {workdir}")), "{body}");
         assert!(body.contains("env: read,mcp__jira_query"), "{body}");
         // The message stays text.
@@ -3266,6 +3318,7 @@ mod tests {
         assert_eq!(applied.timeout, 50);
         assert_eq!(applied.workdir, workdir);
         assert_eq!(applied.model.as_deref(), Some("my model"));
+        assert_eq!(applied.effort.as_deref(), Some("high"));
         assert_eq!(
             applied.tools,
             Some(vec!["read".to_string(), "mcp__jira_query".to_string()])
@@ -3341,6 +3394,7 @@ mod tests {
         bridge.stop().unwrap();
         let body = &reply.msg.body;
         assert!(!body.contains("--tools"), "{body}");
+        assert!(!body.contains("--thinking"), "{body}");
         assert!(body.contains("[--model]\n[m1]"), "{body}");
         assert!(body.contains("env: []"), "{body}");
         let result = reply.msg.result().unwrap();

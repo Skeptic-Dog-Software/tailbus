@@ -687,7 +687,8 @@ fn tools() -> Value {
                             "session": {"type": "string", "enum": ["fresh", "per-sender"]},
                             "timeout": {"type": "integer", "description": "Seconds, up to the agent's configured maximum"},
                             "workdir": {"type": "string", "description": "From the agent's allow-list"},
-                            "model": {"type": "string", "description": "From the agent's allow-list"}
+                            "model": {"type": "string", "description": "From the agent's allow-list"},
+                            "effort": {"type": "string", "description": "How hard it thinks, from the agent's allow-list"}
                         },
                         "additionalProperties": false
                     },

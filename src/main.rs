@@ -92,6 +92,9 @@ enum Cmd {
         /// Run on this model, if the agent's config allows it.
         #[arg(long, value_name = "NAME")]
         model: Option<String>,
+        /// Think this hard, such as `high`, if the agent's config allows it.
+        #[arg(long, value_name = "LEVEL")]
+        effort: Option<String>,
         /// A file to attach. Can be given more than once.
         #[arg(long, value_name = "FILE")]
         attach: Vec<PathBuf>,
@@ -337,6 +340,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             run_timeout,
             workdir,
             model,
+            effort,
             attach,
             timeout,
             no_cancel,
@@ -352,6 +356,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     timeout: run_timeout,
                     workdir,
                     model,
+                    effort,
                 },
                 attach,
                 timeout,
