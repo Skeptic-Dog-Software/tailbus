@@ -14,8 +14,9 @@ which account owns it.
 itself, the CLI, the MCP tools, push into Claude Code, the limits that stop
 agents answering each other forever, permission alerts on your Macs,
 [`/pipe`](#pipe), which hands a whole task to an agent on another machine
-and gets back a reviewed result, and [bridges](#headless-agents), which
-answer messages with a headless agent such as omp.
+and gets back a reviewed result, [bridges](#headless-agents), which answer
+messages with a headless agent such as omp, and
+[`tailbus acr`](#adversarial-review), which reviews a change in any repository.
 
 ## Install
 
@@ -433,6 +434,95 @@ limit those. That's a default it can step around, not a security boundary.
 The bridge adds no tools or permissions of its own: the agent has what `args`
 gives it. Only messages from `owner` reach it, but they run with nobody
 watching, so `args` should give it no more than those messages should have.
+
+## Adversarial review
+
+`tailbus acr` runs an adversarial convergence review of a change, in any
+repository. It holds no knowledge of one: every lens, path and language comes
+from `.acr/config.yaml`. Reviewers attack one lens each from a clean context,
+a Judge rates what they find, the Orchestrator fixes the blockers, and only
+the lenses with blockers are attacked again, by new reviewers. A lens is
+confirmed when its latest round has no blockers. The method is in
+[the ACR skill](plugin/skills/acr/SKILL.md). All four roles go through
+[bridges](#headless-agents).
+
+| Role | Job | Default binding |
+| --- | --- | --- |
+| Sizer | Classifies the change and picks the tier | `glm-flash` |
+| Orchestrator | Settles plain-language triggers, and fixes blockers | `opus-medium` |
+| Reviewer | Attacks one lens, in a fresh session with read-only tools | `glm-flash-high` |
+| Judge | Rates findings, and merges a lens's reviewers into one result | `opus-medium` |
+
+Code runs the loop, so a run is repeatable, and can stop for a person and go
+on. Models are called only for judgment.
+
+| Command | Does |
+| --- | --- |
+| `tailbus acr validate [file]` | Check a config against the schema and its rules. `--base <ref>` reads the repository's. |
+| `tailbus acr schema` | Print the published schema. |
+| `tailbus acr plan --base <ref>` | Show the tier, lenses, bindings and estimated cost, with no model calls. |
+| `tailbus acr run --base <ref>` | Review a change. `--head <ref>` names it, or it's the working tree. Prints the report as JSON. |
+| `tailbus acr resume <run id>` | Go on past a gate: `--fold` and `--waive` take blockers' IDs, and `--approve` and `--stop` do what they say. |
+| `tailbus acr benchmark --base <ref> --known <file>` | Run a binding set against a commit with known blockers, and report what was caught, missed and falsely found, and the cost. |
+
+`run` and `resume` exit 0 when every lens is confirmed or waived, 3 when they're
+waiting for a person, 4 on an escalation, and 1 if the review ended with
+lenses open. `--post-pr <number>` puts the labels and comment on a pull
+request, if the repository turned them on.
+
+**Config.** It loads in this order, each overriding the last: the framework's
+defaults, yours at `~/.config/tailbus/acr.yaml`, the repository's, and the
+run's flags (`--human-gate`, `--max-rounds`, `--review-scope`, and `--binding
+role=name`). An unknown key is an error.
+
+The repository's config needn't be in the repository. Keep it at
+`~/.config/tailbus/acr/<repository>.yaml`, or name it with `--config`, and its
+`not_findings` path is beside it. Then nothing about the review goes into the
+repository, and no change to it can touch the rules it's reviewed by. Without
+one, it's the repository's own `.acr/config.yaml`. [`schema/acr.schema.json`](schema/acr.schema.json)
+is the published schema, and [`examples/acr/`](examples/acr/) has configs for a
+Go and a Rust repository, and a user's. A tier's `match.paths` applies when every
+changed file matches. Tiers go from lowest to highest, and when the Sizer isn't
+sure, it's the higher one. `bottom-of-stack` reviews the first commit after the
+base.
+
+**Safety.**
+
+- A config kept outside the repository can't be changed by a change to it. One
+  in the repository, and its `not_findings`, come from `--base`, never the
+  change, and a change to either always escalates. Either way, a change can't
+  switch off its own review.
+- Only your config says how models are reached, in `allowed_bindings`. A
+  repository can only choose among those names, and has no key for secrets,
+  tools or commands.
+- A reviewer or Judge that fails leaves its lens open and escalates. A review
+  that didn't happen never reads as a clean one.
+
+**Severity** is the same everywhere, so that results compare. A lens's
+`severity` can change what Medium and Low do, but not Critical, High or
+Rejected.
+
+| Severity | Meaning | Does |
+| --- | --- | --- |
+| Critical | Wrong result, data loss, security hole | Blocks |
+| High | Real defect in a realistic case | Blocks |
+| Medium | Real defect in a narrow case | Blocks unless waived |
+| Low | Nit or unlikely edge case | Never blocks, and is logged |
+| Rejected | Off task, noise, decided non-issue | Dropped, keeping the reason |
+
+**The human gate.** `per-round` asks what's folded in each round, `ends` asks
+about the scope and the final result, and `exception` asks only about
+escalations. These always stop for a person, in any mode: reviewers split, a
+rejection that's a values call, a blocker at `max_rounds`, anything in
+`always_escalate`, a change to the config, or a review that didn't fully run.
+
+**Costs are estimates.** Bridges don't report tokens, so they're counted from
+the text sent and received, and priced from your bindings.
+
+**Fixes need the checkout.** After a fix, ACR reads the change from the working
+tree, so the Orchestrator's bridge must run on the same machine as `--repo`, with
+it in `options.workdirs`. A run is saved at each gate, not during a round, so
+a crash mid-round means starting over.
 
 ## How it works
 

@@ -1116,6 +1116,37 @@ A second run, on 2026-10-27 on Claude Code 2.1.311, the same way:
   process. After updating tailbus, restart sessions.
 
 
+### The ACR framework
+
+Added 2026-11-07: `tailbus acr`, the method below as a tool for any repository,
+with reviewers that needn't be Claude. The
+[README](README.md#adversarial-review) has the commands and config.
+
+- **Code runs the loop; models judge.** Rounds, fan-out and state are plain
+  code, so a run repeats, can be tested with no model, and can stop at a gate
+  and go on. The Orchestrator's binding is called only to settle plain-language
+  triggers and `always_escalate`, and to fix blockers.
+- **It has no repository's knowledge in it,** and a test holds it to that. A
+  second config, for a repository in another language, needed no change to the
+  framework.
+- **A change can't touch its own rules.** The repository's config is best kept
+  outside it, in the user's `acr/` directory, so no review files go into the
+  repositories reviewed. One kept in the repository comes from `--base`, read
+  with `git show`, never from the working tree.
+- **Only the user's config says how models are reached.** The repository's has
+  no key for it, so that's an unknown-key error, not a check that could be
+  missed.
+- **Failure is never a pass.** A reviewer that fails, an answer that can't be
+  read, or a Judge that fails leaves the lens open and escalates. If the
+  Orchestrator can't settle a description, the lens stays in.
+- **The Orchestrator fixes, through its bridge.** So ACR needs that bridge on
+  the machine with the checkout. Every other role only reads, and must name
+  its read-only tools, or the config is refused.
+
+Decided here rather than left to a repository: a tier's paths must all match, so
+one source file among docs leaves the docs tier; description triggers count in a
+dry run, so its cost is an upper bound; and only a Medium can be waived.
+
 ### ACR: adversarial convergence review
 
 Baked into the plugin as an `acr` skill, written from Ray Karnes's essay

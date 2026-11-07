@@ -1,0 +1,766 @@
+//! ACR's config: what a review may do, in layers. Nothing here knows about
+//! any repository: every lens, path and language comes from these files.
+//!
+//! The layers load in order, each overriding the one before: the framework's
+//! defaults, the user's config, the repository's, and this run's flags. The
+//! repository's can choose only among what the user's allows, and it has no
+//! keys for secrets, tools or commands, so an unknown key stops it dead.
+//!
+//! The repository's layer needn't be in the repository. It can be a file in
+//! the user's `acr/` directory, so that no review config ever goes into the
+//! repositories being reviewed.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+use globset::Glob;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+
+/// Where a repository keeps its config.
+pub const REPO_CONFIG: &str = ".acr/config.yaml";
+pub const VERSION: u32 = 1;
+/// The schema every config is checked against, published with the binary.
+pub const SCHEMA: &str = include_str!("../../schema/acr.schema.json");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Sizer,
+    Orchestrator,
+    Reviewer,
+    Judge,
+}
+
+impl Role {
+    pub const ALL: [Role; 4] = [Role::Sizer, Role::Orchestrator, Role::Reviewer, Role::Judge];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Sizer => "sizer",
+            Role::Orchestrator => "orchestrator",
+            Role::Reviewer => "reviewer",
+            Role::Judge => "judge",
+        }
+    }
+
+    /// These only read. The Orchestrator also applies fixes.
+    fn read_only(self) -> bool {
+        self != Role::Orchestrator
+    }
+}
+
+/// When a person is asked, on top of the escalations that always reach them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HumanGate {
+    /// They decide what's folded in, each round.
+    PerRound,
+    /// They approve the scope and the final result.
+    Ends,
+    /// Only escalations.
+    Exception,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewScope {
+    WholePr,
+    BottomOfStack,
+}
+
+/// Fixed across repositories, so that results stay comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Severity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Rejected,
+}
+
+/// What a severity does to a finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Action {
+    Blocks,
+    BlocksUnlessWaived,
+    NeverBlocks,
+    Drop,
+}
+
+impl Severity {
+    pub fn default_action(self) -> Action {
+        match self {
+            Severity::Critical | Severity::High => Action::Blocks,
+            Severity::Medium => Action::BlocksUnlessWaived,
+            Severity::Low => Action::NeverBlocks,
+            Severity::Rejected => Action::Drop,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TierMatch {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tier {
+    pub id: String,
+    #[serde(rename = "match")]
+    pub rule: TierMatch,
+    pub fan_out: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Triggers {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lens {
+    /// Stable, so results can be compared over time.
+    pub id: String,
+    pub criteria: String,
+    pub triggers: Triggers,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
+    /// What a severity does in this lens, if not its default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub severity: BTreeMap<Severity, Action>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Labels {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_ready: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
+    /// `{lens}` is the lens's ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommentFormat {
+    Summary,
+    Full,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Integrations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Labels>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<CommentFormat>,
+}
+
+/// What a repository sets. The user's config and a run's flags can set it
+/// too. Each layer's values replace the last's, except that `bindings`
+/// merge role by role.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<Vec<Tier>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lenses: Option<Vec<Lens>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_findings: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_gate: Option<HumanGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_escalate: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_scope: Option<ReviewScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrations: Option<Integrations>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<Role, String>,
+}
+
+impl Policy {
+    fn over(mut self, later: Policy) -> Policy {
+        self.version = later.version.or(self.version);
+        self.tiers = later.tiers.or(self.tiers);
+        self.lenses = later.lenses.or(self.lenses);
+        self.not_findings = later.not_findings.or(self.not_findings);
+        self.human_gate = later.human_gate.or(self.human_gate);
+        self.max_rounds = later.max_rounds.or(self.max_rounds);
+        self.always_escalate = later.always_escalate.or(self.always_escalate);
+        self.review_scope = later.review_scope.or(self.review_scope);
+        self.integrations = later.integrations.or(self.integrations);
+        self.bindings.extend(later.bindings);
+        self
+    }
+}
+
+/// A way to reach a model, which only the user's config can define.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Binding {
+    /// The bridge agent, as `name@machine`.
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How hard it thinks, such as `high`, if its bridge allows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// The tools a call may use. Roles that only read must name these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// Seconds a call can take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    /// Where an Orchestrator applies fixes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// US dollars per million tokens, for estimates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_per_mtok: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_per_mtok: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// Everything a repository can choose from.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allowed_bindings: BTreeMap<String, Binding>,
+    /// This user's defaults, which a repository overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<Policy>,
+}
+
+/// A run's flags, the last layer.
+#[derive(Debug, Clone, Default)]
+pub struct Flags {
+    pub human_gate: Option<HumanGate>,
+    pub max_rounds: Option<u32>,
+    pub review_scope: Option<ReviewScope>,
+    pub bindings: BTreeMap<Role, String>,
+}
+
+/// The layers, resolved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub tiers: Vec<Tier>,
+    pub lenses: Vec<Lens>,
+    pub not_findings: Option<String>,
+    pub human_gate: HumanGate,
+    pub max_rounds: u32,
+    pub always_escalate: Vec<String>,
+    pub review_scope: ReviewScope,
+    pub integrations: Integrations,
+    pub bindings: BTreeMap<Role, String>,
+    pub allowed_bindings: BTreeMap<String, Binding>,
+    /// The repository's layer came from a file outside it, which nothing in
+    /// the repository can change.
+    #[serde(default)]
+    pub outside: bool,
+}
+
+fn framework_defaults() -> Policy {
+    let bindings = [
+        (Role::Sizer, "glm-flash"),
+        (Role::Orchestrator, "opus-medium"),
+        (Role::Reviewer, "glm-flash-high"),
+        (Role::Judge, "opus-medium"),
+    ];
+    Policy {
+        human_gate: Some(HumanGate::Exception),
+        max_rounds: Some(3),
+        review_scope: Some(ReviewScope::WholePr),
+        bindings: bindings
+            .into_iter()
+            .map(|(role, name)| (role, name.to_string()))
+            .collect(),
+        ..Policy::default()
+    }
+}
+
+pub fn parse_repo(text: &str) -> Result<Policy> {
+    serde_yaml_ng::from_str(text).context("in the repository's ACR config")
+}
+
+pub fn parse_user(text: &str) -> Result<UserConfig> {
+    serde_yaml_ng::from_str(text).context("in your ACR config")
+}
+
+/// The user's config, if they have one.
+pub fn load_user(path: &Path) -> Result<UserConfig> {
+    match fs::read_to_string(path) {
+        Ok(text) => parse_user(&text).with_context(|| path.display().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfig::default()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Puts the layers together and checks the result.
+pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config> {
+    if repo.version.is_none() {
+        bail!("the repository's config needs `version: {VERSION}`");
+    }
+    let flag_layer = Policy {
+        human_gate: flags.human_gate,
+        max_rounds: flags.max_rounds,
+        review_scope: flags.review_scope,
+        bindings: flags.bindings.clone(),
+        ..Policy::default()
+    };
+    let merged = framework_defaults()
+        .over(user.defaults.clone().unwrap_or_default())
+        .over(repo)
+        .over(flag_layer);
+    if merged.version != Some(VERSION) {
+        bail!("this tailbus reads ACR config version {VERSION}");
+    }
+    let config = Config {
+        tiers: merged.tiers.unwrap_or_default(),
+        lenses: merged.lenses.unwrap_or_default(),
+        not_findings: merged.not_findings,
+        human_gate: merged.human_gate.expect("set by the framework"),
+        max_rounds: merged.max_rounds.expect("set by the framework"),
+        always_escalate: merged.always_escalate.unwrap_or_default(),
+        review_scope: merged.review_scope.expect("set by the framework"),
+        integrations: merged.integrations.unwrap_or_default(),
+        bindings: merged.bindings,
+        allowed_bindings: user.allowed_bindings.clone(),
+        outside: false,
+    };
+    config.check()?;
+    Ok(config)
+}
+
+fn plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn check_globs(paths: &[String], whose: &str) -> Result<()> {
+    for path in paths {
+        Glob::new(path).with_context(|| format!("{whose}: bad path pattern {path:?}"))?;
+    }
+    Ok(())
+}
+
+impl Config {
+    fn check(&self) -> Result<()> {
+        if self.tiers.is_empty() {
+            bail!("the config needs at least one tier");
+        }
+        if self.lenses.is_empty() {
+            bail!("the config needs at least one lens");
+        }
+        if self.max_rounds == 0 {
+            bail!("max_rounds must be at least 1");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for lens in &self.lenses {
+            let whose = format!("lens {}", lens.id);
+            if !plain_id(&lens.id) {
+                bail!(
+                    "{:?} can't be a lens's id: use lowercase letters, digits and hyphens",
+                    lens.id
+                );
+            }
+            if !seen.insert(lens.id.as_str()) {
+                bail!("there are two lenses with the id {}", lens.id);
+            }
+            if lens.criteria.trim().is_empty() {
+                bail!("{whose} has no criteria");
+            }
+            let t = &lens.triggers;
+            if t.paths.is_empty() && t.content.is_empty() && t.description.is_none() {
+                bail!("{whose} has no triggers");
+            }
+            check_globs(&t.paths, &whose)?;
+            for pattern in &t.content {
+                Regex::new(pattern).with_context(|| format!("{whose}: bad pattern {pattern:?}"))?;
+            }
+            // Results must mean the same in every repository.
+            for severity in lens.severity.keys() {
+                if matches!(
+                    severity,
+                    Severity::Critical | Severity::High | Severity::Rejected
+                ) {
+                    bail!("{whose}: what {severity:?} does can't be changed");
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for tier in &self.tiers {
+            let whose = format!("tier {}", tier.id);
+            if !plain_id(&tier.id) {
+                bail!(
+                    "{:?} can't be a tier's id: use lowercase letters, digits and hyphens",
+                    tier.id
+                );
+            }
+            if !seen.insert(tier.id.as_str()) {
+                bail!("there are two tiers with the id {}", tier.id);
+            }
+            if tier.rule.paths.is_empty() && tier.rule.description.is_none() {
+                bail!("{whose} has nothing to match");
+            }
+            if tier.fan_out == 0 {
+                bail!("{whose}: fan_out must be at least 1");
+            }
+            check_globs(&tier.rule.paths, &whose)?;
+            if let Some(id) = tier.required.iter().find(|r| !self.has_lens(r)) {
+                bail!("{whose} requires lens {id}, which doesn't exist");
+            }
+        }
+        if let Some(labels) = self.integrations.labels.as_ref() {
+            for (key, value) in [
+                ("waiting", &labels.waiting),
+                ("confirmed", &labels.confirmed),
+            ] {
+                if value.as_ref().is_some_and(|v| !v.contains("{lens}")) {
+                    bail!("integrations.labels.{key} needs {{lens}}");
+                }
+            }
+        }
+        if !self.allowed_bindings.is_empty() {
+            self.check_bindings()?;
+        }
+        Ok(())
+    }
+
+    /// Whether every binding in use is one the user allows.
+    pub fn check_bindings(&self) -> Result<()> {
+        let chosen = self
+            .bindings
+            .values()
+            .chain(self.lenses.iter().filter_map(|l| l.binding.as_ref()));
+        for name in chosen {
+            if !self.allowed_bindings.contains_key(name) {
+                bail!("binding {name} isn't in your allowed_bindings");
+            }
+        }
+        for role in Role::ALL.into_iter().filter(|r| r.read_only()) {
+            let binding = self.binding(role, None)?;
+            if binding.tools.as_ref().is_none_or(Vec::is_empty) {
+                bail!(
+                    "the {} binding must name its read-only tools, in `tools`",
+                    role.as_str()
+                );
+            }
+        }
+        for lens in self.lenses.iter().filter(|l| l.binding.is_some()) {
+            let binding = self.binding(Role::Reviewer, Some(lens))?;
+            if binding.tools.as_ref().is_none_or(Vec::is_empty) {
+                bail!("lens {}'s binding must name its read-only tools", lens.id);
+            }
+        }
+        Ok(())
+    }
+
+    fn has_lens(&self, id: &str) -> bool {
+        self.lenses.iter().any(|l| l.id == id)
+    }
+
+    /// The name of the binding for a role, or for a reviewer of `lens`.
+    pub fn binding_name<'a>(&'a self, role: Role, lens: Option<&'a Lens>) -> Result<&'a str> {
+        let name = lens
+            .and_then(|l| l.binding.as_ref())
+            .or_else(|| self.bindings.get(&role));
+        name.map(String::as_str)
+            .with_context(|| format!("no binding for the {}", role.as_str()))
+    }
+
+    pub fn binding<'a>(&'a self, role: Role, lens: Option<&'a Lens>) -> Result<&'a Binding> {
+        let name = self.binding_name(role, lens)?;
+        self.allowed_bindings
+            .get(name)
+            .with_context(|| format!("binding {name} isn't in your allowed_bindings"))
+    }
+
+    /// What a severity does in a lens.
+    pub fn action(&self, lens: &Lens, severity: Severity) -> Action {
+        lens.severity
+            .get(&severity)
+            .copied()
+            .unwrap_or(severity.default_action())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub const GO: &str = include_str!("../../examples/acr/go.yaml");
+    const RUST: &str = include_str!("../../examples/acr/rust.yaml");
+    const USER: &str = include_str!("../../examples/acr/user.yaml");
+
+    fn user() -> UserConfig {
+        parse_user(USER).unwrap()
+    }
+
+    fn resolved(repo: &str) -> Result<Config> {
+        resolve(&user(), parse_repo(repo)?, &Flags::default())
+    }
+
+    #[test]
+    fn the_go_example_is_valid() {
+        let cfg = resolved(GO).unwrap();
+        assert_eq!(cfg.human_gate, HumanGate::PerRound);
+        assert_eq!(cfg.review_scope, ReviewScope::BottomOfStack);
+        assert_eq!(cfg.lenses.len(), 5);
+        assert_eq!(cfg.tiers.last().unwrap().fan_out, 3);
+        assert_eq!(cfg.not_findings.as_deref(), Some("not-findings.md"));
+    }
+
+    #[test]
+    fn a_repository_in_another_language_needs_no_framework_change() {
+        let cfg = resolved(RUST).unwrap();
+        assert!(
+            cfg.lenses
+                .iter()
+                .any(|l| l.triggers.paths.iter().any(|p| p.ends_with(".rs")))
+        );
+    }
+
+    #[test]
+    fn the_framework_knows_nothing_about_any_repository() {
+        for source in [
+            include_str!("config.rs"),
+            include_str!("change.rs"),
+            include_str!("flow.rs"),
+            include_str!("mod.rs"),
+            include_str!("plan.rs"),
+            include_str!("report.rs"),
+            include_str!("roles.rs"),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            // Words from the two examples' configs.
+            for word in [
+                "goroutine-safety",
+                "http-compatibility",
+                "internal/store",
+                "lock-discipline",
+                "wire-compatibility",
+                ".go\"",
+                ".rs\"",
+            ] {
+                assert!(!code.contains(word), "{word} in the framework");
+            }
+        }
+    }
+
+    #[test]
+    fn layers_override_in_order() {
+        let mut user = user();
+        user.defaults = Some(Policy {
+            max_rounds: Some(9),
+            review_scope: Some(ReviewScope::BottomOfStack),
+            human_gate: Some(HumanGate::Ends),
+            ..Policy::default()
+        });
+        let repo = "version: 1\nhuman_gate: per-round\nmax_rounds: 2\n\
+                    tiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                    lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+        let flags = Flags {
+            max_rounds: Some(1),
+            ..Flags::default()
+        };
+        let cfg = resolve(&user, parse_repo(repo).unwrap(), &flags).unwrap();
+        assert_eq!(cfg.max_rounds, 1, "the flag beats the repository");
+        assert_eq!(
+            cfg.human_gate,
+            HumanGate::PerRound,
+            "the repository beats the user"
+        );
+        assert_eq!(
+            cfg.review_scope,
+            ReviewScope::BottomOfStack,
+            "the user beats the default"
+        );
+        assert_eq!(
+            cfg.bindings[&Role::Judge],
+            "opus-medium",
+            "the default fills the rest"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_is_an_error_that_names_it() {
+        for (text, key) in [
+            ("version: 1\nhuman_gates: ends\n", "human_gates"),
+            (
+                "version: 1\nlenses: [{id: a, criteria: c, triggers: {}, nope: 1}]\n",
+                "nope",
+            ),
+            (
+                "version: 1\ntiers: [{id: a, match: {paths: []}, fan_out: 1, x: 1}]\n",
+                "x",
+            ),
+            ("version: 1\nintegrations: {labels: {nope: x}}\n", "nope"),
+        ] {
+            let err = format!("{:#}", parse_repo(text).unwrap_err());
+            assert!(err.contains(key), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_repository_cant_add_secrets_tools_commands_or_bindings() {
+        for key in [
+            "secrets: {T: /x}",
+            "tools: [bash]",
+            "command: /bin/sh",
+            "commands: [rm]",
+            "env: {A: b}",
+            "allowed_bindings: {mine: {agent: a@b}}",
+        ] {
+            let text = format!("version: 1\n{key}\n");
+            assert!(parse_repo(&text).is_err(), "{key}");
+        }
+        assert!(parse_repo("version: 1\nbindings: {sizer: {agent: a@b}}\n").is_err());
+    }
+
+    #[test]
+    fn a_repository_chooses_only_from_the_users_bindings() {
+        let base = "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n";
+        let lens = "lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+        let chosen = format!("{base}{lens}bindings: {{judge: glm-flash}}\n");
+        assert_eq!(
+            resolved(&chosen).unwrap().bindings[&Role::Judge],
+            "glm-flash"
+        );
+        let refused = format!("{base}{lens}bindings: {{judge: free-for-all}}\n");
+        let err = format!("{:#}", resolved(&refused).unwrap_err());
+        assert!(
+            err.contains("free-for-all") && err.contains("allowed_bindings"),
+            "{err}"
+        );
+        let lens_refused = format!(
+            "{base}lenses: [{{id: l, criteria: c, triggers: {{paths: ['**']}}, binding: nope}}]\n"
+        );
+        assert!(resolved(&lens_refused).is_err());
+    }
+
+    #[test]
+    fn roles_that_only_read_must_name_their_tools() {
+        let mut user = user();
+        user.allowed_bindings
+            .get_mut("glm-flash-high")
+            .unwrap()
+            .tools = None;
+        let err = resolve(&user, parse_repo(GO).unwrap(), &Flags::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("read-only tools"), "{err:#}");
+    }
+
+    #[test]
+    fn severity_means_the_same_everywhere() {
+        assert_eq!(Severity::Critical.default_action(), Action::Blocks);
+        assert_eq!(Severity::High.default_action(), Action::Blocks);
+        assert_eq!(
+            Severity::Medium.default_action(),
+            Action::BlocksUnlessWaived
+        );
+        assert_eq!(Severity::Low.default_action(), Action::NeverBlocks);
+        assert_eq!(Severity::Rejected.default_action(), Action::Drop);
+        let text = |s: &str| {
+            format!(
+                "version: 1\ntiers: [{{id: a, match: {{paths: ['**']}}, fan_out: 1}}]\n\
+                 lenses: [{{id: l, criteria: c, triggers: {{paths: ['**']}}, severity: {{{s}: never-blocks}}}}]\n"
+            )
+        };
+        assert!(resolved(&text("High")).is_err());
+        assert!(resolved(&text("Critical")).is_err());
+        let cfg = resolved(&text("Medium")).unwrap();
+        assert_eq!(
+            cfg.action(&cfg.lenses[0], Severity::Medium),
+            Action::NeverBlocks
+        );
+        assert_eq!(cfg.action(&cfg.lenses[0], Severity::High), Action::Blocks);
+    }
+
+    #[test]
+    fn mistakes_are_named() {
+        let base = "tiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                    lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+        let says = |text: String, word: &str| {
+            let err = format!("{:#}", resolved(&text).unwrap_err());
+            assert!(err.contains(word), "{err}");
+        };
+        says(base.to_string(), "version");
+        says(format!("version: 2\n{base}"), "version");
+        says(
+            "version: 1\nlenses: [{id: l, criteria: c, triggers: {paths: ['a']}}]\n".into(),
+            "tier",
+        );
+        says("version: 1\ntiers: [{id: a, match: {paths: ['a']}, fan_out: 0}]\nlenses: [{id: l, criteria: c, triggers: {paths: ['a']}}]\n".into(), "fan_out");
+        says("version: 1\ntiers: [{id: a, match: {paths: ['a']}, fan_out: 1, required: [gone]}]\nlenses: [{id: l, criteria: c, triggers: {paths: ['a']}}]\n".into(), "gone");
+        says("version: 1\ntiers: [{id: a, match: {paths: ['a']}, fan_out: 1}]\nlenses: [{id: l, criteria: c, triggers: {content: ['(']}}]\n".into(), "bad pattern");
+        says("version: 1\ntiers: [{id: a, match: {paths: ['a']}, fan_out: 1}]\nlenses: [{id: 'Not Stable', criteria: c, triggers: {paths: ['a']}}]\n".into(), "id");
+        says("version: 1\ntiers: [{id: a, match: {paths: ['a']}, fan_out: 1}]\nlenses: [{id: l, criteria: c, triggers: {paths: ['a']}}, {id: l, criteria: c, triggers: {paths: ['a']}}]\n".into(), "two lenses");
+        says(
+            format!("version: 1\n{base}integrations: {{labels: {{waiting: plain}}}}\n"),
+            "{lens}",
+        );
+    }
+
+    #[test]
+    fn the_published_schema_covers_every_key() {
+        let schema: serde_json::Value = serde_json::from_str(SCHEMA).unwrap();
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            v["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let repo = serde_json::to_value(Policy {
+            version: Some(1),
+            tiers: Some(Vec::new()),
+            lenses: Some(Vec::new()),
+            not_findings: Some(String::new()),
+            human_gate: Some(HumanGate::Ends),
+            max_rounds: Some(1),
+            always_escalate: Some(Vec::new()),
+            review_scope: Some(ReviewScope::WholePr),
+            integrations: Some(Integrations::default()),
+            bindings: BTreeMap::from([(Role::Judge, "x".to_string())]),
+        })
+        .unwrap();
+        let mut ours: Vec<String> = repo.as_object().unwrap().keys().cloned().collect();
+        ours.sort();
+        let mut published = keys(&schema);
+        published.sort();
+        assert_eq!(ours, published);
+        assert_eq!(schema["additionalProperties"], false);
+    }
+}

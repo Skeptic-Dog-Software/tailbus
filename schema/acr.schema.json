@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Skeptic-Dog-Software/tailbus/schema/acr.schema.json",
+  "title": "A repository's ACR config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": {"const": 1},
+    "human_gate": {"enum": ["per-round", "ends", "exception"]},
+    "max_rounds": {"type": "integer", "minimum": 1},
+    "review_scope": {"enum": ["whole-pr", "bottom-of-stack"]},
+    "not_findings": {"type": "string", "description": "Path to the decided non-issues list"},
+    "always_escalate": {"type": "array", "items": {"type": "string"}},
+    "tiers": {
+      "type": "array",
+      "description": "Ordered from lowest to highest",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "match", "fan_out"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "match": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "paths": {"$ref": "#/$defs/strings"},
+              "description": {"type": "string"}
+            }
+          },
+          "fan_out": {"type": "integer", "minimum": 1},
+          "required": {"$ref": "#/$defs/strings"}
+        }
+      }
+    },
+    "lenses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "criteria", "triggers"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "criteria": {"type": "string"},
+          "triggers": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "paths": {"$ref": "#/$defs/strings"},
+              "content": {"$ref": "#/$defs/strings"},
+              "description": {"type": "string"}
+            }
+          },
+          "binding": {"type": "string"},
+          "severity": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "Medium": {"$ref": "#/$defs/action"},
+              "Low": {"$ref": "#/$defs/action"}
+            }
+          }
+        }
+      }
+    },
+    "integrations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "labels": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "not_ready": {"type": "string"},
+            "ready": {"type": "string"},
+            "waiting": {"type": "string"},
+            "confirmed": {"type": "string"}
+          }
+        },
+        "comment": {"enum": ["summary", "full"]}
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sizer": {"type": "string"},
+        "orchestrator": {"type": "string"},
+        "reviewer": {"type": "string"},
+        "judge": {"type": "string"}
+      }
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+    "strings": {"type": "array", "items": {"type": "string"}},
+    "action": {"enum": ["blocks", "blocks-unless-waived", "never-blocks", "drop"]}
+  }
+}

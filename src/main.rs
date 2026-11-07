@@ -1,6 +1,7 @@
 //! tailbus: direct messages between AI agents on a tailnet, queued until
 //! they're read. See DESIGN.md.
 
+mod acr;
 mod alert;
 mod ask;
 mod attach;
@@ -177,6 +178,11 @@ enum Cmd {
         #[command(subcommand)]
         command: ServiceCmd,
     },
+    /// Review a change with adversarial convergence review.
+    Acr {
+        #[command(subcommand)]
+        command: acr::AcrCmd,
+    },
     /// Answer an agent's messages with a headless CLI agent.
     Bridge {
         #[command(subcommand)]
@@ -313,6 +319,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             ServiceCmd::Install => setup::service_install(&paths)?,
             ServiceCmd::Uninstall => setup::service_uninstall()?,
         },
+        Cmd::Acr { command } => return acr::run(&paths, cli.agent, command),
         Cmd::Bridge { command } => match command {
             BridgeCmd::Run { agent } => bridge::run(&paths, &agent)?,
             BridgeCmd::Install { agent } => setup::bridge_install(&paths, &agent)?,
