@@ -366,6 +366,33 @@ request's message ID, so a sender knows it from the start. Each run's full
 stdout and stderr, its options and its result are kept in
 `~/.local/state/tailbus/bridge/<agent>/log/<run id>/`, with secrets out.
 
+### What a run used
+
+An agent that writes a line of JSON to its session for each model call can
+say what a run really used. Tell its bridge where the numbers are, and every
+result gets a `usage`: the calls, input, output, cache reads and writes, and
+what the agent says it cost. For omp 18.17.0:
+
+```toml
+[bridges.omp.usage]
+files = "**/*.jsonl"            # under {SESSION_DIR}, which args must use
+when = { type = "message", "message.role" = "assistant" }
+input = "message.usage.input"   # input not read from a cache
+output = "message.usage.output" # thinking included
+cache_read = "message.usage.cacheRead"
+cache_write = "message.usage.cacheWrite"
+reasoning = "message.usage.reasoningTokens"
+usd = "message.usage.cost.total"
+model = "message.model"
+```
+
+Paths into a line are dotted. A line counts when everything in `when`
+matches. A session kept between runs counts only the lines a run adds. A run
+that fails or times out still reports what it spent. The bridge never follows
+a link out of the session. It's the agent's own word, so it's for costs,
+never for what's allowed. `tailbus call --verbose` prints it, `--json`
+includes it, and a session sees it in the reply's tag.
+
 ### Calling an agent from a script
 
 `tailbus call` sends a request, waits for its own reply, prints it to stdout,
@@ -494,7 +521,7 @@ base.
   switch off its own review.
 - Only your config says how models are reached, in `allowed_bindings`. A
   repository can only choose among those names, and has no key for secrets,
-  tools or commands.
+  tools or commands. Its `costs` change only estimates.
 - A reviewer or Judge that fails leaves its lens open and escalates. A review
   that didn't happen never reads as a clean one.
 
@@ -516,8 +543,38 @@ escalations. These always stop for a person, in any mode: reviewers split, a
 rejection that's a values call, a blocker at `max_rounds`, anything in
 `always_escalate`, a change to the config, or a review that didn't fully run.
 
-**Costs are estimates.** Bridges don't report tokens, so they're counted from
-the text sent and received, and priced from your bindings.
+**Costs** come from the repository config's `costs`, which the repository's
+agent keeps. A call through a bridge that reports [what a run
+used](#what-a-run-used) is counted as the agent counted it. Any other call
+is estimated: the text ACR sends it and reads back, plus `costs.per_call`
+for its role. That covers what the text misses: the files its tools read,
+its turns, and its thinking. `costs.prices` gives US dollars per million
+tokens, by model, or by binding name for a binding that names no model, with
+`cached_input_per_mtok` and `cache_write_per_mtok` if cached input costs
+differently. Left out, cached input costs what other input does, which is the
+most it could. A binding in your config that sets both `input_per_mtok` and
+`output_per_mtok` keeps its own. With no price anywhere, a counted call uses
+the agent's.
+
+```yaml
+costs:
+  prices:
+    example/glm-flash: {input_per_mtok: 0.1, output_per_mtok: 0.4}
+    opus: {input_per_mtok: 5, output_per_mtok: 25}
+  per_call:
+    reviewer: {input_tokens: 8000, cache_read_tokens: 40000, output_tokens: 6000}
+    judge: {input_tokens: 8000, output_tokens: 3000}
+```
+
+`tailbus acr plan` gives three figures. The least has every lens done in one
+round. The expected has each lens taking as many rounds as it did, on average,
+in the last 20 finished reviews of the repository on this machine, or every
+lens's average for a new one. The most has every lens go through every round,
+with a fix between. The plan names any binding with no price, and says when
+nothing counts the tokens an agent reads and thinks. A run's report has
+`tokens` and `usd`, how many calls were counted and how many estimated, and
+`agent_usd`, what the agents said, beside the config's prices. A price for a
+model none of your bindings use is an error, so a misspelt one is caught.
 
 **Fixes need the checkout.** After a fix, ACR reads the change from the working
 tree, so the Orchestrator's bridge must run on the same machine as `--repo`, with

@@ -8,7 +8,7 @@ pub const MAX_BODY: usize = 64 * 1024;
 /// The most messages or receipts in one request.
 pub const MAX_BATCH: usize = 100;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     /// A ULID.
     pub id: String,
@@ -38,7 +38,7 @@ pub struct Message {
 }
 
 /// What travels beside a message's text.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Extras {
     /// A request's options for its run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,7 +111,7 @@ impl RunStatus {
 }
 
 /// How a bridge's run went.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResult {
     pub status: RunStatus,
     /// The ID of the request, which every try at it shares.
@@ -130,6 +130,35 @@ pub struct RunResult {
     /// large for the body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_reply: Option<String>,
+    /// What the run's model calls used, as the agent recorded them. Left
+    /// out when its bridge isn't told where to look, or found nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunUsage>,
+}
+
+/// What a run's model calls used, by the agent's own record. It's what the
+/// agent says, so it's for costs, never for what's allowed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunUsage {
+    /// The model calls counted.
+    pub calls: u64,
+    /// Input that wasn't read from a cache.
+    pub input_tokens: u64,
+    /// Output, thinking included.
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// The thinking part of the output, if the agent says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// What the agent says it cost, in US dollars, when it said so for every
+    /// call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// The options a run actually had.

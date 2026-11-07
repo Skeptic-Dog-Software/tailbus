@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use super::config::{CommentFormat, Config, Role, Severity};
 use super::flow::{
-    Disagreement, Escalation, Finding, FindingState, Gate, LensResult, Outcome, Run, Status,
+    Disagreement, Escalation, Finding, FindingState, Gate, LensResult, Outcome, Run, Status, Usage,
 };
 
 #[derive(Debug, Serialize)]
@@ -31,11 +31,16 @@ pub struct Report<'a> {
     pub escalations: &'a [Escalation],
     pub disagreements: &'a [Disagreement],
     pub bindings_used: Vec<BindingUsed>,
-    /// Counted from the text sent and received, so an estimate.
-    pub tokens_estimated: u64,
-    /// From those tokens and your prices, so an estimate too. None if a
-    /// binding has no prices.
-    pub usd_estimated: Option<f64>,
+    /// Every call's tokens: the agent's count where it gave one, and an
+    /// estimate where it didn't.
+    pub tokens: u64,
+    pub calls_measured: usize,
+    pub calls_estimated: usize,
+    /// By the config's prices, or an agent's where the config has none.
+    /// None if a call has no price at all.
+    pub usd: Option<f64>,
+    /// What the agents said, for the calls they priced.
+    pub agent_usd: Option<f64>,
     pub labels: Vec<String>,
 }
 
@@ -67,8 +72,15 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         escalations: &run.escalations,
         disagreements: &run.disagreements,
         bindings_used: bindings_used(run),
-        tokens_estimated: run.usage.iter().map(|u| u.tokens_in + u.tokens_out).sum(),
-        usd_estimated: run.usage.iter().map(|u| u.usd).sum(),
+        tokens: run.usage.iter().map(Usage::tokens).sum(),
+        calls_measured: run.usage.iter().filter(|u| u.measured).count(),
+        calls_estimated: run.usage.iter().filter(|u| !u.measured).count(),
+        usd: run.usage.iter().map(|u| u.usd).sum(),
+        agent_usd: run
+            .usage
+            .iter()
+            .filter_map(|u| u.agent_usd)
+            .reduce(|a, b| a + b),
         labels: labels(run, cfg),
     }
 }

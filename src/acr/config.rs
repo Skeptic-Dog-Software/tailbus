@@ -203,6 +203,83 @@ pub struct Policy {
     pub integrations: Option<Integrations>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<Role, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub costs: Option<Costs>,
+}
+
+/// US dollars per million tokens. Cached input left out costs what other
+/// input does, which is the most it could.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Price {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    /// Input read from a cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_per_mtok: Option<f64>,
+    /// Input written to a cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_mtok: Option<f64>,
+}
+
+impl Price {
+    pub fn usd(&self, input: u64, cache_read: u64, cache_write: u64, output: u64) -> f64 {
+        let per_million = |tokens: u64, rate: f64| tokens as f64 / 1_000_000.0 * rate;
+        per_million(input, self.input_per_mtok)
+            + per_million(
+                cache_read,
+                self.cached_input_per_mtok.unwrap_or(self.input_per_mtok),
+            )
+            + per_million(
+                cache_write,
+                self.cache_write_per_mtok.unwrap_or(self.input_per_mtok),
+            )
+            + per_million(output, self.output_per_mtok)
+    }
+
+    fn rates(&self) -> [f64; 4] {
+        [
+            self.input_per_mtok,
+            self.output_per_mtok,
+            self.cached_input_per_mtok.unwrap_or(0.0),
+            self.cache_write_per_mtok.unwrap_or(0.0),
+        ]
+    }
+}
+
+/// What a call takes beyond the text ACR sends it and reads back: the files
+/// its tools read, the turns it takes, the thinking nobody sees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerCall {
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Input read from a cache, as an agent's later turns mostly are.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+/// What estimates are made from. A repository's own agent knows its calls
+/// best, so its config is where these usually come from.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Costs {
+    /// By model, or by binding name for a binding that names no model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prices: BTreeMap<String, Price>,
+    /// By role, added to every call it makes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_call: BTreeMap<Role, PerCall>,
+}
+
+impl Costs {
+    fn over(mut self, later: Costs) -> Costs {
+        self.prices.extend(later.prices);
+        self.per_call.extend(later.per_call);
+        self
+    }
 }
 
 impl Policy {
@@ -217,6 +294,10 @@ impl Policy {
         self.review_scope = later.review_scope.or(self.review_scope);
         self.integrations = later.integrations.or(self.integrations);
         self.bindings.extend(later.bindings);
+        self.costs = match (self.costs, later.costs) {
+            (Some(costs), Some(later)) => Some(costs.over(later)),
+            (costs, later) => later.or(costs),
+        };
         self
     }
 }
@@ -241,11 +322,16 @@ pub struct Binding {
     /// Where an Orchestrator applies fixes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
-    /// US dollars per million tokens, for estimates.
+    /// US dollars per million tokens, for estimates. Set both, and they
+    /// win over a repository's prices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_per_mtok: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_per_mtok: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_per_mtok: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -283,6 +369,8 @@ pub struct Config {
     pub integrations: Integrations,
     pub bindings: BTreeMap<Role, String>,
     pub allowed_bindings: BTreeMap<String, Binding>,
+    #[serde(default)]
+    pub costs: Costs,
     /// The repository's layer came from a file outside it, which nothing in
     /// the repository can change.
     #[serde(default)]
@@ -355,6 +443,7 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         integrations: merged.integrations.unwrap_or_default(),
         bindings: merged.bindings,
         allowed_bindings: user.allowed_bindings.clone(),
+        costs: merged.costs.unwrap_or_default(),
         outside: false,
     };
     config.check()?;
@@ -452,6 +541,11 @@ impl Config {
                 }
             }
         }
+        for (key, price) in &self.costs.prices {
+            if price.rates().iter().any(|r| !r.is_finite() || *r < 0.0) {
+                bail!("costs.prices.{key}: a price can't be negative");
+            }
+        }
         if !self.allowed_bindings.is_empty() {
             self.check_bindings()?;
         }
@@ -484,7 +578,42 @@ impl Config {
                 bail!("lens {}'s binding must name its read-only tools", lens.id);
             }
         }
+        // A misspelt model would only show up as a missing price.
+        for key in self.costs.prices.keys() {
+            let used = self
+                .allowed_bindings
+                .iter()
+                .any(|(name, b)| name == key || b.model.as_ref() == Some(key));
+            if !used {
+                bail!("costs.prices names {key}, which no binding in your allowed_bindings uses");
+            }
+        }
         Ok(())
+    }
+
+    /// A binding's prices: its own, if it sets both, or else the
+    /// repository's for its name or its model.
+    pub fn price(&self, name: &str, binding: &Binding) -> Option<Price> {
+        if let (Some(input_per_mtok), Some(output_per_mtok)) =
+            (binding.input_per_mtok, binding.output_per_mtok)
+        {
+            return Some(Price {
+                input_per_mtok,
+                output_per_mtok,
+                cached_input_per_mtok: binding.cached_input_per_mtok,
+                cache_write_per_mtok: binding.cache_write_per_mtok,
+            });
+        }
+        let model = binding
+            .model
+            .as_ref()
+            .and_then(|m| self.costs.prices.get(m));
+        self.costs.prices.get(name).or(model).copied()
+    }
+
+    /// What every call by a role is taken to add.
+    pub fn per_call(&self, role: Role) -> PerCall {
+        self.costs.per_call.get(&role).copied().unwrap_or_default()
     }
 
     fn has_lens(&self, id: &str) -> bool {
@@ -627,6 +756,14 @@ mod tests {
                 "x",
             ),
             ("version: 1\nintegrations: {labels: {nope: x}}\n", "nope"),
+            (
+                "version: 1\ncosts: {per_call: {reviewer: {tokens: 1}}}\n",
+                "tokens",
+            ),
+            (
+                "version: 1\ncosts: {prices: {m: {input_per_mtok: 1, output_per_mtok: 1, agent: a@b}}}\n",
+                "agent",
+            ),
         ] {
             let err = format!("{:#}", parse_repo(text).unwrap_err());
             assert!(err.contains(key), "{err}");
@@ -647,6 +784,117 @@ mod tests {
             assert!(parse_repo(&text).is_err(), "{key}");
         }
         assert!(parse_repo("version: 1\nbindings: {sizer: {agent: a@b}}\n").is_err());
+    }
+
+    const SMALL: &str = "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
+                         lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
+
+    #[test]
+    fn costs_merge_model_by_model_and_role_by_role() {
+        let mut user = user();
+        let theirs = "version: 1\ncosts: {per_call: {judge: {input_tokens: 7}}, prices: {\
+                      opus: {input_per_mtok: 1, output_per_mtok: 2}, \
+                      example/glm-flash: {input_per_mtok: 3, output_per_mtok: 4}}}\n";
+        user.defaults = Some(parse_repo(theirs).unwrap());
+        let repo = [
+            SMALL,
+            "costs: {prices: {opus: {input_per_mtok: 5, output_per_mtok: 25}}, \
+             per_call: {reviewer: {input_tokens: 100, output_tokens: 10}}}\n",
+        ]
+        .concat();
+        let cfg = resolve(&user, parse_repo(&repo).unwrap(), &Flags::default()).unwrap();
+        let rate = |model: &str| cfg.costs.prices[model].input_per_mtok;
+        assert_eq!(rate("opus"), 5.0, "the repository's wins");
+        assert_eq!(rate("example/glm-flash"), 3.0, "the user's fills the rest");
+        let reviewer = PerCall {
+            input_tokens: 100,
+            output_tokens: 10,
+            ..PerCall::default()
+        };
+        assert_eq!(cfg.per_call(Role::Reviewer), reviewer);
+        assert_eq!(cfg.per_call(Role::Judge).input_tokens, 7);
+        assert_eq!(cfg.per_call(Role::Sizer), PerCall::default());
+    }
+
+    #[test]
+    fn a_binding_with_its_own_prices_keeps_them() {
+        let repo = [
+            SMALL,
+            "costs: {prices: {opus: {input_per_mtok: 5, output_per_mtok: 25}, \
+             example/glm-flash: {input_per_mtok: 1, output_per_mtok: 1}, \
+             glm-flash: {input_per_mtok: 9, output_per_mtok: 9}}}\n",
+        ]
+        .concat();
+        let cfg = resolved(&repo).unwrap();
+        let rate = |name: &str, b: &Binding| cfg.price(name, b).map(|p| p.input_per_mtok);
+        let opus = cfg.allowed_bindings["opus-medium"].clone();
+        assert_eq!(rate("opus-medium", &opus), Some(5.0), "by its model");
+        let flash = &cfg.allowed_bindings["glm-flash"];
+        assert_eq!(rate("glm-flash", flash), Some(9.0), "by its name first");
+        let high = &cfg.allowed_bindings["glm-flash-high"];
+        assert_eq!(rate("glm-flash-high", high), Some(1.0));
+        let mine = Binding {
+            input_per_mtok: Some(2.0),
+            output_per_mtok: Some(3.0),
+            ..opus.clone()
+        };
+        let both = Price {
+            input_per_mtok: 2.0,
+            output_per_mtok: 3.0,
+            cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
+        };
+        assert_eq!(cfg.price("opus-medium", &mine), Some(both));
+        let half = Binding {
+            input_per_mtok: Some(2.0),
+            ..opus
+        };
+        assert_eq!(
+            rate("opus-medium", &half),
+            Some(5.0),
+            "half a price isn't one"
+        );
+    }
+
+    #[test]
+    fn a_price_must_be_for_a_binding_in_use_and_not_negative() {
+        let typo = [
+            SMALL,
+            "costs: {prices: {opsu: {input_per_mtok: 5, output_per_mtok: 25}}}\n",
+        ];
+        let err = format!("{:#}", resolved(&typo.concat()).unwrap_err());
+        assert!(err.contains("opsu"), "{err}");
+        let negative = [
+            SMALL,
+            "costs: {prices: {opus: {input_per_mtok: -1, output_per_mtok: 25}}}\n",
+        ];
+        let err = format!("{:#}", resolved(&negative.concat()).unwrap_err());
+        assert!(err.contains("negative"), "{err}");
+        let half = [SMALL, "costs: {prices: {opus: {input_per_mtok: 5}}}\n"];
+        assert!(parse_repo(&half.concat()).is_err());
+        let cache = [
+            SMALL,
+            "costs: {prices: {opus: {input_per_mtok: 5, output_per_mtok: 25, cached_input_per_mtok: -1}}}\n",
+        ];
+        assert!(resolved(&cache.concat()).is_err());
+    }
+
+    #[test]
+    fn cached_input_has_its_own_price_or_the_inputs() {
+        let full = Price {
+            input_per_mtok: 10.0,
+            output_per_mtok: 20.0,
+            cached_input_per_mtok: Some(1.0),
+            cache_write_per_mtok: Some(12.5),
+        };
+        let m = 1_000_000;
+        assert_eq!(full.usd(m, m, m, m), 10.0 + 1.0 + 12.5 + 20.0);
+        let plain = Price {
+            cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
+            ..full
+        };
+        assert_eq!(plain.usd(0, m, m, 0), 20.0, "at most what input costs");
     }
 
     #[test]
@@ -754,6 +1002,7 @@ mod tests {
             review_scope: Some(ReviewScope::WholePr),
             integrations: Some(Integrations::default()),
             bindings: BTreeMap::from([(Role::Judge, "x".to_string())]),
+            costs: Some(Costs::default()),
         })
         .unwrap();
         let mut ours: Vec<String> = repo.as_object().unwrap().keys().cloned().collect();

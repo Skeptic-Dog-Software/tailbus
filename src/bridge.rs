@@ -38,8 +38,9 @@ use crate::local::{
     self, BRIDGE_SESSION, Client, Held, Inbox, Item, Messages, Refused, Request, Sent, Status,
 };
 use crate::proto::{
-    Applied, Attachment, Extras, MAX_BODY, Message, RunOptions, RunResult, RunStatus,
+    Applied, Attachment, Extras, MAX_BODY, Message, RunOptions, RunResult, RunStatus, RunUsage,
 };
+use crate::run_usage::UsageFrom;
 use crate::setup;
 use crate::util::{ago, is_id, new_id, now_ms, valid_name};
 
@@ -130,6 +131,9 @@ pub struct Settings {
     /// What a request may ask for. Left out, it may ask for nothing.
     #[serde(default)]
     pub options: Allowed,
+    /// Where the agent records what its model calls used, for results that
+    /// carry real usage.
+    pub usage: Option<UsageFrom>,
 }
 
 /// The most a request's options can ask for. This is the authority: a
@@ -325,6 +329,12 @@ impl Settings {
             bail!("{{TOOLS}} belongs in options.tools_args, used only when a request names tools");
         }
         self.options.check(wants_model, self.timeout_secs)?;
+        if let Some(usage) = &self.usage {
+            usage.check()?;
+            if !on_command_line.clone().any(|a| a.contains("{SESSION_DIR}")) {
+                bail!("usage is read from the session directory, so args need {{SESSION_DIR}}");
+            }
+        }
         for (name, path) in &self.secrets {
             read_secret(name, path)?;
         }
@@ -998,6 +1008,7 @@ struct Finished {
     exit_code: Option<i32>,
     stderr_tail: Option<String>,
     attachment: Option<Attachment>,
+    usage: Option<Box<RunUsage>>,
 }
 
 impl Finished {
@@ -1008,6 +1019,7 @@ impl Finished {
             exit_code: None,
             stderr_tail: None,
             attachment: None,
+            usage: None,
         }
     }
 }
@@ -1579,6 +1591,7 @@ impl Bridge {
                 stderr_tail: None,
                 applied: None,
                 full_reply: None,
+                usage: None,
             };
             let ext = Extras {
                 result: Some(result),
@@ -1704,6 +1717,7 @@ impl Bridge {
             stderr_tail: done.stderr_tail,
             applied: plan.map(Plan::applied),
             full_reply: done.attachment.as_ref().map(|a| a.sha256.clone()),
+            usage: done.usage.map(|u| *u),
         };
         let log = RunLog {
             sender: msg.from.clone(),
@@ -1905,6 +1919,7 @@ impl Bridge {
             plan.session == SessionMode::PerSender && fs::read_dir(&session_dir)?.next().is_some();
         let (stdout, stderr) = (run_dir.join("stdout"), run_dir.join("stderr"));
         let mut command = self.command(&item, plan, run_dir, &session_dir, continuing)?;
+        let before = self.cfg.usage.as_ref().map(|u| u.before(&session_dir));
         command
             .stdout(create_private(&stdout)?)
             .stderr(create_private(&stderr)?);
@@ -1964,6 +1979,16 @@ impl Bridge {
         if done.status != RunStatus::Ok {
             let tail_of_stderr = tail_of_stderr.trim();
             done.stderr_tail = (!tail_of_stderr.is_empty()).then(|| tail_of_stderr.to_string());
+        }
+        // Tokens spent are spent, however the run ended.
+        if let (Some(from), Some(before)) = (&self.cfg.usage, &before) {
+            done.usage = from.read(&session_dir, before).map(Box::new);
+            if done.usage.is_none() {
+                self.log(format!(
+                    "{}: no usage found in the session by [bridges.{}.usage]",
+                    msg.id, self.agent
+                ));
+            }
         }
         Ok(Outcome::Finished(done))
     }
@@ -2740,6 +2765,57 @@ mod tests {
         for dir in dirs {
             assert!(!Path::new(dir).exists(), "{dir} was left behind");
         }
+    }
+
+    const RECORDS_USAGE: &str = r#"usage = { files = "*.jsonl", when = { t = "call" }, input = "u.in", output = "u.out", cache_read = "u.cached", usd = "u.usd", model = "m" }"#;
+
+    #[test]
+    fn a_result_carries_what_the_agent_recorded_it_used() {
+        let rig = Rig::new();
+        let script = r#"echo '{"t":"start"}' >> "$1/s.jsonl"
+            echo '{"t":"call","m":"x/flash","u":{"in":120,"out":30,"cached":900,"usd":0.25}}' >> "$1/s.jsonl"
+            echo '{"t":"call","m":"x/flash","u":{"in":5,"out":5,"usd":0.5}}' >> "$1/s.jsonl"
+            echo done"#;
+        let bridge = rig.start(rig.settings(script, RECORDS_USAGE));
+        let id = rig.ask("go");
+        let reply = rig.reply_item(&id);
+        let usage = reply.msg.result().unwrap().usage.clone().unwrap();
+        assert_eq!(
+            (usage.calls, usage.input_tokens, usage.output_tokens),
+            (2, 125, 35)
+        );
+        assert_eq!(usage.cache_read_tokens, 900);
+        assert!((usage.usd.unwrap() - 0.75).abs() < 1e-12);
+        assert_eq!(usage.models, ["x/flash"]);
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_failed_run_still_says_what_it_spent_and_no_config_says_nothing() {
+        let rig = Rig::new();
+        let script = r#"echo '{"t":"call","u":{"in":7,"out":1}}' >> "$1/s.jsonl"; exit 3"#;
+        let bridge = rig.start(rig.settings(script, RECORDS_USAGE));
+        let reply = rig.reply_item(&rig.ask("go"));
+        let result = reply.msg.result().unwrap();
+        assert_eq!(result.status, RunStatus::Failed);
+        let usage = result.usage.as_ref().unwrap();
+        assert_eq!((usage.calls, usage.input_tokens, usage.usd), (1, 7, None));
+        bridge.stop().unwrap();
+        let rig = Rig::new();
+        let bridge = rig.start(rig.settings(script, ""));
+        let reply = rig.reply_item(&rig.ask("go"));
+        assert_eq!(reply.msg.result().unwrap().usage, None);
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn usage_needs_the_session_directory_on_the_command_line() {
+        let rig = Rig::new();
+        let mut cfg = rig.unchecked("echo hi", RECORDS_USAGE);
+        cfg.check().unwrap();
+        cfg.args = vec!["{RUN_DIR}".into()];
+        let err = format!("{:#}", cfg.check().unwrap_err());
+        assert!(err.contains("SESSION_DIR"), "{err}");
     }
 
     #[test]

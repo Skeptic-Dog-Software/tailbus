@@ -233,6 +233,17 @@ pub fn tagged(item: &Item) -> String {
                 let _ = write!(attrs, " tools=\"{}\"", attr(&tools.join(",")));
             }
         }
+        if let Some(u) = &r.usage {
+            let _ = write!(
+                attrs,
+                " tokens-in=\"{}\" tokens-out=\"{}\"",
+                u.input_tokens + u.cache_read_tokens + u.cache_write_tokens,
+                u.output_tokens
+            );
+            if let Some(usd) = u.usd {
+                let _ = write!(attrs, " usd=\"{usd:.4}\"");
+            }
+        }
     }
     let close = |text: &str| text.replace("</tailbus-", "<\\/tailbus-");
     let mut out = format!("<tailbus-message {attrs}>\n{}\n", close(&m.body));

@@ -13,9 +13,11 @@ use std::thread;
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::proto::RunUsage;
+
 use super::change::{self, Change};
 use super::config::{Action, Binding, Config, HumanGate, Lens, Role, Severity};
-use super::plan::{self, Why, price, tokens_in};
+use super::plan::{self, Why, tokens_in};
 use super::roles::{self, Raw};
 
 /// What a role's call needs.
@@ -33,6 +35,8 @@ pub struct Call<'a> {
 pub struct Answer {
     pub text: String,
     pub run_id: String,
+    /// What the call used, if its agent said.
+    pub usage: Option<RunUsage>,
 }
 
 /// How a role reaches its model.
@@ -168,9 +172,27 @@ pub struct Usage {
     pub agent: String,
     pub model: Option<String>,
     pub run_id: String,
+    /// Input not read from or written to a cache.
     pub tokens_in: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
     pub tokens_out: u64,
+    /// By the config's prices, or the agent's if the config has none.
     pub usd: Option<f64>,
+    /// The tokens are the agent's own count, not an estimate.
+    #[serde(default)]
+    pub measured: bool,
+    /// What the agent said the call cost.
+    #[serde(default)]
+    pub agent_usd: Option<f64>,
+}
+
+impl Usage {
+    pub fn tokens(&self) -> u64 {
+        self.tokens_in + self.cache_read + self.cache_write + self.tokens_out
+    }
 }
 
 /// A review, as far as it's got. It's all saved, so that it can stop for a
@@ -211,18 +233,64 @@ pub struct Decision {
     pub stop: bool,
 }
 
-fn record(run: &mut Run, call: &Call, input_bytes: usize, answer: &Answer) {
-    let (tokens_in, tokens_out) = (tokens_in(input_bytes), tokens_in(answer.text.len()));
-    run.usage.push(Usage {
+/// What a call cost: by the agent's count if it gave one, or else by the
+/// text it took and gave and by the config. Either is priced by the config,
+/// falling back to what the agent said.
+fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usage {
+    let mut usage = Usage {
         role: call.role,
         binding: call.binding_name.to_string(),
         agent: call.binding.agent.clone(),
         model: call.binding.model.clone(),
         run_id: answer.run_id.clone(),
-        tokens_in,
-        tokens_out,
-        usd: price(call.binding, tokens_in, tokens_out),
-    });
+        tokens_in: 0,
+        cache_read: 0,
+        cache_write: 0,
+        tokens_out: 0,
+        usd: None,
+        measured: false,
+        agent_usd: None,
+    };
+    match &answer.usage {
+        Some(counted) => {
+            usage.tokens_in = counted.input_tokens;
+            usage.cache_read = counted.cache_read_tokens;
+            usage.cache_write = counted.cache_write_tokens;
+            usage.tokens_out = counted.output_tokens;
+            usage.measured = true;
+            usage.agent_usd = counted.usd;
+            usage.usd = cfg
+                .price(call.binding_name, call.binding)
+                .map(|p| {
+                    p.usd(
+                        usage.tokens_in,
+                        usage.cache_read,
+                        usage.cache_write,
+                        usage.tokens_out,
+                    )
+                })
+                .or(counted.usd);
+        }
+        None => {
+            let guess = plan::cost(
+                cfg,
+                call.role,
+                call.binding_name,
+                Some(call.binding),
+                tokens_in(input_bytes),
+                tokens_in(answer.text.len()),
+            );
+            usage.tokens_in = guess.tokens_in;
+            usage.cache_read = guess.cache_read;
+            usage.tokens_out = guess.tokens_out;
+            usage.usd = guess.usd;
+        }
+    }
+    usage
+}
+
+fn record(run: &mut Run, cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) {
+    run.usage.push(usage(cfg, call, input_bytes, answer));
 }
 
 fn escalate(run: &mut Run, reason: String) {
@@ -260,7 +328,7 @@ fn ask(
         writes: false,
     };
     let answer = caller.call(&call)?;
-    record(run, &call, input_bytes(prompt, artifact), &answer);
+    record(run, s.cfg, &call, input_bytes(prompt, artifact), &answer);
     Ok(answer.text)
 }
 
@@ -470,18 +538,7 @@ fn attack(
                         writes: false,
                     };
                     let answer = caller.call(&call)?;
-                    let bytes = input_bytes(prompt, Some(artifact));
-                    let (input, output) = (tokens_in(bytes), tokens_in(answer.text.len()));
-                    let usage = Usage {
-                        role: Role::Reviewer,
-                        binding: name.to_string(),
-                        agent: binding.agent.clone(),
-                        model: binding.model.clone(),
-                        run_id: answer.run_id.clone(),
-                        tokens_in: input,
-                        tokens_out: output,
-                        usd: price(binding, input, output),
-                    };
+                    let usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
                     Ok((usage, roles::read_findings(&answer.text)?))
                 })
             })
@@ -693,7 +750,7 @@ fn fix(run: &mut Run, s: &Setting, caller: &dyn Caller) -> Result<()> {
         writes: true,
     };
     let fixed = caller.call(&call).and_then(|answer| {
-        record(run, &call, prompt.len(), &answer);
+        record(run, cfg, &call, prompt.len(), &answer);
         roles::read_fixed(&answer.text)
     });
     match fixed {
@@ -913,7 +970,7 @@ pub fn score(run: &Run, known: &[Known]) -> Result<Score> {
         missed,
         false_findings,
         usd: run.usage.iter().map(|u| u.usd).sum(),
-        tokens: run.usage.iter().map(|u| u.tokens_in + u.tokens_out).sum(),
+        tokens: run.usage.iter().map(Usage::tokens).sum(),
         failures: run
             .lenses
             .values()
@@ -981,6 +1038,8 @@ lenses:
     struct Fake<F> {
         answer: F,
         calls: Mutex<Vec<(Role, String, bool, String)>>,
+        /// What every call says it used, as a bridge with `usage` would.
+        usage: Option<RunUsage>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -988,6 +1047,7 @@ lenses:
             Fake {
                 answer,
                 calls: Mutex::new(Vec::new()),
+                usage: None,
             }
         }
 
@@ -1009,8 +1069,47 @@ lenses:
             Ok(Answer {
                 text,
                 run_id: new_id(),
+                usage: self.usage.clone(),
             })
         }
+    }
+
+    #[test]
+    fn a_call_its_agent_counted_is_recorded_as_counted() {
+        let prices = "costs: {prices: {example/glm-flash: {input_per_mtok: 1, output_per_mtok: 2, cached_input_per_mtok: 0.1}, \
+                      opus: {input_per_mtok: 1, output_per_mtok: 2, cached_input_per_mtok: 0.1}}, \
+                      per_call: {reviewer: {input_tokens: 99999}}}";
+        let cfg = config("exception", 1, 1, "", prices);
+        let mut fake = Fake::new(defect_in("alpha", 99));
+        fake.usage = Some(RunUsage {
+            calls: 4,
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 1_000_000,
+            usd: Some(9.0),
+            ..RunUsage::default()
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert!(!run.usage.is_empty());
+        for u in &run.usage {
+            assert!(u.measured);
+            // The agent's count, never the config's guess on top of it.
+            assert_eq!(
+                (u.tokens_in, u.cache_read, u.tokens_out),
+                (1_000_000, 1_000_000, 1_000_000)
+            );
+            assert!((u.usd.unwrap() - 3.1).abs() < 1e-9, "priced by the config");
+            assert_eq!(u.agent_usd, Some(9.0));
+        }
+        let json = serde_json::to_value(report::report(&run, &cfg)).unwrap();
+        assert_eq!(json["calls_measured"], run.usage.len());
+        assert_eq!(json["calls_estimated"], 0);
+        let calls = run.usage.len() as f64;
+        assert!((json["agent_usd"].as_f64().unwrap() - 9.0 * calls).abs() < 1e-9);
+        // With no price in the config, the agent's own is used.
+        let bare = plain("exception", 1, 1);
+        let (run, _) = go(&bare, &["a.src"], &fake);
+        assert!(run.usage.iter().all(|u| u.usd == Some(9.0)));
     }
 
     fn rating(severity: &str) -> String {
@@ -1087,6 +1186,32 @@ lenses:
         assert!(run.lenses.values().all(|l| l.outcome == Outcome::Confirmed));
         assert_eq!(fake.count(Role::Reviewer), 2);
         assert_eq!(fake.count(Role::Judge), 0, "nothing to judge");
+    }
+
+    #[test]
+    fn history_is_the_rounds_finished_reviews_took() {
+        let prices = "costs: {prices: {example/glm-flash: {input_per_mtok: 1, output_per_mtok: 2}, \
+                      opus: {input_per_mtok: 5, output_per_mtok: 25}}}";
+        let cfg = config("exception", 3, 1, "", prices);
+        let fake = Fake::new(defect_in("alpha", 1));
+        let (done, _) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(done.status, Status::Confirmed);
+        let waiting = config("per-round", 3, 1, "", "");
+        let (unfinished, _) = go(&waiting, &["a.src"], &Fake::new(defect_in("alpha", 9)));
+        assert_eq!(unfinished.status, Status::Waiting);
+        let history = plan::History::of([&done, &unfinished]);
+        assert_eq!(history.runs, 1, "only a finished review counts");
+        let plan = plan::dry_run(&cfg, &change(&["a.src"]), &history).unwrap();
+        let (low, expected, worst) = (
+            plan.low_usd.unwrap(),
+            plan.expected_usd.unwrap(),
+            plan.worst_usd.unwrap(),
+        );
+        assert!(
+            low < expected && expected < worst,
+            "{low} {expected} {worst}"
+        );
+        assert_eq!(plan.history_runs, 1);
     }
 
     #[test]
@@ -1473,7 +1598,10 @@ lenses:
 
     #[test]
     fn the_report_can_be_read_by_a_machine() {
-        let top = "integrations:\n  comment: full\n  labels: {not_ready: nr, ready: rd, waiting: \"wait:{lens}\", confirmed: \"ok:{lens}\"}";
+        let top = "integrations:\n  comment: full\n  labels: {not_ready: nr, ready: rd, waiting: \"wait:{lens}\", confirmed: \"ok:{lens}\"}\n\
+                   costs: {prices: {example/glm-flash: {input_per_mtok: 0.1, output_per_mtok: 0.4}, \
+                   opus: {input_per_mtok: 5, output_per_mtok: 25}}, \
+                   per_call: {reviewer: {input_tokens: 1000, output_tokens: 500}}}";
         let cfg = config("exception", 2, 1, "", top);
         let fake = Fake::new(defect_in("alpha", 99));
         let (run, _) = go(&cfg, &["a.src"], &fake);
@@ -1491,8 +1619,15 @@ lenses:
             used.iter()
                 .any(|b| b["role"] == "reviewer" && b["binding"] == "glm-flash-high")
         );
-        assert!(json["tokens_estimated"].as_u64().unwrap() > 0);
-        assert!(json["usd_estimated"].as_f64().unwrap() > 0.0);
+        assert!(json["tokens"].as_u64().unwrap() > 0);
+        assert!(json["usd"].as_f64().unwrap() > 0.0);
+        assert_eq!(json["calls_measured"], 0);
+        assert_eq!(json["agent_usd"], serde_json::Value::Null);
+        // A real call counts what the config says its role takes, too.
+        for u in run.usage.iter().filter(|u| u.role == Role::Reviewer) {
+            assert!(u.tokens_in >= 1000 && u.tokens_out >= 500, "{u:?}");
+        }
+        assert!(run.usage.iter().all(|u| u.usd.is_some()));
         let labels = report::labels(&run, &cfg);
         assert!(labels.contains(&"nr".to_string()));
         assert!(labels.contains(&"wait:alpha".to_string()));

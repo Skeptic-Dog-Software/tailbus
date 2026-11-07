@@ -602,6 +602,7 @@ mod tests {
             stderr_tail: None,
             applied: None,
             full_reply: Some(ext.attachments[0].sha256.clone()),
+            usage: None,
         });
         let draft = Draft {
             reply_to: Some(new_id()),

@@ -484,6 +484,40 @@ Rejected: asking the receiving bus what it supports before sending. It costs
 a round trip on every message, and the answer can be out of date by the time
 it's used. A route that isn't there can't be.
 
+#### What a run used
+
+Added 2026-11-07, so costs needn't be guessed. The text ACR sends a reviewer
+is a small part of what it uses. A trivial prompt through omp took 2,721
+input tokens, all system prompt and tool definitions, where the text came to
+about 8.
+
+- **The agent's record, not the gateway's.** omp writes a JSON line to its
+  session for each model call, with its tokens, cache reads and writes,
+  thinking, and its own price. The bridge already gives each run a session
+  directory, so it reads that before the directory goes. A gateway's logs
+  would need its credentials, and a way to tell one run's calls from
+  another's.
+- **Told where, not built in.** `[bridges.<agent>.usage]` names the files and
+  dotted paths to each number, so another agent's format needs config, not
+  code.
+- **Only what a run adds.** A session kept between runs is read from where
+  each file ended before the run, so nothing's counted twice.
+- **Spent is spent.** A run that fails or times out still reports its usage.
+- **The agent's word.** An agent could write anything to its session, so
+  usage is only for costs. The bridge doesn't follow links out of the
+  session, and reads at most 1,000 files.
+- **The config's price first.** ACR prices a counted call by the config, so
+  that the plan and the report agree, and keeps what the agent said beside
+  it. With no price in the config, it uses the agent's.
+- **Expected costs from history.** A plan's expected figure takes how many
+  rounds each lens took in the last 20 finished reviews of the repository,
+  or every lens's average for a new lens. A review still waiting would make
+  reviews look shorter, so it doesn't count. The most a review could cost
+  now counts the fixes between rounds, which it had left out.
+
+Rejected: `--mode json` on stdout. The reply would then have to be dug out of
+an event stream, where the session already has everything.
+
 #### omp on `server`, checked 2026-11-06 on omp 18.17.0
 
 No real model: a stand-in on `127.0.0.1` returned canned text.
@@ -1142,6 +1176,19 @@ with reviewers that needn't be Claude. The
 - **The Orchestrator fixes, through its bridge.** So ACR needs that bridge on
   the machine with the checkout. Every other role only reads, and must name
   its read-only tools, or the config is refused.
+- **The repository's agent sets what estimates are made from.** It knows how
+  much a reviewer reads and thinks there, and the user's config needn't
+  change for each repository. So `costs` is a repository key: prices by
+  model, and tokens each role's calls take beyond the text ACR measures.
+  A binding with its own prices in the user's config keeps them, since the
+  person paying knows their rates best. Prices change only estimates, never
+  what runs or what's allowed.
+  - *Why per call by role:* bridges don't report usage. The text ACR sends
+    is a small part of what a reviewer with `read` and `grep` takes in, and
+    high effort writes tokens nobody sees, so counting the text alone
+    undercounts by far.
+  - *Rejected:* a fixed multiplier in the framework. How much an agent reads
+    depends on the repository, which the framework knows nothing about.
 
 Decided here rather than left to a repository: a tier's paths must all match, so
 one source file among docs leaves the docs tier; description triggers count in a

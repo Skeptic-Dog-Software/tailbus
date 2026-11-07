@@ -1,6 +1,8 @@
 # Your ACR config, at ~/.config/tailbus/acr.yaml. Only this file can say how
-# models are reached. A repository chooses among these names. The agents, models
-# and prices here are examples: set your own.
+# models are reached. A repository chooses among these names. The agents and
+# models here are examples: set your own. A repository's `costs` prices them.
+# A binding can set input_per_mtok and output_per_mtok itself, and then keeps
+# its own prices.
 version: 1
 allowed_bindings:
   glm-flash:
@@ -8,16 +10,12 @@ allowed_bindings:
     model: example/glm-flash
     tools: [read, grep, glob]
     timeout: 300
-    input_per_mtok: 0.1
-    output_per_mtok: 0.4
   glm-flash-high:
     agent: omp@server
     model: example/glm-flash
     effort: high
     tools: [read, grep, glob]
     timeout: 900
-    input_per_mtok: 0.1
-    output_per_mtok: 0.4
   opus-medium:
     agent: acr-opus@laptop
     model: opus
@@ -25,7 +23,5 @@ allowed_bindings:
     tools: [read, grep, glob]
     timeout: 900
     workdir: /Users/you/Work/the-repo
-    input_per_mtok: 5
-    output_per_mtok: 25
 defaults:
   human_gate: exception

@@ -307,6 +307,7 @@ impl Caller for BridgeCaller {
                 Ok(Answer {
                     text,
                     run_id: sent.id,
+                    usage: result.and_then(|r| r.usage.clone()),
                 })
             }
             Awaited::Undelivered { why } => bail!("{}: {why}", b.agent),
@@ -415,6 +416,28 @@ fn setting<'a>(
     })
 }
 
+/// The most earlier reviews an expected cost is taken from.
+const HISTORY_RUNS: usize = 20;
+
+/// The last finished reviews of `repo` on this machine.
+fn history(paths: &Paths, repo: &Path) -> plan::History {
+    let same = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let want = same(repo);
+    let Ok(entries) = fs::read_dir(paths.state.join("acr")) else {
+        return plan::History::default();
+    };
+    let mut runs: Vec<Run> = entries
+        .flatten()
+        .filter_map(|e| fs::read(e.path().join("run.json")).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Run>(&bytes).ok())
+        .filter(|r| matches!(r.status, Status::Confirmed | Status::Stopped))
+        .filter(|r| same(&r.repo) == want)
+        .collect();
+    runs.sort_by(|a, b| a.id.cmp(&b.id));
+    let newest = runs.len().saturating_sub(HISTORY_RUNS);
+    plan::History::of(&runs[newest..])
+}
+
 fn describe_plan(plan: &plan::Plan) {
     let how = if plan.tier_decided {
         "from its paths"
@@ -430,22 +453,80 @@ fn describe_plan(plan: &plan::Plan) {
     for lens in &plan.lenses {
         println!("  {} on {} ({:?})", lens.id, lens.binding, lens.why);
     }
-    println!("First round:");
-    for cost in &plan.first_round {
+    let tokens = |cost: &plan::RoleCost| {
         let usd = cost
             .usd
             .map_or("no price".to_string(), |u| format!("${u:.4}"));
+        let cached = match cost.cache_read {
+            0 => String::new(),
+            n => format!(", {n} read from cache,"),
+        };
+        format!(
+            "about {} tokens in{cached} and {} out, {usd}",
+            cost.tokens_in, cost.tokens_out
+        )
+    };
+    println!("First round:");
+    for cost in &plan.first_round {
         println!(
-            "  {} on {}: {} call(s), about {} tokens, {usd}",
+            "  {} on {}: {} call(s), {}",
             cost.role.as_str(),
             cost.binding,
             cost.calls,
-            cost.tokens
+            tokens(cost)
         );
     }
-    match plan.worst_usd {
-        Some(usd) => println!("At most, through every round: about ${usd:.4}"),
-        None => println!("At most: can't say, since a binding has no prices"),
+    if let Some(fix) = &plan.fix {
+        println!(
+            "Each fix between rounds: orchestrator on {}, {}",
+            fix.binding,
+            tokens(fix)
+        );
+    }
+    let dollars = |usd: Option<f64>| {
+        usd.map_or(
+            "can't say, since a binding has no prices".to_string(),
+            |u| format!("about ${u:.4}"),
+        )
+    };
+    println!("Cost:");
+    println!(
+        "  At least, with every lens done in one round: {}",
+        dollars(plan.low_usd)
+    );
+    match (plan.history_runs, plan.expected_usd) {
+        (0, _) => {
+            println!("  Expected: can't say yet, with no finished reviews of this repository here")
+        }
+        (n, usd) => println!(
+            "  Expected, from the last {n} finished review(s) here: {}",
+            dollars(usd)
+        ),
+    }
+    println!(
+        "  At most, with every lens through every round and a fix between: {}",
+        dollars(plan.worst_usd)
+    );
+    if !plan.unpriced.is_empty() {
+        println!(
+            "No price for {}: add it under costs.prices",
+            plan.unpriced.join(", ")
+        );
+    }
+    if plan.per_call.is_empty() {
+        println!(
+            "These count only the text ACR sends and reads back. What an agent's tools read and \
+             what it thinks add more: set costs.per_call to count them."
+        );
+    }
+    for (role, extra) in &plan.per_call {
+        println!(
+            "Each {} call adds {} tokens in, {} read from cache and {} out, by costs.per_call",
+            role.as_str(),
+            extra.input_tokens,
+            extra.cache_read_tokens,
+            extra.output_tokens
+        );
     }
     for e in &plan.escalates {
         println!("Escalates: {e}");
@@ -478,7 +559,7 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
         AcrCmd::Plan { target, json } => {
             let (cfg, source) = load_config(paths, &target, &flags(&target))?;
             let change = reload(&cfg, &target.repo, &target.base, target.head.as_deref())?;
-            let plan = plan::dry_run(&cfg, &change)?;
+            let plan = plan::dry_run(&cfg, &change, &history(paths, &target.repo))?;
             if !json && let Source::File(file) = &source {
                 println!("Config: {}", file.display());
             }

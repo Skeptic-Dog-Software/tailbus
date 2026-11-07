@@ -166,6 +166,7 @@ fn show(item: &Item, args: &Args) -> Result<u8> {
             "duration_ms": result.map(|r| r.duration_ms),
             "stderr_tail": result.and_then(|r| r.stderr_tail.as_deref()),
             "applied": result.and_then(|r| r.applied.as_ref()),
+            "usage": result.and_then(|r| r.usage.as_ref()),
             "body": msg.body,
             "attachments": msg.attachments(),
         });
@@ -199,6 +200,19 @@ fn show(item: &Item, args: &Args) -> Result<u8> {
             r.duration_ms,
             serde_json::to_string(&r.applied)?
         );
+        if let Some(u) = &r.usage {
+            let usd = u
+                .usd
+                .map_or(String::new(), |usd| format!(", ${usd:.4} by its count"));
+            eprintln!(
+                "tailbus: used {} model call(s): {} tokens in ({} read from cache, {} written to it), {} out{usd}",
+                u.calls,
+                u.input_tokens + u.cache_read_tokens + u.cache_write_tokens,
+                u.cache_read_tokens,
+                u.cache_write_tokens,
+                u.output_tokens
+            );
+        }
     }
     Ok(code)
 }

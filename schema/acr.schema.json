@@ -90,9 +90,51 @@
         "reviewer": {"type": "string"},
         "judge": {"type": "string"}
       }
+    },
+    "costs": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What estimates are made from. A binding that sets its own prices in the user's config keeps them",
+      "properties": {
+        "prices": {
+          "type": "object",
+          "description": "US dollars per million tokens, by model, or by binding name for a binding that names no model",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["input_per_mtok", "output_per_mtok"],
+            "properties": {
+              "input_per_mtok": {"type": "number", "minimum": 0},
+              "output_per_mtok": {"type": "number", "minimum": 0},
+              "cached_input_per_mtok": {"type": "number", "minimum": 0, "description": "Input read from a cache. Left out, it costs what other input does"},
+              "cache_write_per_mtok": {"type": "number", "minimum": 0, "description": "Input written to a cache. Left out, it costs what other input does"}
+            }
+          }
+        },
+        "per_call": {
+          "type": "object",
+          "description": "Tokens each call by a role takes beyond the text ACR sends it and reads back: what its tools read, its turns, its thinking",
+          "additionalProperties": false,
+          "properties": {
+            "sizer": {"$ref": "#/$defs/per_call"},
+            "orchestrator": {"$ref": "#/$defs/per_call"},
+            "reviewer": {"$ref": "#/$defs/per_call"},
+            "judge": {"$ref": "#/$defs/per_call"}
+          }
+        }
+      }
     }
   },
   "$defs": {
+    "per_call": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "cache_read_tokens": {"type": "integer", "minimum": 0},
+        "output_tokens": {"type": "integer", "minimum": 0}
+      }
+    },
     "id": {"type": "string", "pattern": "^[a-z0-9-]+$"},
     "strings": {"type": "array", "items": {"type": "string"}},
     "action": {"enum": ["blocks", "blocks-unless-waived", "never-blocks", "drop"]}

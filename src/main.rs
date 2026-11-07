@@ -17,6 +17,7 @@ mod mcp;
 mod net;
 mod permission;
 mod proto;
+mod run_usage;
 mod setup;
 mod store;
 mod tailscale;
