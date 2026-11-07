@@ -145,6 +145,43 @@ pub struct Lens {
     /// What a severity does in this lens, if not its default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub severity: BTreeMap<Severity, Action>,
+    /// This lens's reviewers get generated files in the diff too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_generated: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Generated files, which the diff a review sends leaves out, listing each
+/// with its line counts. Reviewers can still read them in the repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Generated {
+    /// Leave generated files out. On unless a config turns it off.
+    #[serde(default = "yes")]
+    pub exclude: bool,
+    /// A file whose first lines carry a generated-code marker is generated.
+    #[serde(default = "yes")]
+    pub markers: bool,
+    /// More paths that are generated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Paths never treated as generated, whatever says they are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keep: Vec<String>,
+}
+
+impl Default for Generated {
+    fn default() -> Generated {
+        Generated {
+            exclude: true,
+            markers: true,
+            paths: Vec::new(),
+            keep: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -201,6 +238,8 @@ pub struct Policy {
     pub review_scope: Option<ReviewScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrations: Option<Integrations>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<Generated>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings: BTreeMap<Role, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -293,6 +332,7 @@ impl Policy {
         self.always_escalate = later.always_escalate.or(self.always_escalate);
         self.review_scope = later.review_scope.or(self.review_scope);
         self.integrations = later.integrations.or(self.integrations);
+        self.generated = later.generated.or(self.generated);
         self.bindings.extend(later.bindings);
         self.costs = match (self.costs, later.costs) {
             (Some(costs), Some(later)) => Some(costs.over(later)),
@@ -371,6 +411,8 @@ pub struct Config {
     pub always_escalate: Vec<String>,
     pub review_scope: ReviewScope,
     pub integrations: Integrations,
+    #[serde(default)]
+    pub generated: Generated,
     pub bindings: BTreeMap<Role, String>,
     pub allowed_bindings: BTreeMap<String, Binding>,
     #[serde(default)]
@@ -446,6 +488,7 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         always_escalate: merged.always_escalate.unwrap_or_default(),
         review_scope: merged.review_scope.expect("set by the framework"),
         integrations: merged.integrations.unwrap_or_default(),
+        generated: merged.generated.unwrap_or_default(),
         bindings: merged.bindings,
         allowed_bindings: user.allowed_bindings.clone(),
         costs: merged.costs.unwrap_or_default(),
@@ -536,6 +579,8 @@ impl Config {
                 bail!("{whose} requires lens {id}, which doesn't exist");
             }
         }
+        check_globs(&self.generated.paths, "generated.paths")?;
+        check_globs(&self.generated.keep, "generated.keep")?;
         if let Some(labels) = self.integrations.labels.as_ref() {
             for (key, value) in [
                 ("waiting", &labels.waiting),
@@ -1094,6 +1139,7 @@ mod tests {
             always_escalate: Some(Vec::new()),
             review_scope: Some(ReviewScope::WholePr),
             integrations: Some(Integrations::default()),
+            generated: Some(Generated::default()),
             bindings: BTreeMap::from([(Role::Judge, "x".to_string())]),
             costs: Some(Costs::default()),
         })

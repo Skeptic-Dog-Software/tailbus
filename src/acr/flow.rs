@@ -352,11 +352,37 @@ fn ask(
     Ok(answer.text)
 }
 
-fn write_artifact(s: &Setting, change: &Change, round: u32) -> Result<PathBuf> {
+/// A round's diff, as files reviewers are sent.
+pub struct Artifacts {
+    /// Without generated files, which it lists.
+    pub diff: PathBuf,
+    /// Everything, when generated files were left out.
+    pub full: Option<PathBuf>,
+}
+
+impl Artifacts {
+    /// The diff a lens's reviewers get.
+    fn for_lens(&self, lens: &Lens) -> &Path {
+        match (&self.full, lens.include_generated) {
+            (Some(full), true) => full,
+            _ => &self.diff,
+        }
+    }
+}
+
+fn write_artifact(s: &Setting, change: &Change, round: u32) -> Result<Artifacts> {
     fs::create_dir_all(&s.work_dir)?;
-    let path = s.work_dir.join(format!("round-{round}.diff"));
-    fs::write(&path, &change.diff)?;
-    Ok(path)
+    let diff = s.work_dir.join(format!("round-{round}.diff"));
+    fs::write(&diff, &change.diff)?;
+    let full = match &change.full {
+        Some(text) => {
+            let path = s.work_dir.join(format!("round-{round}.full.diff"));
+            fs::write(&path, text)?;
+            Some(path)
+        }
+        None => None,
+    };
+    Ok(Artifacts { diff, full })
 }
 
 /// The tier: from paths if they settle it, or else the Sizer's, and higher
@@ -498,9 +524,9 @@ pub fn start(
         disagreements: Vec::new(),
         usage: Vec::new(),
     };
-    let artifact = write_artifact(s, change, 0)?;
-    choose_tier(&mut run, s, change, caller, &artifact)?;
-    choose_lenses(&mut run, s, change, caller, &artifact)?;
+    let artifacts = write_artifact(s, change, 0)?;
+    choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
+    choose_lenses(&mut run, s, change, caller, &artifacts.diff)?;
     if let Some(why) = plan::config_escalation(s.cfg, change) {
         escalate(&mut run, why);
     }
@@ -523,7 +549,7 @@ fn attack(
     run: &mut Run,
     s: &Setting,
     caller: &dyn Caller,
-    artifact: &Path,
+    artifacts: &Artifacts,
 ) -> Result<BTreeMap<String, Vec<Result<Vec<Raw>>>>> {
     let cfg = s.cfg;
     let scope = match run.head.as_deref() {
@@ -550,6 +576,7 @@ fn attack(
             .iter()
             .map(|(lens, prompt)| {
                 scope.spawn(move || -> Result<(Usage, Vec<Raw>)> {
+                    let artifact = artifacts.for_lens(lens);
                     let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
                     let binding = cfg.binding(Role::Reviewer, Some(lens))?;
                     let call = Call {
@@ -634,8 +661,8 @@ fn rate(run: &mut Run, cfg: &Config, lens: &Lens, ratings: Vec<roles::Rating>) -
 /// what's next. Judging stays out of the orchestration's context.
 fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller) -> Result<()> {
     let cfg = s.cfg;
-    let artifact = write_artifact(s, change, run.round)?;
-    let reviews = attack(run, s, caller, &artifact)?;
+    let artifacts = write_artifact(s, change, run.round)?;
+    let reviews = attack(run, s, caller, &artifacts)?;
     for (id, results) in reviews {
         let lens = lens_of(cfg, &id)?;
         let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
@@ -1057,6 +1084,7 @@ lenses:
         Change {
             files: files.iter().map(|f| f.to_string()).collect(),
             diff: "+let x = 1;\n".to_string(),
+            ..Change::default()
         }
     }
 
@@ -1229,6 +1257,22 @@ lenses:
         assert!(run.lenses.values().all(|l| l.outcome == Outcome::Confirmed));
         assert_eq!(fake.count(Role::Reviewer), 2);
         assert_eq!(fake.count(Role::Judge), 0, "nothing to judge");
+    }
+
+    #[test]
+    fn a_lens_that_takes_generated_files_gets_the_whole_diff() {
+        let cfg = plain("exception", 1, 1);
+        let s = setting(&cfg);
+        let mut c = change(&["a.src"]);
+        let lean = write_artifact(&s, &c, 1).unwrap();
+        assert!(lean.full.is_none());
+        c.full = Some("the whole diff".into());
+        let both = write_artifact(&s, &c, 2).unwrap();
+        let mut lens = cfg.lenses[0].clone();
+        assert_eq!(both.for_lens(&lens), both.diff.as_path());
+        lens.include_generated = true;
+        let whole = both.for_lens(&lens);
+        assert_eq!(fs::read_to_string(whole).unwrap(), "the whole diff");
     }
 
     #[test]

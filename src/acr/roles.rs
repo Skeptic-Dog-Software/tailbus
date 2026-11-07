@@ -231,6 +231,7 @@ mod tests {
             triggers: Default::default(),
             binding: None,
             severity: Default::default(),
+            include_generated: false,
         };
         let brief = reviewer_prompt(&lens, "the whole change", "- decided thing");
         for part in [

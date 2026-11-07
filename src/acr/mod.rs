@@ -226,7 +226,7 @@ fn this_machine(paths: &Paths) -> Result<String> {
 }
 
 fn reload(cfg: &Config, repo: &Path, base: &str, head: Option<&str>) -> Result<Change> {
-    change::load(repo, base, head, cfg.review_scope)
+    change::load(repo, base, head, cfg.review_scope, &cfg.generated)
 }
 
 /// Reaches models through bridges, as `tailbus call` does. Each call is a
@@ -458,6 +458,19 @@ fn describe_plan(plan: &plan::Plan) {
         plan.tier, plan.fan_out
     );
     println!("Files: {}", plan.files);
+    if !plan.generated.is_empty() {
+        let added: u64 = plan.generated.iter().map(|g| g.added).sum();
+        let removed: u64 = plan.generated.iter().map(|g| g.removed).sum();
+        println!(
+            "Generated, left out of what reviewers get: {} file(s), +{}/-{} lines",
+            plan.generated.len(),
+            thousands(added),
+            thousands(removed)
+        );
+        for g in &plan.generated {
+            println!("  {} (+{} -{}): {}", g.path, g.added, g.removed, g.why);
+        }
+    }
     println!("Lenses:");
     for lens in &plan.lenses {
         println!("  {} on {} ({:?})", lens.id, lens.binding, lens.why);

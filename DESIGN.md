@@ -518,6 +518,15 @@ about 8.
   a commit under review must be checked out, clean, or the run refuses.
   - *Rejected:* a snapshot of the commit sent to a reviewer elsewhere. It
     copies the code off its machine.
+- **Generated files are left out, never hidden.** A regenerated file can
+  be most of a diff, and every reviewer would read it. So the diff a review
+  sends lists each one with its line counts instead, and reviewers can open
+  it in the repository. Detection is by convention, not by language: a
+  generator's marker in a file's first lines, or `linguist-generated`, so
+  the framework still knows no file types. A lens that has to see them,
+  such as one on migrations, takes `include_generated`.
+  - *Fixed with it:* the plan priced every Judge call as reading the whole
+    diff, which it never got.
 - **No model of its own.** The framework names no binding, model or
   provider, and a test fails if one appears in its code. Every role's
   binding comes from the user's or the repository's config, or a flag.

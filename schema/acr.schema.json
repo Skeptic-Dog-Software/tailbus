@@ -53,6 +53,7 @@
             }
           },
           "binding": {"type": "string"},
+          "include_generated": {"type": "boolean", "description": "This lens's reviewers get generated files in the diff too"},
           "severity": {
             "type": "object",
             "additionalProperties": false,
@@ -89,6 +90,17 @@
         "orchestrator": {"type": "string"},
         "reviewer": {"type": "string"},
         "judge": {"type": "string"}
+      }
+    },
+    "generated": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Generated files are left out of the diff a review sends, each listed with its line counts. Reviewers can still read them in the repository",
+      "properties": {
+        "exclude": {"type": "boolean", "description": "Leave generated files out. Default true"},
+        "markers": {"type": "boolean", "description": "A file whose first lines say it's generated, such as 'Code generated ... DO NOT EDIT' or '@generated', counts. Default true"},
+        "paths": {"$ref": "#/$defs/strings", "description": "More paths that are generated"},
+        "keep": {"$ref": "#/$defs/strings", "description": "Paths never treated as generated"}
       }
     },
     "costs": {

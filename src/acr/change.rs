@@ -2,18 +2,51 @@
 //! decided non-issues always come from the base, never the change, so a
 //! change can't switch off its own review.
 
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use regex::Regex;
+use serde::Serialize;
 
-use super::config::{REPO_CONFIG, ReviewScope};
+use super::config::{Generated, REPO_CONFIG, ReviewScope};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Change {
+    /// Every changed file, generated ones too.
     pub files: Vec<String>,
+    /// What reviewers get: the diff without generated files, which are
+    /// listed at its top.
     pub diff: String,
+    /// The whole diff, when files were left out, for a lens that reads them.
+    pub full: Option<String>,
+    pub generated: Vec<LeftOut>,
 }
+
+/// A generated file left out of the diff a review sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LeftOut {
+    pub path: String,
+    pub added: u64,
+    pub removed: u64,
+    /// What says it's generated.
+    pub why: String,
+}
+
+/// How generated files say so in their first lines, by the common
+/// conventions of code generators. Nothing here is any one language's.
+static MARKER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)@generated\b|\bgenerated\b.*\bdo not (edit|modify)\b|\bdo not (edit|modify)\b.*\bgenerated\b",
+    )
+    .expect("a valid pattern")
+});
+/// How far into a file its marker can be.
+const MARKER_LINES: usize = 5;
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -92,7 +125,13 @@ fn bottom_of_stack(repo: &Path, base: &str, head: &str) -> Result<Option<String>
 }
 
 /// The change from `base` to `head`, or to the working tree with no `head`.
-pub fn load(repo: &Path, base: &str, head: Option<&str>, scope: ReviewScope) -> Result<Change> {
+pub fn load(
+    repo: &Path,
+    base: &str,
+    head: Option<&str>,
+    scope: ReviewScope,
+    generated: &Generated,
+) -> Result<Change> {
     let head = match (scope, head) {
         (ReviewScope::BottomOfStack, Some(head)) => {
             bottom_of_stack(repo, base, head)?.or(Some(head.to_string()))
@@ -104,14 +143,167 @@ pub fn load(repo: &Path, base: &str, head: Option<&str>, scope: ReviewScope) -> 
         None => base.to_string(),
     };
     let names = git(repo, &["diff", "--name-only", &range])?;
-    Ok(Change {
+    let change = Change {
         files: names.lines().map(str::to_string).collect(),
         diff: git(repo, &["diff", &range])?,
-    })
+        ..Change::default()
+    };
+    Ok(leave_out_generated(
+        repo,
+        head.as_deref(),
+        change,
+        generated,
+    )?)
+}
+
+fn globs(paths: &[String]) -> Result<GlobSet> {
+    let mut set = GlobSetBuilder::new();
+    for path in paths {
+        set.add(Glob::new(path)?);
+    }
+    Ok(set.build()?)
+}
+
+/// Files `.gitattributes` marks `linguist-generated`, as of `head`.
+fn linguist_generated(repo: &Path, head: Option<&str>, files: &[String]) -> Vec<String> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let mut args = vec!["check-attr"];
+    let source = head.map(|h| format!("--source={h}"));
+    if let Some(source) = &source {
+        args.push(source);
+    }
+    args.extend(["linguist-generated", "--"]);
+    args.extend(files.iter().map(String::as_str));
+    let Ok(out) = git(repo, &args) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|l| l.rsplit_once(": linguist-generated: "))
+        .filter(|(_, v)| matches!(*v, "set" | "true"))
+        .map(|(p, _)| p.to_string())
+        .collect()
+}
+
+/// A file's first lines, as of `head`, or in the working tree.
+fn first_lines(repo: &Path, head: Option<&str>, path: &str) -> String {
+    let text = match head {
+        Some(head) => git(repo, &["show", &format!("{head}:{path}")]).unwrap_or_default(),
+        None => {
+            let Ok(file) = File::open(repo.join(path)) else {
+                return String::new();
+            };
+            let lines: Vec<String> = BufReader::new(file)
+                .lines()
+                .take(MARKER_LINES)
+                .map_while(Result::ok)
+                .collect();
+            return lines.join("\n");
+        }
+    };
+    text.lines()
+        .take(MARKER_LINES)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Splits a diff into each file's part, by its `diff --git` line.
+fn per_file(diff: &str) -> Vec<(String, String)> {
+    let mut parts: Vec<(String, String)> = Vec::new();
+    for line in diff.split_inclusive('\n') {
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            let path = header
+                .trim_end()
+                .rsplit_once(" b/")
+                .map_or(header.trim_end(), |(_, b)| b)
+                .to_string();
+            parts.push((path, String::new()));
+        }
+        match parts.last_mut() {
+            Some((_, text)) => text.push_str(line),
+            None => parts.push((String::new(), line.to_string())),
+        }
+    }
+    parts
+}
+
+fn counts(part: &str) -> (u64, u64) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in part.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+/// Takes generated files out of the diff, listing each at its top. Never
+/// silently: a hand edit hidden in a generated file still shows up there.
+fn leave_out_generated(
+    repo: &Path,
+    head: Option<&str>,
+    mut change: Change,
+    rules: &Generated,
+) -> Result<Change> {
+    if !rules.exclude || change.files.is_empty() {
+        return Ok(change);
+    }
+    let (paths, keep) = (globs(&rules.paths)?, globs(&rules.keep)?);
+    let attributed = linguist_generated(repo, head, &change.files);
+    let why = |path: &str| -> Option<String> {
+        if keep.is_match(path) {
+            return None;
+        }
+        if paths.is_match(path) {
+            return Some("generated.paths".into());
+        }
+        if attributed.iter().any(|p| p == path) {
+            return Some("linguist-generated".into());
+        }
+        let marked = rules.markers && MARKER.is_match(&first_lines(repo, head, path));
+        marked.then(|| "marked generated".into())
+    };
+    let mut kept = String::new();
+    for (path, part) in per_file(&change.diff) {
+        match (!path.is_empty()).then(|| why(&path)).flatten() {
+            Some(why) => {
+                let (added, removed) = counts(&part);
+                change.generated.push(LeftOut {
+                    path,
+                    added,
+                    removed,
+                    why,
+                });
+            }
+            None => kept.push_str(&part),
+        }
+    }
+    if change.generated.is_empty() {
+        return Ok(change);
+    }
+    let mut diff = String::from(
+        "# Generated files are left out of this diff, with their lines added and removed.\n\
+         # Each is in the repository, to read if a finding needs it.\n",
+    );
+    for g in &change.generated {
+        diff.push_str(&format!(
+            "#   {} (+{} -{}): {}\n",
+            g.path, g.added, g.removed, g.why
+        ));
+    }
+    diff.push('\n');
+    diff.push_str(&kept);
+    change.full = Some(std::mem::replace(&mut change.diff, diff));
+    Ok(change)
 }
 
 impl Change {
-    /// Lines the change adds or removes, without the file headers.
+    /// Lines the change adds or removes, without the file headers or the
+    /// generated files left out.
     pub fn changed_lines(&self) -> impl Iterator<Item = &str> {
         self.diff.lines().filter(|l| {
             (l.starts_with('+') && !l.starts_with("+++"))
@@ -166,6 +358,91 @@ pub mod tests {
     }
 
     #[test]
+    fn generated_files_are_left_out_and_listed() {
+        let dir = repo_with(&[("a.txt", "one\n")]);
+        branch(&dir, "work");
+        let marked = "// GENERATED CODE - DO NOT MODIFY BY HAND\nline\nline\n";
+        let tooled = "// Code generated by some-tool. DO NOT EDIT.\n\npackage x\n";
+        commit(
+            &dir,
+            &[
+                ("a.txt", "two\n"),
+                ("lib/db.g.dart", marked),
+                ("x/pb.txt", tooled),
+                ("vendor/v.txt", "plain\n"),
+                ("data/big.csv", "1,2\n"),
+                (".gitattributes", "vendor/** linguist-generated\n"),
+            ],
+            "work",
+        );
+        let rules = Generated {
+            paths: vec!["data/**".into()],
+            ..Generated::default()
+        };
+        let c = load(&dir, "main", Some("work"), ReviewScope::WholePr, &rules).unwrap();
+        let out: Vec<(&str, &str)> = c
+            .generated
+            .iter()
+            .map(|g| (g.path.as_str(), g.why.as_str()))
+            .collect();
+        assert_eq!(
+            out,
+            [
+                ("data/big.csv", "generated.paths"),
+                ("lib/db.g.dart", "marked generated"),
+                ("vendor/v.txt", "linguist-generated"),
+                ("x/pb.txt", "marked generated"),
+            ]
+        );
+        let db = c
+            .generated
+            .iter()
+            .find(|g| g.path == "lib/db.g.dart")
+            .unwrap();
+        assert_eq!((db.added, db.removed), (3, 0));
+        // Listed at the top, never dropped silently, and still changed files.
+        assert!(
+            c.diff
+                .contains("#   lib/db.g.dart (+3 -0): marked generated")
+        );
+        assert!(!c.diff.contains("+line"));
+        assert!(c.diff.contains("+two"));
+        assert!(c.full.as_ref().unwrap().contains("+line"));
+        assert_eq!(c.files.len(), 6);
+        assert!(!c.changed_lines().any(|l| l.contains("GENERATED")));
+        // A repository can keep one, or turn it all off.
+        let keep = Generated {
+            keep: vec!["lib/**".into()],
+            ..Generated::default()
+        };
+        let kept = load(&dir, "main", Some("work"), ReviewScope::WholePr, &keep).unwrap();
+        assert!(kept.generated.iter().all(|g| g.path != "lib/db.g.dart"));
+        let off = Generated {
+            exclude: false,
+            ..Generated::default()
+        };
+        let all = load(&dir, "main", Some("work"), ReviewScope::WholePr, &off).unwrap();
+        assert!(all.generated.is_empty() && all.full.is_none());
+        let no_markers = Generated {
+            markers: false,
+            ..Generated::default()
+        };
+        let plain = load(
+            &dir,
+            "main",
+            Some("work"),
+            ReviewScope::WholePr,
+            &no_markers,
+        )
+        .unwrap();
+        assert_eq!(plain.generated.len(), 1, "only linguist-generated");
+        // The working tree is read the same way.
+        let tree = load(&dir, "main", None, ReviewScope::WholePr, &rules).unwrap();
+        assert_eq!(tree.generated.len(), 4);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_reviewed_commit_must_be_what_is_checked_out() {
         let dir = repo_with(&[("a.txt", "one\n")]);
         branch(&dir, "change");
@@ -213,13 +490,34 @@ pub mod tests {
         branch(&repo, "work");
         commit(&repo, &[("b.txt", "two\n")], "first of the stack");
         commit(&repo, &[("c.txt", "three\n")], "second of the stack");
-        let whole = load(&repo, "main", Some("work"), ReviewScope::WholePr).unwrap();
+        let whole = load(
+            &repo,
+            "main",
+            Some("work"),
+            ReviewScope::WholePr,
+            &Generated::default(),
+        )
+        .unwrap();
         assert_eq!(whole.files, ["b.txt", "c.txt"]);
-        let bottom = load(&repo, "main", Some("work"), ReviewScope::BottomOfStack).unwrap();
+        let bottom = load(
+            &repo,
+            "main",
+            Some("work"),
+            ReviewScope::BottomOfStack,
+            &Generated::default(),
+        )
+        .unwrap();
         assert_eq!(bottom.files, ["b.txt"]);
         assert_eq!(bottom.changed_lines().collect::<Vec<_>>(), ["+two"]);
         fs::write(repo.join("a.txt"), "changed\n").unwrap();
-        let tree = load(&repo, "main", None, ReviewScope::WholePr).unwrap();
+        let tree = load(
+            &repo,
+            "main",
+            None,
+            ReviewScope::WholePr,
+            &Generated::default(),
+        )
+        .unwrap();
         assert!(tree.files.contains(&"a.txt".to_string()));
     }
 }

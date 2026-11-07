@@ -588,6 +588,27 @@ subscription, and for the calls billed in dollars, `usd` by the config's
 prices and `agent_usd`, what the agents said. A price for a
 model none of your bindings use is an error, so a misspelt one is caught.
 
+**Generated files** are left out of the diff reviewers get, by default.
+Each is listed at the diff's top with its lines added and removed, so a hand
+edit hidden in one still shows, and reviewers can read it in the repository.
+A file is generated if `.gitattributes` marks it `linguist-generated`, or its
+first lines carry a generator's marker, such as `Code generated ... DO NOT
+EDIT`, `GENERATED CODE - DO NOT MODIFY` or `@generated`. That includes
+lockfiles that say so. A repository's `generated` can add paths, `keep`
+some, turn off `markers`, or set `exclude: false`. A lens with
+`include_generated: true` gets the whole diff. `tailbus acr plan` lists what
+it left out.
+
+```yaml
+generated:
+  paths: ["lib/gen/**"]   # also generated
+  keep: ["Cargo.lock"]    # never left out
+lenses:
+  - id: migrations
+    include_generated: true
+    ...
+```
+
 **One machine.** tailbus carries messages between machines, but ACR runs on
 one: every binding it uses must reach an agent on the machine with the code,
 or it refuses to start. Every call runs in the repository, so reviewers read

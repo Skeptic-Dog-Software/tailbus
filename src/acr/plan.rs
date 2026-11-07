@@ -9,7 +9,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use super::change::Change;
+use super::change::{Change, LeftOut};
 use super::config::{Binding, Config, Lens, PerCall, Role, Tier};
 use super::flow::{Run, Status, Usage};
 
@@ -194,6 +194,8 @@ pub struct Plan {
     /// What the config says each call by a role adds, for the roles above.
     pub per_call: Vec<(Role, PerCall)>,
     pub escalates: Vec<String>,
+    /// Generated files left out of the diff reviewers get.
+    pub generated: Vec<LeftOut>,
 }
 
 /// One call's tokens and dollars.
@@ -372,7 +374,13 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
             binding: cfg.binding_name(Role::Reviewer, Some(lens))?.to_string(),
         });
     }
+    // What reviewers read: the diff without generated files, unless their
+    // lens takes those too.
     let artifact = tokens_in(change.diff.len()) + BRIEF_TOKENS;
+    let whole = change
+        .full
+        .as_ref()
+        .map_or(artifact, |full| tokens_in(full.len()) + BRIEF_TOKENS);
     let fan_out = u64::from(tier.fan_out);
     let needs_orchestrator = chosen.iter().any(|(_, w)| matches!(w, Why::Description(_)))
         || !cfg.always_escalate.is_empty();
@@ -411,9 +419,21 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
     )?;
     let mut reviewers = Vec::new();
     for (lens, _) in &chosen {
-        reviewers.push(role_cost(Role::Reviewer, Some(lens), fan_out, artifact)?);
+        let reads = if lens.include_generated {
+            whole
+        } else {
+            artifact
+        };
+        reviewers.push(role_cost(Role::Reviewer, Some(lens), fan_out, reads)?);
     }
-    let judges = role_cost(Role::Judge, None, chosen.len() as u64, artifact)?;
+    // A Judge reads its lens's findings, one list from each reviewer, not
+    // the change.
+    let judges = role_cost(
+        Role::Judge,
+        None,
+        chosen.len() as u64,
+        BRIEF_TOKENS + fan_out * ANSWER_TOKENS,
+    )?;
     // A fix is told the findings, not the whole change.
     let fix = (cfg.max_rounds > 1)
         .then(|| role_cost(Role::Orchestrator, None, 1, BRIEF_TOKENS))
@@ -502,6 +522,7 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
         unpriced,
         per_call,
         escalates,
+        generated: change.generated.clone(),
     })
 }
 
@@ -522,6 +543,7 @@ mod tests {
         Change {
             files: files.iter().map(|f| f.to_string()).collect(),
             diff: diff.to_string(),
+            ..Change::default()
         }
     }
 
@@ -706,6 +728,44 @@ mod tests {
         let plan = dry(&cfg, &change(&["a.go"], "+x\n")).unwrap();
         assert_eq!(plan.most.usd, None);
         assert!(plan.least.tokens > 0 && plan.most.tokens > plan.least.tokens);
+    }
+
+    #[test]
+    fn a_lens_is_priced_on_the_diff_it_gets_and_a_judge_on_findings() {
+        let mut cfg = example();
+        cfg.costs.per_call.clear();
+        let small = "+x\n".to_string();
+        let big = format!("+x\n{}", "+generated line\n".repeat(4000));
+        let mut go = change(&["a.go"], &small);
+        go.full = Some(big.clone());
+        let lean = dry(&cfg, &go).unwrap();
+        let everything = dry(&cfg, &change(&["a.go"], &big)).unwrap();
+        let reviewer_in = |p: &Plan| -> u64 {
+            p.first_round
+                .iter()
+                .filter(|c| c.role == Role::Reviewer)
+                .map(|c| c.tokens_in)
+                .sum()
+        };
+        assert!(reviewer_in(&lean) < reviewer_in(&everything));
+        // A Judge's input doesn't grow with the change.
+        let judge_in = |p: &Plan| {
+            p.first_round
+                .iter()
+                .find(|c| c.role == Role::Judge)
+                .unwrap()
+                .tokens_in
+        };
+        assert_eq!(judge_in(&lean), judge_in(&everything));
+        // A lens that takes generated files is priced on all of it.
+        let id = lean.lenses[0].id.clone();
+        cfg.lenses
+            .iter_mut()
+            .find(|l| l.id == id)
+            .unwrap()
+            .include_generated = true;
+        let opted = dry(&cfg, &go).unwrap();
+        assert!(reviewer_in(&opted) > reviewer_in(&lean));
     }
 
     #[test]
