@@ -514,7 +514,9 @@ about 8.
 - **One machine.** ACR's reviewers read the code where it is, never a
   copy, so every binding must reach an agent on the machine with the
   repository, and every call runs in it. tailbus still carries messages
-  between machines; ACR doesn't use that. A reviewer reads the checkout, so
+  between machines; ACR doesn't use that, and both ends check: ACR won't
+  start with a binding elsewhere, and a bridge refuses a request marked as
+  a review from another machine. A reviewer reads the checkout, so
   a commit under review must be checked out, clean, or the run refuses.
   - *Rejected:* a snapshot of the commit sent to a reviewer elsewhere. It
     copies the code off its machine.

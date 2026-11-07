@@ -366,6 +366,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     model,
                     effort,
                     log: None,
+                    review: None,
                 },
                 attach,
                 timeout,

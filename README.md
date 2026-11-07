@@ -354,6 +354,7 @@ models = ["some/other-model"]
 | `model` | `options.models`, and `model` | Needs `{MODEL}` in `args`. |
 | `effort` | `options.efforts`, with `{EFFORT}` in `options.effort_args` | How hard it thinks, such as `high`. The arguments are added only when a request names one. |
 | `log` | Always | `false` keeps no log of the run once it's answered, for a caller that keeps its own record. |
+| `review` | Only from this machine | Marks a request as part of an ACR review, which a bridge refuses from another machine. ACR sets it. |
 
 Be careful what `tools` promises. A flag such as omp's `--tools` doesn't limit
 MCP tools, so naming connectors in `options.tools` means the agent has to
@@ -612,7 +613,8 @@ lenses:
 
 **One machine.** tailbus carries messages between machines, but ACR runs on
 one: every binding it uses must reach an agent on the machine with the code,
-or it refuses to start. Every call runs in the repository, so reviewers read
+or it refuses to start, and a bridge refuses a review from another machine.
+Other machines can still ask a bridge anything else. Every call runs in the repository, so reviewers read
 the code itself, with their read-only tools, and nothing is copied. The
 bridge must list the repository in `options.workdirs`. Reviewers read the
 checkout, so a review of a commit (`--head`) needs that commit checked out

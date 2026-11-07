@@ -312,6 +312,8 @@ impl Caller for BridgeCaller {
             effort: b.effort.clone(),
             // A review keeps its own record, and leaves nothing behind.
             log: Some(false),
+            // And runs on one machine, which the bridge checks too.
+            review: Some(true),
         };
         let mut attachments = Vec::new();
         if let Some(path) = call.artifact {

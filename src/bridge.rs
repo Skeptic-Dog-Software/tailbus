@@ -505,6 +505,11 @@ fn read_secret(name: &str, path: &Path) -> Result<String> {
 /// what's meant to be fixed, such as a system prompt. It's one pass, so
 /// nothing from a message is read as a template. Anything else in braces
 /// stays as it is.
+/// The machine part of `name@machine`.
+fn machine_of(address: &str) -> &str {
+    address.split_once('@').map_or("", |(_, m)| m)
+}
+
 fn expand(template: &str, vars: &[(&str, &str)]) -> Result<String> {
     fill(template, vars, true)
 }
@@ -1514,14 +1519,19 @@ impl Bridge {
         self.log(format!("request {} from {}", msg.id, msg.from));
         // A /pipe task needs its plan approved before work starts, which a
         // single run can't do.
+        let options = msg.ext.as_ref().and_then(|e| e.options.as_ref());
+        // A review runs on one machine. Other machines may ask anything else.
+        let elsewhere = machine_of(&msg.from) != machine_of(&msg.to);
         let plan = match &msg.pipe {
             Some(pipe) => Err(format!(
                 "it answers plain requests, not /pipe steps (this was a {})",
                 pipe.stage.as_str()
             )),
-            None => self
-                .cfg
-                .plan(msg.ext.as_ref().and_then(|e| e.options.as_ref())),
+            None if elsewhere && options.and_then(|o| o.review) == Some(true) => Err(format!(
+                "ACR runs on one machine, and this review is from {}",
+                machine_of(&msg.from)
+            )),
+            None => self.cfg.plan(options),
         };
         let plan = match plan {
             Ok(plan) => plan,
@@ -3185,6 +3195,7 @@ mod tests {
             model: some("m2"),
             effort: some("high"),
             log: None,
+            review: None,
         })
         .unwrap();
         assert_eq!(narrowed.tools, tools);
@@ -4028,6 +4039,60 @@ mod tests {
         assert!(dir.exists());
         let bridge = rig.start(rig.settings("echo out", "log_retention_days = 0"));
         until("the log to go", || (!dir.exists()).then_some(()));
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_review_runs_only_for_this_machine() {
+        let rig = Rig::new();
+        let bridge = rig.start(rig.settings(r#"touch "$HOME/ran"; echo hi"#, ""));
+        let review = || {
+            with(RunOptions {
+                review: Some(true),
+                ..RunOptions::default()
+            })
+        };
+        // This machine's review runs.
+        let id = rig.ask_with(review());
+        assert_eq!(
+            rig.reply_item(&id).msg.result().unwrap().status,
+            RunStatus::Ok
+        );
+        fs::remove_file(rig.home("ran")).unwrap();
+        // Another machine's doesn't.
+        let msg = Message {
+            id: new_id(),
+            from: "acr@elsewhere".into(),
+            to: "api@here".into(),
+            body: "review this".into(),
+            reply_to: None,
+            expects_reply: true,
+            created_at: now_ms(),
+            pipe: None,
+            attended: false,
+            ext: review(),
+        };
+        rig.bus.db().store_incoming(&msg, "o", now_ms()).unwrap();
+        rig.bus.notify();
+        let meta = rig.state().join("log").join(&msg.id).join("meta.json");
+        let logged = until("the refusal", || fs::read_to_string(&meta).ok());
+        assert!(logged.contains("refused"), "{logged}");
+        assert!(
+            !rig.home("ran").exists(),
+            "a review from elsewhere never runs"
+        );
+        // Another machine can still ask anything else.
+        let mut question = msg.clone();
+        question.id = new_id();
+        question.ext = None;
+        rig.bus
+            .db()
+            .store_incoming(&question, "o", now_ms())
+            .unwrap();
+        rig.bus.notify();
+        until("the question to run", || {
+            rig.home("ran").exists().then_some(())
+        });
         bridge.stop().unwrap();
     }
 

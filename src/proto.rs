@@ -78,6 +78,10 @@ pub struct RunOptions {
     /// keeps its own record and leaves nothing behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<bool>,
+    /// Part of an ACR review, which runs on one machine: a bridge takes it
+    /// only from its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<bool>,
 }
 
 /// A file held by its hash on each bus it reaches.
