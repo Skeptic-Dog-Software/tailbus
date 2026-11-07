@@ -74,6 +74,10 @@ pub struct RunOptions {
     /// How hard the agent thinks, such as `high`, in the agent's own words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// False: keep no log of the run once it's answered, for a caller that
+    /// keeps its own record and leaves nothing behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<bool>,
 }
 
 /// A file held by its hash on each bus it reaches.

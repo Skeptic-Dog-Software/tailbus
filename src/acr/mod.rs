@@ -235,6 +235,18 @@ struct BridgeCaller {
     socket: PathBuf,
     agent: String,
     store: Attachments,
+    /// Attachments this put in the store, or got back there, to remove when
+    /// it's done: a review leaves nothing behind.
+    made: std::sync::Mutex<Vec<String>>,
+}
+
+impl Drop for BridgeCaller {
+    fn drop(&mut self) {
+        let made = std::mem::take(&mut *self.made.lock().unwrap_or_else(|e| e.into_inner()));
+        for sha in made {
+            let _ = fs::remove_file(self.store.path(&sha));
+        }
+    }
 }
 
 impl BridgeCaller {
@@ -248,11 +260,37 @@ impl BridgeCaller {
                 bus.max_attachment_bytes,
                 bus.attachment_store_bytes,
             ),
+            made: std::sync::Mutex::default(),
         })
+    }
+
+    /// Adds an attachment, noting it to remove later if it wasn't there
+    /// already, since something else might need one that was.
+    fn attach(&self, name: &str, bytes: &[u8]) -> Result<crate::proto::Attachment> {
+        use sha2::{Digest, Sha256};
+        let sha: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let there = self.store.path(&sha).exists();
+        let a = self.store.add(name, &mut &bytes[..], bytes.len() as u64)?;
+        if !there {
+            self.noted(&a.sha256);
+        }
+        Ok(a)
+    }
+
+    fn noted(&self, sha: &str) {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.push(sha.to_string());
     }
 }
 
 impl Caller for BridgeCaller {
+    fn fingerprint(&self, repo: &Path) -> Option<String> {
+        change::fingerprint(repo).ok()
+    }
+
     fn call(&self, call: &Call) -> Result<Answer> {
         let b = call.binding;
         // Fixes only from a binding the user lets write.
@@ -272,15 +310,21 @@ impl Caller for BridgeCaller {
             workdir: Some(call.repo.display().to_string()),
             model: b.model.clone(),
             effort: b.effort.clone(),
+            // A review keeps its own record, and leaves nothing behind.
+            log: Some(false),
         };
         let mut attachments = Vec::new();
         if let Some(path) = call.artifact {
-            attachments.push(self.store.add_file(path)?);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "change.diff".into());
+            let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            attachments.push(self.attach(&name, &bytes)?);
         }
         let mut body = call.prompt.to_string();
         if body.len() > MAX_BODY {
-            let size = body.len() as u64;
-            attachments.push(self.store.add("brief.txt", &mut body.as_bytes(), size)?);
+            attachments.push(self.attach("brief.txt", body.as_bytes())?);
             body = "Your brief is in the attached file brief.txt.".to_string();
         }
         let ext = Extras {
@@ -310,12 +354,15 @@ impl Caller for BridgeCaller {
                 }
                 let whole = result
                     .and_then(|r| r.full_reply.as_ref())
-                    .and_then(|sha| msg.attachments().iter().find(|a| &a.sha256 == sha))
-                    .and_then(|a| a.path.as_ref());
-                let text = match whole {
+                    .and_then(|sha| msg.attachments().iter().find(|a| &a.sha256 == sha));
+                let text = match whole.and_then(|a| a.path.as_ref()) {
                     Some(path) => fs::read_to_string(path)?,
                     None => msg.body.clone(),
                 };
+                // The bridge made it for this reply alone.
+                if let Some(a) = whole {
+                    self.noted(&a.sha256);
+                }
                 Ok(Answer {
                     text,
                     run_id: sent.id,
@@ -785,6 +832,33 @@ mod tests {
         branch(&repo, "work");
         let err = load_config(&paths(), &target(&repo, None), &Flags::default()).unwrap_err();
         assert!(format!("{err:#}").contains(REPO_CONFIG), "{err:#}");
+    }
+
+    #[test]
+    fn a_caller_removes_only_the_attachments_it_made() {
+        let paths = paths();
+        let theirs = {
+            let caller = BridgeCaller::new(&paths, None).unwrap();
+            // Someone else's, already in the store.
+            let theirs = caller
+                .store
+                .add("theirs.txt", &mut &b"shared"[..], 6)
+                .unwrap();
+            let again = caller.attach("same.txt", b"shared").unwrap();
+            assert_eq!(again.sha256, theirs.sha256);
+            let mine = caller.attach("mine.txt", b"only mine").unwrap();
+            assert!(caller.store.path(&mine.sha256).exists());
+            let mine_path = caller.store.path(&mine.sha256);
+            drop(caller);
+            assert!(!mine_path.exists(), "it leaves nothing behind");
+            theirs
+        };
+        let store = Attachments::new(paths.attachments(), 1 << 20, 1 << 30);
+        assert!(
+            store.path(&theirs.sha256).exists(),
+            "and never takes another's"
+        );
+        fs::remove_dir_all(paths.state.parent().unwrap()).unwrap();
     }
 
     #[test]

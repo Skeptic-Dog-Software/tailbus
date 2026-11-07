@@ -353,6 +353,7 @@ models = ["some/other-model"]
 | `workdir` | `options.workdirs`, and `working_directory` | A directory to run in. |
 | `model` | `options.models`, and `model` | Needs `{MODEL}` in `args`. |
 | `effort` | `options.efforts`, with `{EFFORT}` in `options.effort_args` | How hard it thinks, such as `high`. The arguments are added only when a request names one. |
+| `log` | Always | `false` keeps no log of the run once it's answered, for a caller that keeps its own record. |
 
 Be careful what `tools` promises. A flag such as omp's `--tools` doesn't limit
 MCP tools, so naming connectors in `options.tools` means the agent has to
@@ -480,7 +481,7 @@ confirmed when its latest round has no blockers. The method is in
 | Sizer | Classifies the change and picks the tier | A small, fast model: one quick call |
 | Orchestrator | Settles plain-language triggers, and fixes blockers | A strong model: few calls, and it writes |
 | Reviewer | Attacks one lens, in a fresh session with read-only tools | A mid-size model thinking hard: most of the calls |
-| Judge | Rates findings, and merges a lens's reviewers into one result | A strong model: it decides what blocks |
+| Judge | Checks findings against the code, rates them, and merges a lens's reviewers into one result. It repairs nothing, but may write and run a script, in its own scratch space, to test a claim | A strong model: it decides what blocks |
 
 tailbus names no model or provider. Each role's binding comes from
 `defaults.bindings` in your config, `bindings` in the repository's, a lens's
@@ -617,7 +618,11 @@ bridge must list the repository in `options.workdirs`. Reviewers read the
 checkout, so a review of a commit (`--head`) needs that commit checked out
 with nothing changed on top; without `--head`, it's the working tree. Only a
 binding with `writes: true` may apply an Orchestrator's fixes, and after a
-fix the review goes on from the working tree. A run is saved at each gate,
+fix the review goes on from the working tree. A Judge gets the diff its
+lens's reviewers got, and may write and run scripts under `$TMPDIR`, the
+run's own scratch space, which goes when the call ends: give its binding
+the tools for that. Nothing but an Orchestrator may change the checkout, and
+ACR checks: if it changes during a round, the round fails and escalates. A run is saved at each gate,
 not during a round, so a crash mid-round means starting over.
 
 ## How it works
@@ -632,9 +637,11 @@ not during a round, so a crash mid-round means starting over.
   the freed space back to the system, and empties SQLite's WAL file. The
   daemon's and each bridge's logs are cut back to about their last 256 KiB
   once they pass 1 MiB, and a bridge's run logs go after
-  `log_retention_days`. ACR keeps one line of history for each finished
-  review, the last 20 per repository. A finished review's diffs go when it
-  finishes, and the rest after 7 days. One left waiting goes after 30.
+  `log_retention_days`. A finished ACR review leaves nothing on disk but a
+  line of history, the last 20 per repository: its files, the attachments
+  it sent and got back, and its calls' bridge logs all go as it finishes.
+  One waiting for a person keeps its files to go on from, and goes after 30
+  days.
 - **Between machines.** Buses talk HTTP with JSON bodies on each machine's
   tailnet address, port 4747, which WireGuard encrypts. Each request is
   checked with `tailscale whois`. A message waits in the sender's outbox

@@ -105,7 +105,8 @@ pub fn reviewer_prompt(lens: &Lens, scope: &str, not_findings: &str) -> String {
         "You are the reviewer for {id}. Find what is wrong.\n\n\
          What wrong means here: {criteria}\n\n\
          Scope: {scope}. The change is the attached diff. Attack that, and nothing outside this \
-         lens. You can read, but not change anything.\n\n\
+         lens. Your working directory is the repository, as the change leaves it: read any of \
+         it you need, but change nothing.\n\n\
          Not findings, which are already decided, so leave them out:\n{decided}\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
          \"<the evidence>\", \"file\": \"<path>\", \"line\": <number>}}]}}. If you find nothing, \
@@ -159,6 +160,10 @@ struct Judged {
 pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Result<String> {
     Ok(format!(
         "Judge these findings from {n} reviewer(s) of the {id} lens. Its criteria: {criteria}\n\n\
+         The change is the attached diff, and your working directory is the repository, as the \
+         change leaves it. Check each finding against the code. Change nothing in the \
+         repository: you repair nothing. To test a claim, you may write and run a script, but \
+         only under $TMPDIR, which is yours for this call and goes when it ends.\n\n\
          Merge findings that are the same defect into one. Rate each as:\n\
          - Critical: wrong result, data loss, security hole\n\
          - High: real defect in a realistic case\n\

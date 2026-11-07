@@ -45,6 +45,12 @@ pub struct Answer {
 /// How a role reaches its model.
 pub trait Caller: Sync {
     fn call(&self, call: &Call) -> Result<Answer>;
+
+    /// What the checkout is now, to tell whether a role that may only read
+    /// changed it. None if this caller can't say.
+    fn fingerprint(&self, _repo: &Path) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +668,8 @@ fn rate(run: &mut Run, cfg: &Config, lens: &Lens, ratings: Vec<roles::Rating>) -
 fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller) -> Result<()> {
     let cfg = s.cfg;
     let artifacts = write_artifact(s, change, run.round)?;
+    // Only an Orchestrator may change the checkout.
+    let before = caller.fingerprint(&run.repo);
     let reviews = attack(run, s, caller, &artifacts)?;
     for (id, results) in reviews {
         let lens = lens_of(cfg, &id)?;
@@ -682,14 +690,22 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             }
         }
         if lists.iter().any(|l| !l.is_empty()) {
+            let diff = artifacts.for_lens(lens);
             let judged = roles::judge_prompt(lens, &lists, &s.not_findings).and_then(|prompt| {
-                let text = ask(run, s, caller, Role::Judge, &prompt, None)?;
+                let text = ask(run, s, caller, Role::Judge, &prompt, Some(diff))?;
                 roles::read_ratings(&text)
             });
             match judged {
                 Ok(ratings) => round.findings = rate(run, cfg, lens, ratings),
                 Err(e) => round.failures.push(format!("the Judge: {e:#}")),
             }
+        }
+        if before.is_some() && caller.fingerprint(&run.repo) != before {
+            round.failures.push(
+                "the repository changed during the reviewers' or the Judge's turn, and only an \
+                 Orchestrator may change it"
+                    .into(),
+            );
         }
         for failure in &round.failures {
             escalate(
@@ -1094,6 +1110,12 @@ lenses:
         calls: Mutex<Vec<(Role, String, bool, String)>>,
         /// What every call says it used, as a bridge with `usage` would.
         usage: Option<RunUsage>,
+        /// A role whose calls change the checkout, which none may but an
+        /// Orchestrator fixing.
+        tamper: Option<Role>,
+        changes: std::sync::atomic::AtomicU32,
+        /// The roles that got the change as a file.
+        with_diff: Mutex<Vec<Role>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -1102,6 +1124,9 @@ lenses:
                 answer,
                 calls: Mutex::new(Vec::new()),
                 usage: None,
+                tamper: None,
+                changes: Default::default(),
+                with_diff: Mutex::new(Vec::new()),
             }
         }
 
@@ -1119,11 +1144,26 @@ lenses:
                 call.writes,
                 call.prompt.to_string(),
             ));
+            if call.artifact.is_some() {
+                self.with_diff.lock().unwrap().push(call.role);
+            }
+            if self.tamper == Some(call.role) {
+                self.changes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             let text = (self.answer)(call.role, call.prompt)?;
             Ok(Answer {
                 text,
                 run_id: new_id(),
                 usage: self.usage.clone(),
+            })
+        }
+
+        fn fingerprint(&self, _repo: &Path) -> Option<String> {
+            self.tamper.map(|_| {
+                self.changes
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .to_string()
             })
         }
     }
@@ -1276,6 +1316,37 @@ lenses:
     }
 
     #[test]
+    fn a_judge_gets_the_diff_and_may_not_change_the_checkout() {
+        let cfg = plain("exception", 3, 1);
+        let fake = Fake::new(defect_in("alpha", 9));
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert!(fake.with_diff.lock().unwrap().contains(&Role::Judge));
+        assert!(
+            run.escalations
+                .iter()
+                .all(|e| !e.reason.contains("changed"))
+        );
+        // A Judge that writes to the repository, rather than its scratch
+        // space, fails the round and escalates.
+        let mut tampering = Fake::new(defect_in("alpha", 9));
+        tampering.tamper = Some(Role::Judge);
+        let (run, _) = go(&cfg, &["a.src"], &tampering);
+        let alpha = &run.lenses["alpha"];
+        assert_eq!(alpha.outcome, Outcome::Open);
+        assert!(
+            alpha.rounds[0]
+                .failures
+                .iter()
+                .any(|f| f.contains("only an Orchestrator"))
+        );
+        assert!(
+            run.escalations
+                .iter()
+                .any(|e| e.reason.contains("only an Orchestrator"))
+        );
+    }
+
+    #[test]
     fn a_finished_review_is_noted_once_and_tidied() {
         let cfg = plain("exception", 3, 1);
         let (run, _) = go(&cfg, &["a.src"], &Fake::new(defect_in("alpha", 1)));
@@ -1290,11 +1361,7 @@ lenses:
         fs::write(review.join("run.json"), "{}").unwrap();
         super::super::keep::finished(&paths, &run, true).unwrap();
         super::super::keep::finished(&paths, &run, true).unwrap();
-        assert!(
-            !review.join("round-1.diff").exists(),
-            "a finished review needs no diffs"
-        );
-        assert!(review.join("run.json").exists());
+        assert!(!review.exists(), "a finished review leaves nothing behind");
         let noted = super::super::keep::history(&paths, &run.repo);
         assert_eq!(noted.len(), 1, "noted once");
         assert_eq!(noted[0].lenses["alpha"], 2);

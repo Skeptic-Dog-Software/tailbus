@@ -518,6 +518,17 @@ about 8.
   a commit under review must be checked out, clean, or the run refuses.
   - *Rejected:* a snapshot of the commit sent to a reviewer elsewhere. It
     copies the code off its machine.
+- **A review leaves nothing behind.** Its files go as it finishes, with the
+  attachments it sent and got back, and it asks bridges to keep no log of
+  its calls. What's left is a line of history, for estimates. Its report is
+  printed, and posted if asked; a review waiting at a gate keeps its files,
+  since it goes on from them.
+- **A Judge checks, and never repairs.** It reads the diff and the code,
+  and may write and run a script in its run's scratch space to test a
+  claim. Only an Orchestrator may change the checkout, and a fingerprint of
+  it before and after each round catches anything else that does: the
+  round fails and escalates. That catches it; the agent's own sandbox, if
+  it has one, is what would stop it.
 - **Generated files are left out, never hidden.** A regenerated file can
   be most of a diff, and every reviewer would read it. So the diff a review
   sends lists each one with its line counts instead, and reviewers can open

@@ -91,6 +91,21 @@ pub fn name(repo: &Path) -> Result<String> {
         .context("the repository has no name")
 }
 
+/// What the checkout is now: its commit, and every change and untracked file
+/// in it. Only an Orchestrator may change it during a review.
+pub fn fingerprint(repo: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for args in [
+        &["rev-parse", "HEAD"][..],
+        &["status", "--porcelain", "--untracked-files=all"],
+        &["diff", "HEAD", "--binary"],
+    ] {
+        hash.update(git(repo, args)?.as_bytes());
+    }
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Reviewers read the checkout itself, so a commit under review must be the
 /// one checked out, with nothing changed on top. Without `head`, the review
 /// is of the working tree, which is the checkout already.
@@ -148,12 +163,7 @@ pub fn load(
         diff: git(repo, &["diff", &range])?,
         ..Change::default()
     };
-    Ok(leave_out_generated(
-        repo,
-        head.as_deref(),
-        change,
-        generated,
-    )?)
+    leave_out_generated(repo, head.as_deref(), change, generated)
 }
 
 fn globs(paths: &[String]) -> Result<GlobSet> {

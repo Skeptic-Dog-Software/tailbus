@@ -1,7 +1,8 @@
 //! What ACR keeps, and for how long. A finished review leaves a line of
-//! history, which estimates come from, and its own files go after a week.
-//! Every `tailbus acr` command cleans up first, which is cheap: a look at
-//! each review's directory, and nothing read.
+//! history, which estimates come from, and nothing else: its files go as it
+//! finishes. One waiting for a person keeps its files, to go on from. Every
+//! `tailbus acr` command first clears any left by a crash, or left waiting
+//! too long, which is cheap: a look at each directory, and nothing read.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -20,11 +21,9 @@ use crate::config::Paths;
 const HISTORY: &str = "history.jsonl";
 /// The finished reviews of each repository that history keeps.
 pub const HISTORY_RUNS: usize = 20;
-/// How long a finished review's files stay, for reading its report.
-const FINISHED: Duration = Duration::from_secs(7 * 86_400);
 /// How long a review waiting for a person stays before it's taken as left.
 const UNFINISHED: Duration = Duration::from_secs(30 * 86_400);
-/// In a review's directory once it's finished and noted.
+/// Left in a review's directory by an earlier tailbus once it finished.
 const FINISHED_MARK: &str = "finished";
 
 pub fn dir(paths: &Paths) -> PathBuf {
@@ -120,8 +119,9 @@ pub fn history(paths: &Paths, repo: &Path) -> Vec<Record> {
         .collect()
 }
 
-/// Once a review is finished: notes it in history, if `noted`, and drops
-/// what only a review under way needs. Does nothing the second time.
+/// Once a review is finished: notes it in history, if `noted`, and removes
+/// its files. Its report has been printed. A review that isn't finished
+/// keeps them, to go on from.
 pub fn finished(paths: &Paths, run: &Run, noted: bool) -> Result<()> {
     if !matches!(
         run.status,
@@ -129,27 +129,20 @@ pub fn finished(paths: &Paths, run: &Run, noted: bool) -> Result<()> {
     ) {
         return Ok(());
     }
-    let review = dir(paths).join(&run.id);
-    let mark = review.join(FINISHED_MARK);
-    if mark.exists() {
-        return Ok(());
-    }
     if noted && let Some(record) = Record::of(run) {
         add(paths, record)?;
     }
-    for entry in fs::read_dir(&review)?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("round-") && name.ends_with(".diff") {
-            let _ = fs::remove_file(entry.path());
+    let review = dir(paths).join(&run.id);
+    match fs::remove_dir_all(&review) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {}", review.display()))
         }
+        _ => Ok(()),
     }
-    File::create(&mark)?;
-    Ok(())
 }
 
-/// Removes finished reviews after `FINISHED`, and ones left waiting after
-/// `UNFINISHED`, going by when each was last saved. Returns how many.
+/// Removes reviews an earlier tailbus left finished, and ones left waiting
+/// after `UNFINISHED`, going by when each was last saved. Returns how many.
 pub fn prune(paths: &Paths) -> usize {
     prune_at(paths, SystemTime::now())
 }
@@ -171,7 +164,7 @@ fn prune_at(paths: &Paths, now: SystemTime) -> usize {
             continue;
         };
         let keep = if review.join(FINISHED_MARK).exists() {
-            FINISHED
+            Duration::ZERO
         } else {
             UNFINISHED
         };
@@ -226,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn old_reviews_go_and_finished_ones_sooner() {
+    fn left_reviews_go_and_finished_ones_at_once() {
         let p = paths();
         for (id, done) in [("done", true), ("waiting", false)] {
             let review = dir(&p).join(id);
@@ -237,8 +230,8 @@ mod tests {
             }
         }
         let now = SystemTime::now();
-        assert_eq!(prune_at(&p, now), 0, "nothing is old yet");
-        assert_eq!(prune_at(&p, now + FINISHED + Duration::from_secs(60)), 1);
+        // One an earlier tailbus left finished goes at once.
+        assert_eq!(prune_at(&p, now + Duration::from_secs(1)), 1);
         assert!(!dir(&p).join("done").exists());
         assert!(dir(&p).join("waiting").exists());
         assert_eq!(prune_at(&p, now + UNFINISHED + Duration::from_secs(60)), 1);

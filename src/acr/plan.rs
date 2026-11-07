@@ -271,6 +271,24 @@ pub fn config_escalation(cfg: &Config, change: &Change) -> Option<String> {
     touched(list).then(|| format!("this change edits {list}, which reviewers are told to believe"))
 }
 
+/// Several calls by one role, as one line.
+fn sum_of(role: Role, binding: &str, parts: &[RoleCost]) -> RoleCost {
+    RoleCost {
+        role,
+        binding: binding.to_string(),
+        calls: parts.iter().map(|c| c.calls).sum(),
+        tokens_in: parts.iter().map(|c| c.tokens_in).sum(),
+        cache_read: parts.iter().map(|c| c.cache_read).sum(),
+        tokens_out: parts.iter().map(|c| c.tokens_out).sum(),
+        usd: if parts.is_empty() {
+            Some(0.0)
+        } else {
+            parts.iter().map(|c| c.usd).sum()
+        },
+        subscription: parts.iter().any(|c| c.subscription),
+    }
+}
+
 /// Each part's dollars added up, or None if any part has no price.
 fn all(parts: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
     parts.into_iter().sum()
@@ -418,6 +436,9 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
         artifact,
     )?;
     let mut reviewers = Vec::new();
+    // A Judge reads the diff its lens's reviewers got, and their findings,
+    // one list from each.
+    let mut judge_each = Vec::new();
     for (lens, _) in &chosen {
         let reads = if lens.include_generated {
             whole
@@ -425,26 +446,28 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
             artifact
         };
         reviewers.push(role_cost(Role::Reviewer, Some(lens), fan_out, reads)?);
+        judge_each.push(role_cost(
+            Role::Judge,
+            None,
+            1,
+            reads + fan_out * ANSWER_TOKENS,
+        )?);
     }
-    // A Judge reads its lens's findings, one list from each reviewer, not
-    // the change.
-    let judges = role_cost(
+    let judges = sum_of(
         Role::Judge,
-        None,
-        chosen.len() as u64,
-        BRIEF_TOKENS + fan_out * ANSWER_TOKENS,
-    )?;
+        cfg.binding_name(Role::Judge, None)?,
+        &judge_each,
+    );
     // A fix is told the findings, not the whole change.
     let fix = (cfg.max_rounds > 1)
         .then(|| role_cost(Role::Orchestrator, None, 1, BRIEF_TOKENS))
         .transpose()?;
 
     // What a lens's round costs: its reviewers, and its call to the Judge.
-    let judge_one = Amount::of(&judges).times(1.0 / judges.calls.max(1) as f64);
     let rounds: Vec<(&str, Amount)> = chosen
         .iter()
-        .zip(&reviewers)
-        .map(|((lens, _), r)| (lens.id.as_str(), Amount::of(r).plus(judge_one)))
+        .zip(reviewers.iter().zip(&judge_each))
+        .map(|((lens, _), (r, j))| (lens.id.as_str(), Amount::of(r).plus(Amount::of(j))))
         .collect();
     let setup = Amount::of(&sizer).plus(Amount::of(&orchestrator));
     let one_fix = fix.as_ref().map_or(Amount::ZERO, Amount::of);
@@ -731,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lens_is_priced_on_the_diff_it_gets_and_a_judge_on_findings() {
+    fn a_lens_and_its_judge_are_priced_on_the_diff_they_get() {
         let mut cfg = example();
         cfg.costs.per_call.clear();
         let small = "+x\n".to_string();
@@ -748,7 +771,7 @@ mod tests {
                 .sum()
         };
         assert!(reviewer_in(&lean) < reviewer_in(&everything));
-        // A Judge's input doesn't grow with the change.
+        // A Judge reads the diff its lens's reviewers got.
         let judge_in = |p: &Plan| {
             p.first_round
                 .iter()
@@ -756,7 +779,7 @@ mod tests {
                 .unwrap()
                 .tokens_in
         };
-        assert_eq!(judge_in(&lean), judge_in(&everything));
+        assert!(judge_in(&lean) < judge_in(&everything));
         // A lens that takes generated files is priced on all of it.
         let id = lean.lenses[0].id.clone();
         cfg.lenses

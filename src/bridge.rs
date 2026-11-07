@@ -1765,6 +1765,11 @@ impl Bridge {
             self.log(format!("couldn't save the reply to {}: {e:#}", msg.id));
         }
         self.send_reply(msg, &saved);
+        // A caller that keeps its own record asks for none here.
+        let options = msg.ext.as_ref().and_then(|e| e.options.as_ref());
+        if options.and_then(|o| o.log) == Some(false) {
+            let _ = fs::remove_dir_all(self.log_dir(&msg.id));
+        }
     }
 
     /// Sends a reply, which acknowledges the message. It keeps trying while
@@ -3179,6 +3184,7 @@ mod tests {
             workdir: Some(rig.dir.join("home").display().to_string()),
             model: some("m2"),
             effort: some("high"),
+            log: None,
         })
         .unwrap();
         assert_eq!(narrowed.tools, tools);
@@ -4022,6 +4028,29 @@ mod tests {
         assert!(dir.exists());
         let bridge = rig.start(rig.settings("echo out", "log_retention_days = 0"));
         until("the log to go", || (!dir.exists()).then_some(()));
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_caller_can_ask_for_no_log() {
+        let rig = Rig::new();
+        let bridge = rig.start(rig.settings("echo out", ""));
+        let id = rig.ask_with(with(RunOptions {
+            log: Some(false),
+            ..RunOptions::default()
+        }));
+        assert_eq!(
+            rig.reply_item(&id).msg.result().unwrap().status,
+            RunStatus::Ok
+        );
+        let dir = rig.state().join("log").join(&id);
+        until("the log to go", || (!dir.exists()).then_some(()));
+        let kept = rig.ask("hello");
+        rig.reply_to(&kept);
+        assert!(
+            rig.state().join("log").join(&kept).exists(),
+            "others keep theirs"
+        );
         bridge.stop().unwrap();
     }
 
