@@ -58,6 +58,32 @@ pub fn name(repo: &Path) -> Result<String> {
         .context("the repository has no name")
 }
 
+/// Reviewers read the checkout itself, so a commit under review must be the
+/// one checked out, with nothing changed on top. Without `head`, the review
+/// is of the working tree, which is the checkout already.
+pub fn checked_out(repo: &Path, head: Option<&str>) -> Result<()> {
+    let Some(head) = head else {
+        return Ok(());
+    };
+    let want = git(repo, &["rev-parse", &format!("{head}^{{commit}}")])?;
+    let have = git(repo, &["rev-parse", "HEAD"])?;
+    if want.trim() != have.trim() {
+        bail!(
+            "reviewers read the checkout, so {head} has to be what's checked out, and it's \
+             {}. Check {head} out, or leave --head out to review the working tree.",
+            &have.trim()[..12.min(have.trim().len())]
+        );
+    }
+    let changed = git(repo, &["status", "--porcelain", "--untracked-files=no"])?;
+    if !changed.trim().is_empty() {
+        bail!(
+            "reviewers read the checkout, which has changes on top of {head}. Commit or \
+             stash them, or leave --head out to review the working tree."
+        );
+    }
+    Ok(())
+}
+
 /// The commit a stack's review stops at: the first after the base.
 fn bottom_of_stack(repo: &Path, base: &str, head: &str) -> Result<Option<String>> {
     let range = format!("{base}..{head}");
@@ -137,6 +163,22 @@ pub mod tests {
                 .unwrap();
             assert!(out.status.success(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn a_reviewed_commit_must_be_what_is_checked_out() {
+        let dir = repo_with(&[("a.txt", "one\n")]);
+        branch(&dir, "change");
+        commit(&dir, &[("a.txt", "two\n")], "two");
+        // The working tree is always fine: it's the checkout.
+        assert!(checked_out(&dir, None).is_ok());
+        assert!(checked_out(&dir, Some("change")).is_ok());
+        let err = format!("{:#}", checked_out(&dir, Some("main")).unwrap_err());
+        assert!(err.contains("checked out"), "{err}");
+        fs::write(dir.join("a.txt"), "three\n").unwrap();
+        let err = format!("{:#}", checked_out(&dir, Some("change")).unwrap_err());
+        assert!(err.contains("changes on top"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     pub fn branch(dir: &Path, name: &str) {

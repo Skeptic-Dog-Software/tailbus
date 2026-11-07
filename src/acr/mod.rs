@@ -216,6 +216,15 @@ fn not_findings(cfg: &Config, source: &Source, repo: &Path, base: &str) -> Resul
     }
 }
 
+/// This machine's name on the tailnet, as the bus knows it.
+fn this_machine(paths: &Paths) -> Result<String> {
+    let status: crate::local::Status = crate::local::call(&paths.socket(), &Request::Status)
+        .context("asking the bus which machine this is")?;
+    status
+        .machine
+        .context("the bus doesn't know this machine's name yet")
+}
+
 fn reload(cfg: &Config, repo: &Path, base: &str, head: Option<&str>) -> Result<Change> {
     change::load(repo, base, head, cfg.review_scope)
 }
@@ -246,10 +255,10 @@ impl BridgeCaller {
 impl Caller for BridgeCaller {
     fn call(&self, call: &Call) -> Result<Answer> {
         let b = call.binding;
-        // Fixes go where they're meant to, or not at all.
-        if call.writes && b.workdir.is_none() {
+        // Fixes only from a binding the user lets write.
+        if call.writes && !b.writes {
             bail!(
-                "the {} binding has no workdir, so it can't apply fixes",
+                "the {} binding can't apply fixes: give it `writes: true` in your acr.yaml",
                 call.binding_name
             );
         }
@@ -258,7 +267,9 @@ impl Caller for BridgeCaller {
             tools: if call.writes { None } else { b.tools.clone() },
             session: Some("fresh".into()),
             timeout: b.timeout,
-            workdir: b.workdir.clone().filter(|_| call.writes),
+            // Every role works in the repository, so reviewers read the
+            // code itself, read-only, and an Orchestrator fixes it there.
+            workdir: Some(call.repo.display().to_string()),
             model: b.model.clone(),
             effort: b.effort.clone(),
         };
@@ -561,9 +572,14 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
                     user_config_path(paths).display()
                 );
             }
+            match this_machine(paths) {
+                Ok(machine) => cfg.check_local(&machine)?,
+                Err(e) => println!("Not checked that every agent is on this machine: {e:#}."),
+            }
         }
         AcrCmd::Plan { target, json } => {
             let (cfg, source) = load_config(paths, &target, &flags(&target))?;
+            cfg.check_local(&this_machine(paths)?)?;
             let change = reload(&cfg, &target.repo, &target.base, target.head.as_deref())?;
             let plan = plan::dry_run(&cfg, &change, &history(paths, &target.repo))?;
             if !json && let Source::File(file) = &source {
@@ -578,6 +594,8 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
         AcrCmd::Run { target, post_pr } => {
             let (cfg, source) = load_config(paths, &target, &flags(&target))?;
             cfg.check_bindings()?;
+            cfg.check_local(&this_machine(paths)?)?;
+            change::checked_out(&target.repo, target.head.as_deref())?;
             let id = new_id();
             let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
             let s = setting(paths, &cfg, &id, Some(list))?;
@@ -604,6 +622,11 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
                 |name: &str| fs::read(dir.join(name)).with_context(|| format!("no run {run_id}"));
             let mut run: Run = serde_json::from_slice(&read("run.json")?)?;
             let cfg: Config = stored_config(&read("config.json")?)?;
+            cfg.check_local(&this_machine(paths)?)?;
+            // Until a fix, the review is of its head, which must be checked out.
+            if run.lenses.values().all(|l| l.done.is_empty()) {
+                change::checked_out(&run.repo, run.head.as_deref())?;
+            }
             let decision = Decision {
                 fold,
                 waive,
@@ -627,6 +650,8 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
             flags.human_gate = Some(HumanGate::Exception);
             let (cfg, source) = load_config(paths, &target, &flags)?;
             cfg.check_bindings()?;
+            cfg.check_local(&this_machine(paths)?)?;
+            change::checked_out(&target.repo, target.head.as_deref())?;
             let known: Vec<Known> = serde_yaml_ng::from_str(
                 &fs::read_to_string(&known)
                     .with_context(|| format!("reading {}", known.display()))?,
@@ -764,9 +789,10 @@ mod tests {
             prompt: "Fix these",
             artifact: None,
             writes: true,
+            repo: Path::new("."),
         };
         let err = caller.call(&call).err().unwrap();
-        assert!(format!("{err:#}").contains("no workdir"), "{err:#}");
+        assert!(format!("{err:#}").contains("writes: true"), "{err:#}");
     }
 
     #[test]

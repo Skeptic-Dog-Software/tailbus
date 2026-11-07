@@ -251,7 +251,7 @@ path = "/Users/you/.local/bin:/usr/bin:/bin"
 | `stderr_tail_bytes` | The most stderr a result carries. Default 4096. |
 | `log_retention_days` | Days to keep each run's log. Default 14. |
 | `options` | What a request may ask for, as a table. Left out, it may ask for nothing. See [Per-request options](#per-request-options). |
-| `env` | More environment variables, as a table. |
+| `env` | More environment variables, as a table. A value can name the run's places, such as `{SESSION_DIR}` or `{RUN_DIR}`, but never the message. |
 | `secrets` | Environment variables read from files, as a table, such as `GH_TOKEN = "/path/to/token"`. Each file must be yours, readable only by you (`chmod 600`). They're read for each run, so a new token needs no restart. |
 
 | Placeholder | In | Is |
@@ -387,7 +387,9 @@ model = "message.model"
 ```
 
 Paths into a line are dotted. A line counts when everything in `when`
-matches. A session kept between runs counts only the lines a run adds. A run
+matches. An agent that writes a call more than once as it streams, as Claude
+Code does, needs `dedupe`, a path that names the call: the last line with each
+name counts. A session kept between runs counts only the lines a run adds. A run
 that fails or times out still reports what it spent. The bridge never follows
 a link out of the session. It's the agent's own word, so it's for costs,
 never for what's allowed. `tailbus call --verbose` prints it, `--json`
@@ -586,10 +588,16 @@ subscription, and for the calls billed in dollars, `usd` by the config's
 prices and `agent_usd`, what the agents said. A price for a
 model none of your bindings use is an error, so a misspelt one is caught.
 
-**Fixes need the checkout.** After a fix, ACR reads the change from the working
-tree, so the Orchestrator's bridge must run on the same machine as `--repo`, with
-it in `options.workdirs`. A run is saved at each gate, not during a round, so
-a crash mid-round means starting over.
+**One machine.** tailbus carries messages between machines, but ACR runs on
+one: every binding it uses must reach an agent on the machine with the code,
+or it refuses to start. Every call runs in the repository, so reviewers read
+the code itself, with their read-only tools, and nothing is copied. The
+bridge must list the repository in `options.workdirs`. Reviewers read the
+checkout, so a review of a commit (`--head`) needs that commit checked out
+with nothing changed on top; without `--head`, it's the working tree. Only a
+binding with `writes: true` may apply an Orchestrator's fixes, and after a
+fix the review goes on from the working tree. A run is saved at each gate,
+not during a round, so a crash mid-round means starting over.
 
 ## How it works
 

@@ -30,6 +30,9 @@ pub struct Call<'a> {
     pub artifact: Option<&'a Path>,
     /// It may change the working tree: only an Orchestrator fixing.
     pub writes: bool,
+    /// The repository, which every role works in: reviewers read it, and an
+    /// Orchestrator fixes it.
+    pub repo: &'a Path,
 }
 
 pub struct Answer {
@@ -334,6 +337,7 @@ fn ask(
     artifact: Option<&Path>,
 ) -> Result<String> {
     let name = s.cfg.binding_name(role, None)?;
+    let repo = run.repo.clone();
     let call = Call {
         role,
         binding_name: name,
@@ -341,6 +345,7 @@ fn ask(
         prompt,
         artifact,
         writes: false,
+        repo: &repo,
     };
     let answer = caller.call(&call)?;
     record(run, s.cfg, &call, input_bytes(prompt, artifact), &answer);
@@ -538,6 +543,8 @@ fn attack(
             briefs.push((lens, prompt.clone()));
         }
     }
+    let repo = run.repo.clone();
+    let repo = repo.as_path();
     let answers: Vec<_> = thread::scope(|scope| {
         let handles: Vec<_> = briefs
             .iter()
@@ -552,6 +559,7 @@ fn attack(
                         prompt,
                         artifact: Some(artifact),
                         writes: false,
+                        repo,
                     };
                     let answer = caller.call(&call)?;
                     let usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
@@ -757,6 +765,7 @@ fn fix(run: &mut Run, s: &Setting, caller: &dyn Caller) -> Result<()> {
     let prompt = roles::fix_prompt(&list);
     let cfg = s.cfg;
     let name = cfg.binding_name(Role::Orchestrator, None)?;
+    let repo = run.repo.clone();
     let call = Call {
         role: Role::Orchestrator,
         binding_name: name,
@@ -764,6 +773,7 @@ fn fix(run: &mut Run, s: &Setting, caller: &dyn Caller) -> Result<()> {
         prompt: &prompt,
         artifact: None,
         writes: true,
+        repo: &repo,
     };
     let fixed = caller.call(&call).and_then(|answer| {
         record(run, cfg, &call, prompt.len(), &answer);

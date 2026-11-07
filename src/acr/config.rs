@@ -319,9 +319,9 @@ pub struct Binding {
     /// Seconds a call can take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
-    /// Where an Orchestrator applies fixes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workdir: Option<String>,
+    /// It may apply an Orchestrator's fixes, in the repository under review.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writes: bool,
     /// US dollars per million tokens, for estimates. Set both, and they
     /// win over a repository's prices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -597,6 +597,32 @@ impl Config {
                 .any(|(name, b)| name == key || b.model.as_ref() == Some(key));
             if !used {
                 bail!("costs.prices names {key}, which no binding in your allowed_bindings uses");
+            }
+        }
+        Ok(())
+    }
+
+    /// ACR runs on one machine: every binding in use must reach an agent on
+    /// `machine`, where the code is, so its reviewers read the code itself.
+    pub fn check_local(&self, machine: &str) -> Result<()> {
+        let chosen = self
+            .bindings
+            .values()
+            .chain(self.lenses.iter().filter_map(|l| l.binding.as_ref()));
+        for name in chosen {
+            let Some(binding) = self.allowed_bindings.get(name) else {
+                continue;
+            };
+            let on = binding
+                .agent
+                .split_once('@')
+                .map(|(_, m)| m.split('.').next().unwrap_or(m));
+            if on.is_some_and(|m| !m.eq_ignore_ascii_case(machine)) {
+                bail!(
+                    "ACR runs on one machine: binding {name} reaches {}, but the code is on \
+                     {machine}. Bind it to an agent on {machine}.",
+                    binding.agent
+                );
             }
         }
         Ok(())
@@ -954,6 +980,25 @@ mod tests {
         user.allowed_bindings.get_mut("medium").unwrap().tools = None;
         let err = resolve(&user, parse_repo(GO).unwrap(), &Flags::default()).unwrap_err();
         assert!(format!("{err:#}").contains("read-only tools"), "{err:#}");
+    }
+
+    #[test]
+    fn every_binding_must_be_on_the_machine_with_the_code() {
+        let cfg = resolved(GO).unwrap();
+        // The example's agents are on my-mac.
+        assert!(cfg.check_local("my-mac").is_ok());
+        assert!(cfg.check_local("MY-MAC").is_ok());
+        let err = format!("{:#}", cfg.check_local("build-box").unwrap_err());
+        assert!(
+            err.contains("one machine") && err.contains("build-box"),
+            "{err}"
+        );
+        // An agent named without a machine is this one's.
+        let mut here = cfg.clone();
+        for b in here.allowed_bindings.values_mut() {
+            b.agent = "models".into();
+        }
+        assert!(here.check_local("build-box").is_ok());
     }
 
     #[test]

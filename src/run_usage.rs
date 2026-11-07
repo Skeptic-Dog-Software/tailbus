@@ -30,6 +30,9 @@ pub struct UsageFrom {
     /// A line counts as a model call when each path here has its value.
     #[serde(default)]
     pub when: BTreeMap<String, String>,
+    /// A path whose value names the call, for an agent that writes a call
+    /// more than once, as it streams. The last line with each value counts.
+    pub dedupe: Option<String>,
     /// Input that wasn't read from a cache.
     pub input: Option<String>,
     /// Output, thinking included.
@@ -54,6 +57,7 @@ impl UsageFrom {
             bail!("usage needs at least one of input and output");
         }
         let paths = [
+            &self.dedupe,
             &self.input,
             &self.output,
             &self.cache_read,
@@ -91,6 +95,8 @@ impl UsageFrom {
         let matcher = self.matcher().ok()?;
         let mut usage = RunUsage::default();
         let mut priced = true;
+        // Calls an agent wrote more than once, by name, the latest kept.
+        let mut named: Vec<(String, Value)> = Vec::new();
         for file in files_under(dir, &matcher) {
             let from = before.get(&file).copied().unwrap_or(0);
             let Ok(mut f) = File::open(&file) else {
@@ -107,10 +113,25 @@ impl UsageFrom {
                     // Half a line from an agent that was stopped, or not JSON.
                     continue;
                 };
-                if self.counts(&record) {
-                    priced &= self.add(&mut usage, &record);
+                if !self.counts(&record) {
+                    continue;
+                }
+                let name = self
+                    .dedupe
+                    .as_deref()
+                    .and_then(|p| at(&record, p))
+                    .map(|v| v.to_string());
+                match name {
+                    Some(name) => match named.iter_mut().find(|(n, _)| *n == name) {
+                        Some(seen) => seen.1 = record,
+                        None => named.push((name, record)),
+                    },
+                    None => priced &= self.add(&mut usage, &record),
                 }
             }
+        }
+        for (_, record) in &named {
+            priced &= self.add(&mut usage, record);
         }
         if usage.calls == 0 {
             return None;
@@ -336,6 +357,48 @@ mod tests {
         assert_eq!(omp().read(&d, &Before::new()), None);
         fs::remove_dir_all(&d).unwrap();
         fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn a_call_written_twice_counts_once() {
+        // Claude Code's shape: a line for each part of a streamed response.
+        let claude: UsageFrom = toml::from_str(
+            r#"
+            files = "**/*.jsonl"
+            when = { type = "assistant" }
+            dedupe = "message.id"
+            input = "message.usage.input_tokens"
+            output = "message.usage.output_tokens"
+            cache_read = "message.usage.cache_read_input_tokens"
+            cache_write = "message.usage.cache_creation_input_tokens"
+            model = "message.model"
+            "#,
+        )
+        .unwrap();
+        let line = |id: &str, out: u64| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"{id}","model":"m","usage":{{"input_tokens":10,"output_tokens":{out},"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}}}}}"#
+            )
+        };
+        let d = dir();
+        append(
+            &d.join("s.jsonl"),
+            &[
+                line("a", 1),
+                line("a", 7),
+                line("b", 3),
+                r#"{"type":"user"}"#.into(),
+            ],
+        );
+        let u = claude.read(&d, &Before::new()).unwrap();
+        assert_eq!(u.calls, 2);
+        assert_eq!(
+            (u.input_tokens, u.output_tokens),
+            (20, 10),
+            "a's last line counts"
+        );
+        assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (200, 10));
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

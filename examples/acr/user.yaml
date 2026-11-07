@@ -2,6 +2,8 @@
 # models are reached: which bridge agent, which of its models, with which
 # tools. A repository chooses among these names. tailbus assumes no provider,
 # model or binding of its own, so everything here is an example: set your own.
+# ACR runs on one machine: every agent here must be on the machine with the
+# code, where its reviewers read the repository itself, read-only.
 version: 1
 allowed_bindings:
   small:
@@ -21,7 +23,7 @@ allowed_bindings:
     effort: medium
     tools: [read, grep, glob]
     timeout: 900
-    workdir: /Users/you/Work/the-repo
+    writes: true    # the Orchestrator may apply fixes, in the repository
 defaults:
   human_gate: exception
   # Every role needs a binding, here or in the repository's config.

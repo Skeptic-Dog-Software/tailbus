@@ -511,6 +511,13 @@ about 8.
   come only for calls billed in them. `subscription: true` on a binding
   keeps a price or an agent's own figure from turning its tokens into
   dollars.
+- **One machine.** ACR's reviewers read the code where it is, never a
+  copy, so every binding must reach an agent on the machine with the
+  repository, and every call runs in it. tailbus still carries messages
+  between machines; ACR doesn't use that. A reviewer reads the checkout, so
+  a commit under review must be checked out, clean, or the run refuses.
+  - *Rejected:* a snapshot of the commit sent to a reviewer elsewhere. It
+    copies the code off its machine.
 - **No model of its own.** The framework names no binding, model or
   provider, and a test fails if one appears in its code. Every role's
   binding comes from the user's or the repository's config, or a flag.

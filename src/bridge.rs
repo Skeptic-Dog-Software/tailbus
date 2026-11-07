@@ -303,6 +303,14 @@ impl Settings {
         if let Some(name) = self.secrets.keys().find(|n| self.env.contains_key(*n)) {
             bail!("{name} is in both env and secrets");
         }
+        if let Some(name) = self
+            .env
+            .iter()
+            .find(|(_, v)| v.contains("{BODY}") || v.contains("{MESSAGE}"))
+            .map(|(n, _)| n)
+        {
+            bail!("env {name} can't carry the message; it goes to stdin");
+        }
         let on_command_line = self.args.iter().chain(&self.continue_args);
         if on_command_line
             .clone()
@@ -2115,8 +2123,17 @@ impl Bridge {
         command
             .env("HOME", &self.cfg.home)
             .env("PATH", &self.cfg.path)
-            .env("TMPDIR", run_dir.join("tmp"))
-            .envs(&self.cfg.env);
+            .env("TMPDIR", run_dir.join("tmp"));
+        // Values can name the run's places, such as {SESSION_DIR}, but never
+        // the message, and never read a file in.
+        let places: Vec<(&str, &str)> = vars
+            .iter()
+            .filter(|(k, _)| !matches!(*k, "MESSAGE" | "BODY"))
+            .copied()
+            .collect();
+        for (name, value) in &self.cfg.env {
+            command.env(name, fill(value, &places, false)?);
+        }
         if let (Some(name), Some(tools)) = (&self.cfg.options.tools_env, &tools) {
             command.env(name, tools);
         }
