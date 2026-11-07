@@ -118,6 +118,11 @@ pub struct Config {
     /// that and this.
     #[serde(default = "default_max_subagents")]
     pub max_subagents: u32,
+    /// Headless agents `tailbus bridge` runs: agent name to its settings.
+    /// Kept unparsed here, so a mistake in one stops that bridge and not
+    /// the bus.
+    #[serde(default)]
+    pub bridges: std::collections::HashMap<String, toml::Value>,
 }
 
 fn default_max_subagents() -> u32 {
@@ -171,6 +176,9 @@ mod tests {
         assert_eq!(cfg.ask_after_secs, 60);
         assert!(cfg.clients.is_empty());
         assert_eq!(cfg.max_subagents, 5);
+        assert!(cfg.bridges.is_empty());
+        let cfg: Config = toml::from_str("[bridges.omp]\nnot_a_setting = 1").unwrap();
+        assert!(cfg.bridges.contains_key("omp"));
         let cfg: Config = toml::from_str("[clients]\nwork = \"acme\"").unwrap();
         assert_eq!(cfg.clients["work"], "acme");
 

@@ -12,9 +12,10 @@ which account owns it.
 
 [DESIGN.md](DESIGN.md) has the design and the plan. Built so far: the bus
 itself, the CLI, the MCP tools, push into Claude Code, the limits that stop
-agents answering each other forever, permission alerts on your Macs, and
+agents answering each other forever, permission alerts on your Macs,
 [`/pipe`](#pipe), which hands a whole task to an agent on another machine
-and gets back a reviewed result.
+and gets back a reviewed result, and [bridges](#headless-agents), which
+answer messages with a headless agent such as omp.
 
 ## Install
 
@@ -45,6 +46,7 @@ The same file sets the [handoff limit](#requests-responses-and-the-handoff-limit
 showing tailbus's dialogs. A `[clients]` table tags
 [clients' workers](#pipe) here, such as `work = "acme"`, and
 `max_subagents = 5` caps the subagents a `/pipe` task runs at once.
+`[bridges.<agent>]` tables set up [headless agents](#headless-agents).
 
 ## Agents and addresses
 
@@ -213,6 +215,107 @@ installs `~/.claude/skills/pipe`, so `/pipe` works as typed.
 | `tailbus status` | Show the bus's state. |
 | `tailbus tail` | Follow messages and sessions as they happen. |
 | `tailbus usage <session>` | Count the tokens a Claude Code session and its subagents used, from their transcripts: input, output, cache writes and cache reads. `--since` takes a time or a message ID, such as a `/pipe` task's. |
+
+## Headless agents
+
+`tailbus bridge` answers an agent's messages by running a headless CLI
+agent, such as omp, once per message. What it prints is the reply. Describe
+the agent in `~/.config/tailbus/config.toml`, in a table named for its bus
+agent:
+
+```toml
+[bridges.omp]
+owner = "you@example.com"
+command = "/Users/you/.local/bin/omp"
+args = ["-p", "--model", "some/model", "--session-dir", "{SESSION_DIR}", "--no-tools"]
+working_directory = "/Users/you/agent-home/workspace"
+home = "/Users/you/agent-home/home"
+path = "/Users/you/.local/bin:/usr/bin:/bin"
+```
+
+| Setting | Means |
+| --- | --- |
+| `owner` | The Tailscale login a message must come from. Required. |
+| `command`, `args` | What to run. `args` can use the placeholders below. |
+| `working_directory` | Where it runs. Required. Every run shares it, in either session mode. |
+| `home`, `path` | Its `HOME` and `PATH`. Required. `home` can't be your own. |
+| `message` | What the agent is asked. The default says who it's from and that it's a request, not an instruction from its user. |
+| `session` | `"fresh"`, the default, gives every request a new, empty session. `"per-sender"` keeps one running conversation with each sender. |
+| `continue_args` | Added after `args` when a `per-sender` session already has files, such as `["-c"]`. |
+| `sessions_dir` | Where `per-sender` sessions go, a directory for each sender. |
+| `max_concurrent` | The most runs at once. Default 1. |
+| `timeout_secs` | How long a run can take. Default 600. |
+| `shutdown_grace_secs` | How long a stop gives runs already going. Default 10. |
+| `env` | More environment variables, as a table. |
+| `secrets` | Environment variables read from files, as a table, such as `GH_TOKEN = "/path/to/token"`. Each file must be yours, readable only by you (`chmod 600`). They're read for each run, so a new token needs no restart. |
+
+| Placeholder | In | Is |
+| --- | --- | --- |
+| `{AGENT}`, `{ID}`, `{SENDER}` | `args`, `message` | The bus agent, the message's ID, and who sent it. |
+| `{SESSION_DIR}` | `args`, `message` | The run's session directory. Pass this to the agent: it's what keeps sessions apart. |
+| `{RUN_DIR}`, `{MESSAGE_FILE}` | `args`, `message` | A directory for this run alone, and the path of the file holding the message. |
+| `{FILE:/path}` | `args`, `message` | A file's text, with only `{AGENT}` filled in. For a system prompt. |
+| `{MESSAGE}`, `{BODY}` | `message` | The message tagged with its sender and owner, and its bare text. |
+
+| Command | Does |
+| --- | --- |
+| `tailbus bridge run <agent>` | Run a bridge in the foreground. |
+| `tailbus bridge install <agent>` | Start it now and at every login (macOS, launchd), replacing a running one. |
+| `tailbus bridge uninstall <agent>` | Stop it and stop starting it at login. |
+| `tailbus bridge status [agent]` | Show whether it's up, what's running, and its last failure. |
+
+Its log is `~/.local/state/tailbus/bridge/<agent>/bridge.log`. Run `bridge
+status` after changing a table: it says if the settings have a problem. A
+running bridge keeps the settings it started with, so `bridge install`
+again to use new ones.
+
+**What it answers.** A message gets a run if it comes from `owner` and
+expects a reply. Anything else is acknowledged without an answer, and
+logged. Steps of a `/pipe` get a failure reply, since a single run can't
+wait for its plan to be approved.
+
+**What the agent gets.** The message arrives on stdin, never on the command
+line, where other users of the machine could read it. Its environment is
+`HOME`, `PATH`, `TMPDIR` (its own for each run), `USER`, `LOGNAME`, `SHELL`,
+`LANG`, and what the table sets. Nothing else comes through from the
+bridge's, including `SSH_AUTH_SOCK`.
+
+**Failures.** A non-zero exit, empty output, a timeout, or anything else that
+stops a run goes back to the sender as a reply saying why. A timeout kills
+the whole process tree, including anything that left its process group with
+`setsid`, as long as it still has a parent in the tree. Output over 64 KiB is
+cut, with a note saying so. Secrets' values are taken out of the log and of
+everything sent back, wherever they turn up.
+
+**Sessions.** A fresh session gets a new session directory and `TMPDIR`, and
+both are deleted after the run. Runs still share `home` and
+`working_directory`, so **a file a run leaves in either can reach later runs**.
+A sender's `per-sender` runs go one at a time, whatever `max_concurrent`
+says, because omp forks a conversation that two runs continue at once. While
+one sender's messages wait for their turn, they hold a place in
+`max_concurrent`.
+
+**A stop or a crash.** A message stays pending until its reply is stored,
+which acknowledges it. So nothing a bridge took is lost, and it runs again
+from the start when the bridge next starts. That's at-least-once: **a run
+that was cut short may already have done things that it will do again**, such
+as posting a comment.
+
+- On a stop, the bridge stops taking messages at once, and gives runs
+  `shutdown_grace_secs` to finish. Then it ends what's left, with SIGTERM and
+  then SIGKILL, and tells each sender their request will start over.
+- After a crash, the next start first stops what the old bridge left running,
+  if the process is still the same one.
+- An answer finished but not yet sent is kept, and sent without running again.
+- A message whose runs the bridge died in three times gets a failure reply.
+
+**This isn't a sandbox.** The agent keeps a shell, and can read anything your
+user can. `home` keeps it from loading what's in your own home directory by
+default, such as its MCP servers, because flags like omp's `--tools` don't
+limit those. That's a default it can step around, not a security boundary.
+The bridge adds no tools or permissions of its own: the agent has what `args`
+gives it. Only messages from `owner` reach it, but they run with nobody
+watching, so `args` should give it no more than those messages should have.
 
 ## How it works
 

@@ -1,5 +1,5 @@
 //! `tailbus setup claude` and `tailbus service`: wiring tailbus into Claude
-//! Code, and running the daemon under launchd.
+//! Code, and running the daemon and bridges under launchd.
 
 use std::env;
 use std::fs;
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
+use crate::bridge;
 use crate::config::Paths;
 use crate::local::{self, Hello, Request};
 
@@ -21,6 +22,8 @@ const WAIT_HOOK_TIMEOUT_SECS: u64 = 7 * 86_400;
 /// How long the permission hook holds a prompt for an alert's answer. If it
 /// passes, the prompt stays with the terminal.
 const PERMISSION_HOOK_TIMEOUT_SECS: u64 = 86_400;
+/// How long launchd gives a job to stop, unless it says otherwise.
+const LAUNCHD_EXIT_TIMEOUT: u64 = 20;
 
 fn home() -> Result<PathBuf> {
     env::var_os("HOME")
@@ -222,10 +225,10 @@ fn find_claude() -> Result<PathBuf> {
     bail!("can't find the `claude` command; install Claude Code, or use --no-install")
 }
 
-fn plist_path() -> Result<PathBuf> {
+fn plist_path(label: &str) -> Result<PathBuf> {
     Ok(home()?
         .join("Library/LaunchAgents")
-        .join(format!("{LABEL}.plist")))
+        .join(format!("{label}.plist")))
 }
 
 fn xml(s: &str) -> String {
@@ -241,69 +244,138 @@ fn launchctl(args: &[&str]) -> Result<std::process::Output> {
         .output()?)
 }
 
-/// Runs the daemon as a launchd agent that starts at login and restarts if
-/// it stops. Running it again replaces the running daemon, for upgrades.
-pub fn service_install(paths: &Paths) -> Result<()> {
+fn require_launchd(what: &str, instead: &str) -> Result<()> {
     if !cfg!(target_os = "macos") {
         bail!(
-            "`tailbus service` uses launchd, so it's macOS only for now; elsewhere, run `tailbus daemon` under your service manager"
+            "`{what}` uses launchd, so it's macOS only for now; elsewhere, run `{instead}` under your service manager"
         );
     }
-    paths.make_state_dir()?;
-    let exe = this_exe()?;
-    let mut env_vars = String::from(
-        "        <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>\n",
-    );
-    if let Some(home) = env::var_os("TAILBUS_HOME") {
-        env_vars.push_str(&format!(
-            "        <key>TAILBUS_HOME</key><string>{}</string>\n",
-            xml(&home.to_string_lossy())
-        ));
-    }
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+    Ok(())
+}
+
+/// A launchd agent that runs this binary at login and restarts it if it
+/// stops.
+struct LaunchAgent<'a> {
+    label: &'a str,
+    args: &'a [&'a str],
+    log: &'a Path,
+    /// The fewest seconds between starts.
+    throttle: u32,
+    /// How long it gets to stop before launchd kills it, if not launchd's
+    /// default.
+    exit_timeout: Option<u64>,
+}
+
+impl LaunchAgent<'_> {
+    fn plist(&self, exe: &Path) -> String {
+        let mut env_vars = String::from(
+            "        <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>\n",
+        );
+        if let Some(home) = env::var_os("TAILBUS_HOME") {
+            env_vars.push_str(&format!(
+                "        <key>TAILBUS_HOME</key><string>{}</string>\n",
+                xml(&home.to_string_lossy())
+            ));
+        }
+        let args: String = self
+            .args
+            .iter()
+            .map(|a| format!("        <string>{}</string>\n", xml(a)))
+            .collect();
+        let exit_timeout = self
+            .exit_timeout
+            .map(|s| format!("    <key>ExitTimeOut</key><integer>{s}</integer>\n"))
+            .unwrap_or_default();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>{LABEL}</string>
+    <key>Label</key><string>{label}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
-        <string>daemon</string>
-    </array>
+{args}    </array>
     <key>EnvironmentVariables</key>
     <dict>
 {env_vars}    </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>ThrottleInterval</key><integer>10</integer>
-    <key>StandardOutPath</key><string>{log}</string>
+    <key>ThrottleInterval</key><integer>{throttle}</integer>
+{exit_timeout}    <key>StandardOutPath</key><string>{log}</string>
     <key>StandardErrorPath</key><string>{log}</string>
 </dict>
 </plist>
 "#,
-        exe = xml(&exe.to_string_lossy()),
-        log = xml(&paths.log().to_string_lossy()),
-    );
-    let path = plist_path()?;
-    write(&path, &plist)?;
-
-    let uid = unsafe { libc::getuid() };
-    let path_str = path.to_string_lossy().to_string();
-    // A GUI session's domain when there is one; over ssh with nobody logged
-    // in at the screen, the user domain.
-    let mut started = None;
-    for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
-        let _ = launchctl(&["bootout", &format!("{domain}/{LABEL}")]);
-        let out = launchctl(&["bootstrap", &domain, &path_str])?;
-        if out.status.success() {
-            started = Some(domain);
-            break;
-        }
+            label = xml(self.label),
+            exe = xml(&exe.to_string_lossy()),
+            throttle = self.throttle,
+            log = xml(&self.log.to_string_lossy()),
+        )
     }
-    let Some(domain) = started else {
-        bail!("launchctl couldn't load {}", path.display());
-    };
+
+    /// Writes the plist and starts the job, replacing a running one.
+    /// Returns the launchd domain it's in.
+    fn start(&self) -> Result<String> {
+        let path = plist_path(self.label)?;
+        write(&path, &self.plist(&this_exe()?))?;
+        let path_str = path.to_string_lossy().to_string();
+        // A GUI session's domain when there is one; over ssh with nobody
+        // logged in at the screen, the user domain.
+        for domain in domains() {
+            let booted = launchctl(&["bootout", &format!("{domain}/{}", self.label)])?;
+            // A job on its way out can't be replaced until it's gone, which
+            // can take as long as launchd gives it.
+            let wait = match booted.status.success() {
+                true => self.exit_timeout.unwrap_or(LAUNCHD_EXIT_TIMEOUT) + 5,
+                false => 0,
+            };
+            let until = Instant::now() + Duration::from_secs(wait);
+            loop {
+                let out = launchctl(&["bootstrap", &domain, &path_str])?;
+                if out.status.success() {
+                    return Ok(domain);
+                }
+                if Instant::now() >= until {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+        bail!("launchctl couldn't load {}", path.display())
+    }
+}
+
+fn domains() -> [String; 2] {
+    let uid = unsafe { libc::getuid() };
+    [format!("gui/{uid}"), format!("user/{uid}")]
+}
+
+/// Stops a launchd agent and removes its plist. Returns the plist's path.
+fn stop_launch_agent(label: &str) -> Result<PathBuf> {
+    for domain in domains() {
+        let _ = launchctl(&["bootout", &format!("{domain}/{label}")]);
+    }
+    let path = plist_path(label)?;
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    Ok(path)
+}
+
+/// Runs the daemon as a launchd agent that starts at login and restarts if
+/// it stops. Running it again replaces the running daemon, for upgrades.
+pub fn service_install(paths: &Paths) -> Result<()> {
+    require_launchd("tailbus service", "tailbus daemon")?;
+    paths.make_state_dir()?;
+    let domain = LaunchAgent {
+        label: LABEL,
+        args: &["daemon"],
+        log: &paths.log(),
+        throttle: 10,
+        exit_timeout: None,
+    }
+    .start()?;
     let socket = paths.socket();
     let until = Instant::now() + Duration::from_secs(10);
     loop {
@@ -333,16 +405,64 @@ pub fn service_install(paths: &Paths) -> Result<()> {
 }
 
 pub fn service_uninstall() -> Result<()> {
-    let uid = unsafe { libc::getuid() };
-    for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
-        let _ = launchctl(&["bootout", &format!("{domain}/{LABEL}")]);
-    }
-    let path = plist_path()?;
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
+    let path = stop_launch_agent(LABEL)?;
     println!("Stopped the tailbus daemon and removed {}.", path.display());
     Ok(())
+}
+
+fn bridge_label(agent: &str) -> String {
+    format!("{LABEL}.bridge.{agent}")
+}
+
+/// Runs a bridge as a launchd agent, the way `service_install` runs the
+/// daemon. Running it again replaces the running bridge.
+pub fn bridge_install(paths: &Paths, agent: &str) -> Result<()> {
+    require_launchd("tailbus bridge install", "tailbus bridge run")?;
+    paths.make_state_dir()?;
+    let settings = bridge::load(paths, agent)?;
+    let dir = bridge::state_dir(paths, agent);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let log = dir.join("bridge.log");
+    let label = bridge_label(agent);
+    let since = crate::util::now_ms();
+    let domain = LaunchAgent {
+        label: &label,
+        args: &["bridge", "run", agent],
+        log: &log,
+        throttle: 30,
+        // Long enough for its runs' grace period and to stop what's left.
+        exit_timeout: Some(settings.shutdown_grace_secs + 10),
+    }
+    .start()?;
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        if bridge::started_since(paths, agent, since) {
+            println!("The {agent} bridge is running (launchd {domain}/{label}).");
+            println!("Log: {}", log.display());
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    bail!(
+        "launchd started the {agent} bridge, but it isn't up. Is the tailbus daemon running? See {}",
+        log.display()
+    )
+}
+
+pub fn bridge_uninstall(agent: &str) -> Result<()> {
+    let path = stop_launch_agent(&bridge_label(agent))?;
+    println!("Stopped the {agent} bridge and removed {}.", path.display());
+    Ok(())
+}
+
+/// The launchd domain a bridge's job is loaded in, if it is.
+pub fn bridge_job(agent: &str) -> Option<String> {
+    let label = bridge_label(agent);
+    domains().into_iter().find_map(|domain| {
+        let job = format!("{domain}/{label}");
+        let out = launchctl(&["print", &job]).ok()?;
+        out.status.success().then_some(job)
+    })
 }
 
 #[cfg(test)]

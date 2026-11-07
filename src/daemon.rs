@@ -17,7 +17,8 @@ use crate::ask;
 use crate::bus::{Bus, Claim, Handoff, Waited};
 use crate::config::{Config, Paths};
 use crate::local::{
-    self, AgentStatus, Events, Held, Hello, Item, Messages, Request, Status, Thread, Verdict, Woken,
+    self, AgentStatus, BRIDGE_SESSION, Events, Held, Hello, Item, Messages, Request, Status,
+    Thread, Verdict, Woken,
 };
 use crate::net;
 use crate::permission;
@@ -213,7 +214,7 @@ fn items(found: &[Incoming]) -> Vec<Item> {
     found.iter().cloned().map(Item::from).collect()
 }
 
-fn serve_conn(bus: &Bus, stream: UnixStream) -> Result<()> {
+pub(crate) fn serve_conn(bus: &Bus, stream: UnixStream) -> Result<()> {
     let mut conn = Conn {
         reader: BufReader::new(stream.try_clone()?),
         out: stream,
@@ -309,8 +310,8 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             bus.db().agent_live(&agent, None, now_ms())?;
             let max = max.clamp(1, 100);
             // An agent session's handoffs count toward the limit; the CLI's
-            // don't.
-            let how = if session == "cli" {
+            // and a bridge's don't.
+            let how = if session == "cli" || session.starts_with(BRIDGE_SESSION) {
                 Handoff::Free
             } else {
                 Handoff::Tool

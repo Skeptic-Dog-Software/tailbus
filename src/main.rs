@@ -3,6 +3,7 @@
 
 mod alert;
 mod ask;
+mod bridge;
 mod bus;
 mod config;
 mod daemon;
@@ -131,6 +132,11 @@ enum Cmd {
         #[command(subcommand)]
         command: ServiceCmd,
     },
+    /// Answer an agent's messages with a headless CLI agent.
+    Bridge {
+        #[command(subcommand)]
+        command: BridgeCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -159,6 +165,18 @@ enum SetupApp {
         #[arg(long)]
         no_install: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum BridgeCmd {
+    /// Run a bridge in the foreground.
+    Run { agent: String },
+    /// Start a bridge now and at every login, replacing a running one.
+    Install { agent: String },
+    /// Stop a bridge and stop starting it at login.
+    Uninstall { agent: String },
+    /// Show how the bridges in the config are doing.
+    Status { agent: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -238,6 +256,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Service { command } => match command {
             ServiceCmd::Install => setup::service_install(&paths)?,
             ServiceCmd::Uninstall => setup::service_uninstall()?,
+        },
+        Cmd::Bridge { command } => match command {
+            BridgeCmd::Run { agent } => bridge::run(&paths, &agent)?,
+            BridgeCmd::Install { agent } => setup::bridge_install(&paths, &agent)?,
+            BridgeCmd::Uninstall { agent } => setup::bridge_uninstall(&agent)?,
+            BridgeCmd::Status { agent } => bridge::status(&paths, agent.as_deref())?,
         },
         Cmd::Send {
             to,

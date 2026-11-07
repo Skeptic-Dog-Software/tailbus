@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 use crate::proto::{AgentList, Message};
 use crate::store::{Incoming, Outgoing};
 
+/// How `tailbus bridge` sessions' names start. Like the CLI's, their
+/// handoffs don't count toward the limit: nobody can type in a bridge's
+/// session to clear it, and a bridge only ever sends responses.
+pub const BRIDGE_SESSION: &str = "bridge-";
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -124,6 +129,18 @@ pub enum Request {
         after: u64,
     },
 }
+
+/// The daemon's answer was no, as opposed to there being no answer.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 #[derive(Serialize, Deserialize)]
 struct Reply {
@@ -373,7 +390,8 @@ impl Client {
         }
         let reply: Reply = serde_json::from_str(&line).context("reading the daemon's reply")?;
         if !reply.ok {
-            bail!("{}", reply.error.unwrap_or_else(|| "unknown error".into()));
+            let why = reply.error.unwrap_or_else(|| "unknown error".into());
+            return Err(Refused(why).into());
         }
         Ok(serde_json::from_value(reply.data)?)
     }

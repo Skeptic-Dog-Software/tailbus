@@ -95,7 +95,7 @@ Each decision has a short why, so it survives later simplification.
    | Local API and CLI | anything that can open a Unix socket or run a command: scripts, custom agents on any provider's SDK | Send, receive, acknowledge. `tailbus recv --wait` blocks until a message arrives. |
    | MCP tools | nearly every agent app (Claude Code, Codex, Gemini CLI, opencode, Cursor, …) | The tool set below, including `msg_wait`, which blocks until a reply arrives. |
    | Push adapter | agent apps that let an outside process inject into a running session | Messages appear in the conversation without the agent asking, and wake an idle session. |
-   | Bot runner | agent apps with a headless mode that resumes a session, and plain provider APIs | tailbus runs the agent itself, one turn per message. Nobody needs a terminal open. See [Bots](#bots). |
+   | Bot runner | agent apps with a headless mode that resumes a session, and plain provider APIs | tailbus runs the agent itself, one turn per message. Nobody needs a terminal open. See [Bots](#bots), and [Bridges](#bridges) for what's built. |
 
    Push adapters are per agent app (decision 5). Without one, an agent still
    gets every message, through its tools and through a "you have mail" note
@@ -174,6 +174,7 @@ Each decision has a short why, so it survives later simplification.
 | `tailbus hook` | Hook commands for each app: `session-start` (subscribe, record the session ID, note waiting mail), `wait` (Claude Code's background hook that waits for the next message) and `stop` (Codex and Grok Build: carry on if mail is waiting). |
 | `tailbus setup claude\|codex\|grok` | Writes the app's MCP config, hooks and plugin, and says what's left to do by hand, such as trusting the hooks. |
 | `tailbus bot` | `add`, `list`, `remove` and `log` for [bots](#bots). |
+| `tailbus bridge` | `run`, `install`, `uninstall` and `status` for [bridges](#bridges), each its own process under launchd. |
 | `tailbus` CLI | `send`, `recv [--wait \| --follow]`, `ack`, `inbox`, `agent add/list`, `peers`, `status` and `tail`. `--follow` prints a one-line notice per message, for Grok Build's monitor. |
 
 ## Message lifecycle
@@ -387,6 +388,90 @@ at a terminal.
 - **Cost:** every turn re-reads the session's history. Grok Build's ACP
   server, Codex's app-server and the Claude Agent SDK keep a session open
   between turns instead. The runner can switch to them later (phase 4).
+
+### Bridges
+
+Built 2026-11-06, as the bot runner's first form, to replace a Python loop
+that answered messages for omp on `server`. A bridge runs any headless
+CLI agent, set up in a `[bridges.<agent>]` table. The
+[README](README.md#headless-agents) has the settings. Where it differs from
+the plan above:
+
+- **It's its own process, not part of the daemon.** Every upgrade restarts the
+  daemon, which shouldn't cut off a run of ten minutes, and a run going wrong
+  shouldn't reach the bus. It has its own launchd job.
+- **It's configured, not per app.** The table says what to run, so a new
+  agent needs no code, and there's no `--app`.
+- **One message, one run, with up to `max_concurrent` at once.** The plan's
+  one turn for everything waiting doesn't suit review work, where each
+  request stands alone.
+- **A session can be `fresh`, and that's the default.** A `per-sender` session
+  is the plan's running session, kept per sender.
+
+What it keeps from the plan: the message goes in by stdin or file, framed as
+untrusted, and a session never has two writers.
+
+How a message moves:
+
+1. A bridge holds its agent's name, like any session, so one bridge runs per
+   agent, and the agent shows as live. Its session name is new on each start.
+   Names starting `bridge-` get the CLI's exemption from the handoff limit:
+   nobody can type in a bridge's session to clear it, and a bridge only ever
+   sends responses.
+2. A worker takes one message, and the hand-off is confirmed. The message is
+   now pending with this session. Workers take in turn, so a sender's
+   messages reach its session in the order they came.
+3. `inflight/<id>.json` records the try, then the run's process group and
+   when its leader started.
+4. The answer is saved to `inflight/<id>.reply`, then sent. The reply
+   acknowledges the message, and the records go.
+
+What a restart does follows from step 1. A new session name means the old
+one is no longer live, so the bus hands its pending messages to the new
+session, as it would to any agent's next session. The Python loop always
+received as `cli`, which the bus never gives a message twice, so a crash
+left the message pending for good and its sender waiting.
+
+Holding the name also means no other bridge is using these records, so what
+the journal says is running really is left over. Before killing it, the
+bridge checks the process still started when the journal says, since a PID
+can be reused. If the leader has exited, whatever it left is not touched.
+
+Delivery is at-least-once, so a run cut short can repeat what it had already
+done. The alternative, telling the sender to ask again, loses the work to
+save a repeat, and would need a person in the loop. A message whose runs the
+bridge dies in `MAX_ATTEMPTS` times ends in a failure reply, so one bad
+message can't crash-loop the bridge forever.
+
+`[bridges.*]` tables stay unparsed in the daemon's config, so a mistake in one
+stops that bridge, not the bus.
+
+#### omp on `server`, checked 2026-11-06 on omp 18.17.0
+
+No real model: a stand-in on `127.0.0.1` returned canned text.
+
+| Check | Result |
+| --- | --- |
+| 8 at once on one used `HOME`, own session directories, 3 rounds | All 24 finished, with no errors in omp's logs. |
+| 8 at once on a brand-new `HOME`, 5 rounds | 5 of 40 crashed creating `agent.db` (`table settings already exists`). A real `HOME` is past this: signing in creates it. |
+| A new, empty `--session-dir` | Saw nothing from an earlier run. |
+| `-c` in the same directory | Saw the earlier run. |
+| 4 at once with `-c` on one session | All exited 0, but each forked the conversation, saying so only on stderr. So a sender's runs go one at a time. |
+| Where a conversation is stored with `--session-dir` | Only there. `HOME` keeps a pointer of about 100 bytes per session. |
+| stdin left open | omp waits for it forever, so stdin must end. |
+
+So a shared `HOME` is safe at `max_concurrent` above 1, and a `HOME` for each
+run isn't needed, and wouldn't work: it holds the sign-in.
+
+A `HOME` shared between runs still means a fresh session isn't sealed off.
+`working_directory` is shared too, by choice, because the gateway settings
+might be found relative to it. The docs say files left in either can reach
+later runs.
+
+Rust's `Command` passes on the parent's signal mask, so blocking the stop
+signals in the bridge blocked them in the agent too, and it could only be
+killed. Only a timing test on the real binary showed it. The agent's mask is
+now cleared before it starts.
 
 ## Permissions and conversation limits
 
@@ -1032,7 +1117,9 @@ user runs on their repos, which follows the essay.
 - **What a message can do:** become text in the recipient's conversation,
   nothing more. Agent apps keep their own permission prompts in force.
   A message to a bot also starts a turn with nobody watching, which is why
-  bots get read-only access unless given more.
+  bots get read-only access unless given more. A bridge has exactly what its
+  `args` give it, and answers only its `owner`. Its `home` keeps an agent
+  from loading tools by default, but isn't a sandbox: the agent keeps a shell.
 - **Permission answers** (phase 2) come only from a click on an alert on
   one of your own Macs, never from the local socket or another owner's
   machine.
