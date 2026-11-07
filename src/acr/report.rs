@@ -36,8 +36,11 @@ pub struct Report<'a> {
     pub tokens: u64,
     pub calls_measured: usize,
     pub calls_estimated: usize,
-    /// By the config's prices, or an agent's where the config has none.
-    /// None if a call has no price at all.
+    /// Calls that came out of a subscription, which count only in tokens.
+    pub calls_on_subscription: usize,
+    /// For the calls billed in dollars: by the config's prices, or an
+    /// agent's where the config has none. None if one of those has no
+    /// price, or none was billed in dollars.
     pub usd: Option<f64>,
     /// What the agents said, for the calls they priced.
     pub agent_usd: Option<f64>,
@@ -75,7 +78,8 @@ pub fn report<'a>(run: &'a Run, cfg: &Config) -> Report<'a> {
         tokens: run.usage.iter().map(Usage::tokens).sum(),
         calls_measured: run.usage.iter().filter(|u| u.measured).count(),
         calls_estimated: run.usage.iter().filter(|u| !u.measured).count(),
-        usd: run.usage.iter().map(|u| u.usd).sum(),
+        calls_on_subscription: run.usage.iter().filter(|u| u.subscription).count(),
+        usd: super::flow::dollars(&run.usage),
         agent_usd: run
             .usage
             .iter()

@@ -332,6 +332,10 @@ pub struct Binding {
     pub cached_input_per_mtok: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_per_mtok: Option<f64>,
+    /// Its calls come out of a subscription, so they count in tokens and
+    /// never in dollars, whatever a price or the agent says.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subscription: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -377,23 +381,24 @@ pub struct Config {
     pub outside: bool,
 }
 
+/// The framework's own defaults. They name no binding, model or provider:
+/// which model does each role is the user's to say.
 fn framework_defaults() -> Policy {
-    let bindings = [
-        (Role::Sizer, "glm-flash"),
-        (Role::Orchestrator, "opus-medium"),
-        (Role::Reviewer, "glm-flash-high"),
-        (Role::Judge, "opus-medium"),
-    ];
     Policy {
         human_gate: Some(HumanGate::Exception),
         max_rounds: Some(3),
         review_scope: Some(ReviewScope::WholePr),
-        bindings: bindings
-            .into_iter()
-            .map(|(role, name)| (role, name.to_string()))
-            .collect(),
         ..Policy::default()
     }
+}
+
+/// Where a role's binding can be set.
+fn no_binding(role: Role) -> String {
+    let role = role.as_str();
+    format!(
+        "no binding for the {role}: set `defaults.bindings.{role}` in your acr.yaml, \
+         `bindings.{role}` in the repository's config, or `--binding {role}=<name>`"
+    )
 }
 
 pub fn parse_repo(text: &str) -> Result<Policy> {
@@ -554,6 +559,12 @@ impl Config {
 
     /// Whether every binding in use is one the user allows.
     pub fn check_bindings(&self) -> Result<()> {
+        if let Some(role) = Role::ALL
+            .into_iter()
+            .find(|r| !self.bindings.contains_key(r))
+        {
+            bail!("{}", no_binding(role));
+        }
         let chosen = self
             .bindings
             .values()
@@ -625,8 +636,7 @@ impl Config {
         let name = lens
             .and_then(|l| l.binding.as_ref())
             .or_else(|| self.bindings.get(&role));
-        name.map(String::as_str)
-            .with_context(|| format!("no binding for the {}", role.as_str()))
+        name.map(String::as_str).with_context(|| no_binding(role))
     }
 
     pub fn binding<'a>(&'a self, role: Role, lens: Option<&'a Lens>) -> Result<&'a Binding> {
@@ -705,18 +715,36 @@ mod tests {
             ] {
                 assert!(!code.contains(word), "{word} in the framework");
             }
+            // Nor any model or provider: those are the user's to choose.
+            let lower = code.to_lowercase();
+            for word in [
+                "glm",
+                "opus",
+                "sonnet",
+                "haiku",
+                "fable",
+                "claude",
+                "gpt",
+                "gemini",
+                "grok",
+                "fireworks",
+                "bifrost",
+                "anthropic",
+                "openai",
+            ] {
+                assert!(!lower.contains(word), "{word} in the framework");
+            }
         }
     }
 
     #[test]
     fn layers_override_in_order() {
         let mut user = user();
-        user.defaults = Some(Policy {
-            max_rounds: Some(9),
-            review_scope: Some(ReviewScope::BottomOfStack),
-            human_gate: Some(HumanGate::Ends),
-            ..Policy::default()
-        });
+        let mut defaults = user.defaults.clone().unwrap();
+        defaults.max_rounds = Some(9);
+        defaults.review_scope = Some(ReviewScope::BottomOfStack);
+        defaults.human_gate = Some(HumanGate::Ends);
+        user.defaults = Some(defaults);
         let repo = "version: 1\nhuman_gate: per-round\nmax_rounds: 2\n\
                     tiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n\
                     lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
@@ -738,8 +766,8 @@ mod tests {
         );
         assert_eq!(
             cfg.bindings[&Role::Judge],
-            "opus-medium",
-            "the default fills the rest"
+            "large",
+            "the user's defaults fill the rest"
         );
     }
 
@@ -793,19 +821,24 @@ mod tests {
     fn costs_merge_model_by_model_and_role_by_role() {
         let mut user = user();
         let theirs = "version: 1\ncosts: {per_call: {judge: {input_tokens: 7}}, prices: {\
-                      opus: {input_per_mtok: 1, output_per_mtok: 2}, \
-                      example/glm-flash: {input_per_mtok: 3, output_per_mtok: 4}}}\n";
+                      example/large-model: {input_per_mtok: 1, output_per_mtok: 2}, \
+                      example/small-model: {input_per_mtok: 3, output_per_mtok: 4}}}\n\
+                      bindings: {sizer: small, reviewer: medium, orchestrator: large, judge: large}\n";
         user.defaults = Some(parse_repo(theirs).unwrap());
         let repo = [
             SMALL,
-            "costs: {prices: {opus: {input_per_mtok: 5, output_per_mtok: 25}}, \
+            "costs: {prices: {example/large-model: {input_per_mtok: 5, output_per_mtok: 25}}, \
              per_call: {reviewer: {input_tokens: 100, output_tokens: 10}}}\n",
         ]
         .concat();
         let cfg = resolve(&user, parse_repo(&repo).unwrap(), &Flags::default()).unwrap();
         let rate = |model: &str| cfg.costs.prices[model].input_per_mtok;
-        assert_eq!(rate("opus"), 5.0, "the repository's wins");
-        assert_eq!(rate("example/glm-flash"), 3.0, "the user's fills the rest");
+        assert_eq!(rate("example/large-model"), 5.0, "the repository's wins");
+        assert_eq!(
+            rate("example/small-model"),
+            3.0,
+            "the user's fills the rest"
+        );
         let reviewer = PerCall {
             input_tokens: 100,
             output_tokens: 10,
@@ -820,23 +853,24 @@ mod tests {
     fn a_binding_with_its_own_prices_keeps_them() {
         let repo = [
             SMALL,
-            "costs: {prices: {opus: {input_per_mtok: 5, output_per_mtok: 25}, \
-             example/glm-flash: {input_per_mtok: 1, output_per_mtok: 1}, \
-             glm-flash: {input_per_mtok: 9, output_per_mtok: 9}}}\n",
+            "costs: {prices: {example/large-model: {input_per_mtok: 5, output_per_mtok: 25}, \
+             example/small-model: {input_per_mtok: 1, output_per_mtok: 1}, \
+             example/medium-model: {input_per_mtok: 2, output_per_mtok: 2}, \
+             small: {input_per_mtok: 9, output_per_mtok: 9}}}\n",
         ]
         .concat();
         let cfg = resolved(&repo).unwrap();
         let rate = |name: &str, b: &Binding| cfg.price(name, b).map(|p| p.input_per_mtok);
-        let opus = cfg.allowed_bindings["opus-medium"].clone();
-        assert_eq!(rate("opus-medium", &opus), Some(5.0), "by its model");
-        let flash = &cfg.allowed_bindings["glm-flash"];
-        assert_eq!(rate("glm-flash", flash), Some(9.0), "by its name first");
-        let high = &cfg.allowed_bindings["glm-flash-high"];
-        assert_eq!(rate("glm-flash-high", high), Some(1.0));
+        let large = cfg.allowed_bindings["large"].clone();
+        assert_eq!(rate("large", &large), Some(5.0), "by its model");
+        let small = &cfg.allowed_bindings["small"];
+        assert_eq!(rate("small", small), Some(9.0), "by its name first");
+        let medium = &cfg.allowed_bindings["medium"];
+        assert_eq!(rate("medium", medium), Some(2.0));
         let mine = Binding {
             input_per_mtok: Some(2.0),
             output_per_mtok: Some(3.0),
-            ..opus.clone()
+            ..large.clone()
         };
         let both = Price {
             input_per_mtok: 2.0,
@@ -844,16 +878,12 @@ mod tests {
             cached_input_per_mtok: None,
             cache_write_per_mtok: None,
         };
-        assert_eq!(cfg.price("opus-medium", &mine), Some(both));
+        assert_eq!(cfg.price("large", &mine), Some(both));
         let half = Binding {
             input_per_mtok: Some(2.0),
-            ..opus
+            ..large
         };
-        assert_eq!(
-            rate("opus-medium", &half),
-            Some(5.0),
-            "half a price isn't one"
-        );
+        assert_eq!(rate("large", &half), Some(5.0), "half a price isn't one");
     }
 
     #[test]
@@ -866,15 +896,18 @@ mod tests {
         assert!(err.contains("opsu"), "{err}");
         let negative = [
             SMALL,
-            "costs: {prices: {opus: {input_per_mtok: -1, output_per_mtok: 25}}}\n",
+            "costs: {prices: {example/large-model: {input_per_mtok: -1, output_per_mtok: 25}}}\n",
         ];
         let err = format!("{:#}", resolved(&negative.concat()).unwrap_err());
         assert!(err.contains("negative"), "{err}");
-        let half = [SMALL, "costs: {prices: {opus: {input_per_mtok: 5}}}\n"];
+        let half = [
+            SMALL,
+            "costs: {prices: {example/large-model: {input_per_mtok: 5}}}\n",
+        ];
         assert!(parse_repo(&half.concat()).is_err());
         let cache = [
             SMALL,
-            "costs: {prices: {opus: {input_per_mtok: 5, output_per_mtok: 25, cached_input_per_mtok: -1}}}\n",
+            "costs: {prices: {example/large-model: {input_per_mtok: 5, output_per_mtok: 25, cached_input_per_mtok: -1}}}\n",
         ];
         assert!(resolved(&cache.concat()).is_err());
     }
@@ -901,11 +934,8 @@ mod tests {
     fn a_repository_chooses_only_from_the_users_bindings() {
         let base = "version: 1\ntiers: [{id: a, match: {paths: ['**']}, fan_out: 1}]\n";
         let lens = "lenses: [{id: l, criteria: c, triggers: {paths: ['**']}}]\n";
-        let chosen = format!("{base}{lens}bindings: {{judge: glm-flash}}\n");
-        assert_eq!(
-            resolved(&chosen).unwrap().bindings[&Role::Judge],
-            "glm-flash"
-        );
+        let chosen = format!("{base}{lens}bindings: {{judge: small}}\n");
+        assert_eq!(resolved(&chosen).unwrap().bindings[&Role::Judge], "small");
         let refused = format!("{base}{lens}bindings: {{judge: free-for-all}}\n");
         let err = format!("{:#}", resolved(&refused).unwrap_err());
         assert!(
@@ -921,12 +951,30 @@ mod tests {
     #[test]
     fn roles_that_only_read_must_name_their_tools() {
         let mut user = user();
-        user.allowed_bindings
-            .get_mut("glm-flash-high")
-            .unwrap()
-            .tools = None;
+        user.allowed_bindings.get_mut("medium").unwrap().tools = None;
         let err = resolve(&user, parse_repo(GO).unwrap(), &Flags::default()).unwrap_err();
         assert!(format!("{err:#}").contains("read-only tools"), "{err:#}");
+    }
+
+    #[test]
+    fn the_framework_chooses_no_model() {
+        let mut user = user();
+        user.defaults.as_mut().unwrap().bindings.clear();
+        let err = resolve(&user, parse_repo(GO).unwrap(), &Flags::default()).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("no binding for the") && err.contains("defaults.bindings"),
+            "{err}"
+        );
+        // Any layer can say.
+        let flags = Flags {
+            bindings: Role::ALL
+                .into_iter()
+                .map(|r| (r, "small".to_string()))
+                .collect(),
+            ..Flags::default()
+        };
+        assert!(resolve(&user, parse_repo(GO).unwrap(), &flags).is_ok());
     }
 
     #[test]

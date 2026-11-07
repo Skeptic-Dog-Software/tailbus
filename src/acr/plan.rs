@@ -101,8 +101,68 @@ pub struct RoleCost {
     pub tokens_in: u64,
     pub cache_read: u64,
     pub tokens_out: u64,
-    /// None if its binding has no prices.
+    /// None if its binding has no prices, or is a subscription.
     pub usd: Option<f64>,
+    /// Counted in tokens only.
+    pub subscription: bool,
+}
+
+impl RoleCost {
+    pub fn tokens(&self) -> u64 {
+        self.tokens_in + self.cache_read + self.tokens_out
+    }
+}
+
+/// What a review could take: always its tokens, and its dollars when they
+/// mean something.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Estimate {
+    pub tokens: u64,
+    /// For the calls billed in dollars. None if one of those has no price.
+    pub usd: Option<f64>,
+}
+
+/// Tokens and dollars, added and scaled together. A subscription's calls
+/// add no dollars.
+#[derive(Debug, Clone, Copy)]
+struct Amount {
+    tokens: f64,
+    usd: Option<f64>,
+}
+
+impl Amount {
+    const ZERO: Amount = Amount {
+        tokens: 0.0,
+        usd: Some(0.0),
+    };
+
+    fn of(c: &RoleCost) -> Amount {
+        Amount {
+            tokens: c.tokens() as f64,
+            usd: if c.subscription { Some(0.0) } else { c.usd },
+        }
+    }
+
+    fn times(self, n: f64) -> Amount {
+        Amount {
+            tokens: self.tokens * n,
+            usd: self.usd.map(|u| u * n),
+        }
+    }
+
+    fn plus(self, other: Amount) -> Amount {
+        Amount {
+            tokens: self.tokens + other.tokens,
+            usd: all([self.usd, other.usd]),
+        }
+    }
+
+    fn estimate(self) -> Estimate {
+        Estimate {
+            tokens: self.tokens.round() as u64,
+            usd: self.usd,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,15 +177,18 @@ pub struct Plan {
     /// One fix by the Orchestrator, made between rounds. None with one round.
     pub fix: Option<RoleCost>,
     /// With every lens done in one round.
-    pub low_usd: Option<f64>,
+    pub least: Estimate,
     /// With each lens taking the rounds it took before here, on average.
     /// None without earlier reviews.
-    pub expected_usd: Option<f64>,
+    pub expected: Option<Estimate>,
     /// The finished reviews of this repository that went into it.
     pub history_runs: usize,
     /// With every lens going all the way to `max_rounds`, and a fix between
     /// each round.
-    pub worst_usd: Option<f64>,
+    pub most: Estimate,
+    /// Whether any call is billed in dollars, rather than all coming out of
+    /// subscriptions.
+    pub dollars: bool,
     /// Bindings in use that nothing gives a price, as `name (model)`.
     pub unpriced: Vec<String>,
     /// What the config says each call by a role adds, for the roles above.
@@ -140,7 +203,9 @@ pub struct Cost {
     pub tokens_in: u64,
     pub cache_read: u64,
     pub tokens_out: u64,
+    /// None if it has no price, or is on a subscription.
     pub usd: Option<f64>,
+    pub subscription: bool,
 }
 
 /// What a call is estimated to cost: the text ACR sends and reads back,
@@ -159,13 +224,16 @@ pub fn cost(
         extra.cache_read_tokens,
         text_out + extra.output_tokens,
     );
+    let subscription = binding.is_some_and(|b| b.subscription);
     Cost {
         tokens_in,
         cache_read,
         tokens_out,
         usd: binding
+            .filter(|_| !subscription)
             .and_then(|b| cfg.price(name, b))
             .map(|p| p.usd(tokens_in, cache_read, 0, tokens_out)),
+        subscription,
     }
 }
 
@@ -326,11 +394,12 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
             cache_read: calls * one.cache_read,
             tokens_out: calls * one.tokens_out,
             // Nothing costs nothing, priced or not.
-            usd: if calls == 0 {
+            usd: if calls == 0 && !one.subscription {
                 Some(0.0)
             } else {
                 one.usd.map(|usd| usd * calls as f64)
             },
+            subscription: one.subscription,
         })
     };
     let sizer = role_cost(Role::Sizer, None, u64::from(by_paths.is_none()), artifact)?;
@@ -351,34 +420,32 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
         .transpose()?;
 
     // What a lens's round costs: its reviewers, and its call to the Judge.
-    let judge_one = judges.usd.map(|usd| usd / judges.calls.max(1) as f64);
-    let rounds: Vec<(&str, Option<f64>)> = chosen
+    let judge_one = Amount::of(&judges).times(1.0 / judges.calls.max(1) as f64);
+    let rounds: Vec<(&str, Amount)> = chosen
         .iter()
         .zip(&reviewers)
-        .map(|((lens, _), r)| (lens.id.as_str(), all([r.usd, judge_one])))
+        .map(|((lens, _), r)| (lens.id.as_str(), Amount::of(r).plus(judge_one)))
         .collect();
-    let setup = all([sizer.usd, orchestrator.usd]);
-    let fix_usd = fix.as_ref().map_or(Some(0.0), |f| f.usd);
+    let setup = Amount::of(&sizer).plus(Amount::of(&orchestrator));
+    let one_fix = fix.as_ref().map_or(Amount::ZERO, Amount::of);
     let max = f64::from(cfg.max_rounds);
-    let low_usd = all([setup, all(rounds.iter().map(|(_, usd)| *usd))]);
     let at = |lens_rounds: &dyn Fn(&str) -> f64, fixes: f64| {
-        all([
-            setup,
-            all(rounds
-                .iter()
-                .map(|(id, usd)| usd.map(|usd| usd * lens_rounds(id)))),
-            fix_usd.map(|usd| usd * fixes),
-        ])
+        rounds
+            .iter()
+            .fold(setup, |sum, (id, round)| {
+                sum.plus(round.times(lens_rounds(id)))
+            })
+            .plus(one_fix.times(fixes))
+            .estimate()
     };
-    let worst_usd = at(&|_| max, max - 1.0);
-    let expected_usd = if history.runs == 0 {
-        None
-    } else {
+    let least = at(&|_| 1.0, 0.0);
+    let most = at(&|_| max, max - 1.0);
+    let expected = (history.runs > 0).then(|| {
         at(
             &|id| history.rounds(id).min(max),
             history.fixes().min(max - 1.0),
         )
-    };
+    });
 
     let first_round: Vec<RoleCost> = [sizer, orchestrator]
         .into_iter()
@@ -386,9 +453,13 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
         .chain([judges])
         .filter(|c| c.calls > 0)
         .collect();
+    let dollars = first_round
+        .iter()
+        .chain(fix.as_ref())
+        .any(|c| !c.subscription);
     let mut unpriced = Vec::new();
     for c in first_round.iter().chain(fix.as_ref()) {
-        if c.usd.is_none() {
+        if c.usd.is_none() && !c.subscription {
             let model = cfg
                 .allowed_bindings
                 .get(&c.binding)
@@ -423,10 +494,11 @@ pub fn dry_run(cfg: &Config, change: &Change, history: &History) -> Result<Plan>
         files: change.files.len(),
         first_round,
         fix,
-        low_usd,
-        expected_usd,
+        least,
+        expected,
         history_runs: history.runs,
-        worst_usd,
+        most,
+        dollars,
         unpriced,
         per_call,
         escalates,
@@ -519,9 +591,9 @@ mod tests {
             .map(|c| c.calls)
             .sum();
         assert_eq!(reviews, plan.lenses.len() as u64 * 3);
-        assert!(plan.worst_usd.unwrap() > 0.0);
+        assert!(plan.most.usd.unwrap() > 0.0);
         let first: f64 = plan.first_round.iter().map(|c| c.usd.unwrap()).sum();
-        assert!(plan.worst_usd.unwrap() > first);
+        assert!(plan.most.usd.unwrap() > first);
         assert!(plan.unpriced.is_empty());
     }
 
@@ -530,10 +602,10 @@ mod tests {
         let mut cfg = example();
         cfg.costs.prices.clear();
         let plan = dry(&cfg, &change(&["a.go"], "+x\n")).unwrap();
-        assert_eq!(plan.worst_usd, None);
+        assert_eq!(plan.most.usd, None);
         assert!(
             plan.unpriced
-                .contains(&"glm-flash-high (example/glm-flash)".to_string()),
+                .contains(&"medium (example/medium-model)".to_string()),
             "{:?}",
             plan.unpriced
         );
@@ -556,17 +628,17 @@ mod tests {
         let fix = plan.fix.as_ref().unwrap().usd.unwrap();
         let max = f64::from(cfg.max_rounds);
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
-        assert!(close(plan.low_usd.unwrap(), setup + round));
+        assert!(close(plan.least.usd.unwrap(), setup + round));
         assert!(close(
-            plan.worst_usd.unwrap(),
+            plan.most.usd.unwrap(),
             setup + round * max + fix * (max - 1.0)
         ));
-        assert_eq!(plan.expected_usd, None, "no history, no expectation");
+        assert!(plan.expected.is_none(), "no history, no expectation");
         let mut once = cfg.clone();
         once.max_rounds = 1;
         let plan = dry(&once, &change(&["a.go"], "+x\n")).unwrap();
         assert!(plan.fix.is_none());
-        assert!(close(plan.worst_usd.unwrap(), plan.low_usd.unwrap()));
+        assert!(close(plan.most.usd.unwrap(), plan.least.usd.unwrap()));
     }
 
     #[test]
@@ -586,7 +658,7 @@ mod tests {
         let round = usd(&base, Role::Reviewer) + usd(&base, Role::Judge);
         let fix = base.fix.as_ref().unwrap().usd.unwrap();
         let want = setup + round * 2.0 + fix * 1.0;
-        assert!((plan.expected_usd.unwrap() - want).abs() < 1e-9);
+        assert!((plan.expected.unwrap().usd.unwrap() - want).abs() < 1e-9);
         assert_eq!(plan.history_runs, 2);
         // Never past max_rounds, whatever happened before.
         let long = History {
@@ -595,7 +667,45 @@ mod tests {
             fixes: vec![8],
         };
         let plan = dry_run(&cfg, &go, &long).unwrap();
-        assert!((plan.expected_usd.unwrap() - plan.worst_usd.unwrap()).abs() < 1e-9);
+        assert!((plan.expected.unwrap().usd.unwrap() - plan.most.usd.unwrap()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn on_a_subscription_it_counts_tokens_and_no_dollars() {
+        let mut cfg = example();
+        for b in cfg.allowed_bindings.values_mut() {
+            b.subscription = true;
+        }
+        let plan = dry(&cfg, &change(&["a.go"], "+x\n")).unwrap();
+        assert!(!plan.dollars);
+        assert!(plan.unpriced.is_empty(), "a subscription needs no price");
+        assert!(plan.least.tokens > 0 && plan.most.tokens > plan.least.tokens);
+        assert!(
+            plan.first_round
+                .iter()
+                .all(|c| c.subscription && c.usd.is_none())
+        );
+        // One billed binding brings dollars back, for its calls alone.
+        cfg.allowed_bindings.get_mut("medium").unwrap().subscription = false;
+        let mixed = dry(&cfg, &change(&["a.go"], "+x\n")).unwrap();
+        assert!(mixed.dollars);
+        let reviewers: f64 = mixed
+            .first_round
+            .iter()
+            .filter(|c| c.role == Role::Reviewer)
+            .map(|c| c.usd.unwrap())
+            .sum();
+        assert!((mixed.least.usd.unwrap() - reviewers).abs() < 1e-9);
+        assert_eq!(mixed.least.tokens, plan.least.tokens, "tokens don't change");
+    }
+
+    #[test]
+    fn tokens_need_no_price() {
+        let mut cfg = example();
+        cfg.costs.prices.clear();
+        let plan = dry(&cfg, &change(&["a.go"], "+x\n")).unwrap();
+        assert_eq!(plan.most.usd, None);
+        assert!(plan.least.tokens > 0 && plan.most.tokens > plan.least.tokens);
     }
 
     #[test]
@@ -617,7 +727,7 @@ mod tests {
         let (_, bare_in, bare_out) = reviewers(&without);
         assert_eq!(tokens_in - bare_in, calls * 40_000);
         assert_eq!(tokens_out - bare_out, calls * 6_000);
-        assert!(with.worst_usd.unwrap() > without.worst_usd.unwrap());
+        assert!(with.most.usd.unwrap() > without.most.usd.unwrap());
         assert!(with.per_call.iter().any(|(r, _)| *r == Role::Reviewer));
         assert!(without.per_call.is_empty());
     }

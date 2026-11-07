@@ -423,6 +423,19 @@ fn history(paths: &Paths, repo: &Path) -> plan::History {
     plan::History::of(keep::history(paths, repo))
 }
 
+/// 1234567 as 1,234,567.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
+}
+
 fn describe_plan(plan: &plan::Plan) {
     let how = if plan.tier_decided {
         "from its paths"
@@ -439,16 +452,19 @@ fn describe_plan(plan: &plan::Plan) {
         println!("  {} on {} ({:?})", lens.id, lens.binding, lens.why);
     }
     let tokens = |cost: &plan::RoleCost| {
-        let usd = cost
-            .usd
-            .map_or("no price".to_string(), |u| format!("${u:.4}"));
+        let usd = match (cost.subscription, cost.usd) {
+            (true, _) => "subscription".to_string(),
+            (false, Some(u)) => format!("${u:.4}"),
+            (false, None) => "no price".to_string(),
+        };
         let cached = match cost.cache_read {
             0 => String::new(),
-            n => format!(", {n} read from cache,"),
+            n => format!(", {} read from cache,", thousands(n)),
         };
         format!(
             "about {} tokens in{cached} and {} out, {usd}",
-            cost.tokens_in, cost.tokens_out
+            thousands(cost.tokens_in),
+            thousands(cost.tokens_out)
         )
     };
     println!("First round:");
@@ -468,33 +484,37 @@ fn describe_plan(plan: &plan::Plan) {
             tokens(fix)
         );
     }
-    let dollars = |usd: Option<f64>| {
-        usd.map_or(
-            "can't say, since a binding has no prices".to_string(),
-            |u| format!("about ${u:.4}"),
-        )
+    // Tokens always. Dollars only for calls billed in them.
+    let figure = |e: &plan::Estimate| {
+        let usd = match (plan.dollars, e.usd) {
+            (false, _) => String::new(),
+            (true, Some(u)) => format!(" (${u:.2})"),
+            (true, None) => " (dollars: a binding has no price)".to_string(),
+        };
+        format!("about {} tokens{usd}", thousands(e.tokens))
     };
-    println!("Cost:");
+    println!("Tokens:");
     println!(
         "  At least, with every lens done in one round: {}",
-        dollars(plan.low_usd)
+        figure(&plan.least)
     );
-    match (plan.history_runs, plan.expected_usd) {
-        (0, _) => {
+    match &plan.expected {
+        None => {
             println!("  Expected: can't say yet, with no finished reviews of this repository here")
         }
-        (n, usd) => println!(
-            "  Expected, from the last {n} finished review(s) here: {}",
-            dollars(usd)
+        Some(e) => println!(
+            "  Expected, from the last {} finished review(s) here: {}",
+            plan.history_runs,
+            figure(e)
         ),
     }
     println!(
         "  At most, with every lens through every round and a fix between: {}",
-        dollars(plan.worst_usd)
+        figure(&plan.most)
     );
     if !plan.unpriced.is_empty() {
         println!(
-            "No price for {}: add it under costs.prices",
+            "No price for {}: add it under costs.prices, or mark its binding `subscription: true`",
             plan.unpriced.join(", ")
         );
     }
@@ -739,7 +759,7 @@ mod tests {
         };
         let call = Call {
             role: Role::Orchestrator,
-            binding_name: "opus",
+            binding_name: "large",
             binding: &binding,
             prompt: "Fix these",
             artifact: None,

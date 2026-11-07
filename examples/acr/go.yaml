@@ -36,8 +36,9 @@ lenses:
 # What estimates are made from. Measure your own: these are examples.
 costs:
   prices:
-    example/glm-flash: {input_per_mtok: 0.1, output_per_mtok: 0.4}
-    opus: {input_per_mtok: 5, output_per_mtok: 25}
+    example/small-model: {input_per_mtok: 0.1, output_per_mtok: 0.5}
+    example/medium-model: {input_per_mtok: 1, output_per_mtok: 5}
+    example/large-model: {input_per_mtok: 5, output_per_mtok: 25}
   per_call:
     reviewer: {input_tokens: 40000, output_tokens: 6000}
     judge: {input_tokens: 8000, output_tokens: 3000}

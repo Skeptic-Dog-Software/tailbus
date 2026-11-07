@@ -506,6 +506,14 @@ about 8.
 - **The agent's word.** An agent could write anything to its session, so
   usage is only for costs. The bridge doesn't follow links out of the
   session, and reads at most 1,000 files.
+- **Tokens first, dollars where they're spent.** On a subscription, dollars
+  mean nothing and tokens still do, so every figure is tokens, and dollars
+  come only for calls billed in them. `subscription: true` on a binding
+  keeps a price or an agent's own figure from turning its tokens into
+  dollars.
+- **No model of its own.** The framework names no binding, model or
+  provider, and a test fails if one appears in its code. Every role's
+  binding comes from the user's or the repository's config, or a flag.
 - **The config's price first.** ACR prices a counted call by the config, so
   that the plan and the report agree, and keeps what the agent said beside
   it. With no price in the config, it uses the agent's.

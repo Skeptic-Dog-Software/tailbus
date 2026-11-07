@@ -473,12 +473,16 @@ confirmed when its latest round has no blockers. The method is in
 [the ACR skill](plugin/skills/acr/SKILL.md). All four roles go through
 [bridges](#headless-agents).
 
-| Role | Job | Default binding |
+| Role | Job | Sized for |
 | --- | --- | --- |
-| Sizer | Classifies the change and picks the tier | `glm-flash` |
-| Orchestrator | Settles plain-language triggers, and fixes blockers | `opus-medium` |
-| Reviewer | Attacks one lens, in a fresh session with read-only tools | `glm-flash-high` |
-| Judge | Rates findings, and merges a lens's reviewers into one result | `opus-medium` |
+| Sizer | Classifies the change and picks the tier | A small, fast model: one quick call |
+| Orchestrator | Settles plain-language triggers, and fixes blockers | A strong model: few calls, and it writes |
+| Reviewer | Attacks one lens, in a fresh session with read-only tools | A mid-size model thinking hard: most of the calls |
+| Judge | Rates findings, and merges a lens's reviewers into one result | A strong model: it decides what blocks |
+
+tailbus names no model or provider. Each role's binding comes from
+`defaults.bindings` in your config, `bindings` in the repository's, a lens's
+`binding`, or `--binding role=name`, and a role without one is an error.
 
 Code runs the loop, so a run is repeatable, and can stop for a person and go
 on. Models are called only for judgment.
@@ -543,8 +547,12 @@ escalations. These always stop for a person, in any mode: reviewers split, a
 rejection that's a values call, a blocker at `max_rounds`, anything in
 `always_escalate`, a change to the config, or a review that didn't fully run.
 
-**Costs** come from the repository config's `costs`, which the repository's
-agent keeps. A call through a bridge that reports [what a run
+**Costs** are tokens first: every estimate and report counts them, whoever
+pays. Dollars come only where a call is billed in them. A binding that sets
+`subscription: true` in your config counts in tokens alone, whatever a price
+or its agent says, so a subscription plan needs no prices at all. What
+estimates are made from is the repository config's `costs`, which the
+repository's agent keeps. A call through a bridge that reports [what a run
 used](#what-a-run-used) is counted as the agent counted it. Any other call
 is estimated: the text ACR sends it and reads back, plus `costs.per_call`
 for its role. That covers what the text misses: the files its tools read,
@@ -559,21 +567,23 @@ the agent's.
 ```yaml
 costs:
   prices:
-    example/glm-flash: {input_per_mtok: 0.1, output_per_mtok: 0.4}
-    opus: {input_per_mtok: 5, output_per_mtok: 25}
+    example/small-model: {input_per_mtok: 0.1, output_per_mtok: 0.5}
+    example/large-model: {input_per_mtok: 5, output_per_mtok: 25}
   per_call:
     reviewer: {input_tokens: 8000, cache_read_tokens: 40000, output_tokens: 6000}
     judge: {input_tokens: 8000, output_tokens: 3000}
 ```
 
-`tailbus acr plan` gives three figures. The least has every lens done in one
+`tailbus acr plan` gives three figures, each in tokens, with dollars beside
+them when any call is billed in dollars. The least has every lens done in one
 round. The expected has each lens taking as many rounds as it did, on average,
 in the last 20 finished reviews of the repository on this machine, or every
 lens's average for a new one. The most has every lens go through every round,
-with a fix between. The plan names any binding with no price, and says when
-nothing counts the tokens an agent reads and thinks. A run's report has
-`tokens` and `usd`, how many calls were counted and how many estimated, and
-`agent_usd`, what the agents said, beside the config's prices. A price for a
+with a fix between. The plan names any binding billed in dollars that has no
+price, and says when nothing counts the tokens an agent reads and thinks. A
+run's report has `tokens`, how many calls were counted, estimated and on a
+subscription, and for the calls billed in dollars, `usd` by the config's
+prices and `agent_usd`, what the agents said. A price for a
 model none of your bindings use is an error, so a misspelt one is caught.
 
 **Fixes need the checkout.** After a fix, ACR reads the change from the working

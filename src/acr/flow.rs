@@ -187,12 +187,23 @@ pub struct Usage {
     /// What the agent said the call cost.
     #[serde(default)]
     pub agent_usd: Option<f64>,
+    /// It came out of a subscription: tokens count, dollars don't.
+    #[serde(default)]
+    pub subscription: bool,
 }
 
 impl Usage {
     pub fn tokens(&self) -> u64 {
         self.tokens_in + self.cache_read + self.cache_write + self.tokens_out
     }
+}
+
+/// The dollars of the calls billed in them. None if one of those has no
+/// price, or none was billed in dollars at all.
+pub fn dollars(usage: &[Usage]) -> Option<f64> {
+    let mut billed = usage.iter().filter(|u| !u.subscription).peekable();
+    billed.peek()?;
+    billed.map(|u| u.usd).sum()
 }
 
 /// A review, as far as it's got. It's all saved, so that it can stop for a
@@ -250,6 +261,7 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         usd: None,
         measured: false,
         agent_usd: None,
+        subscription: call.binding.subscription,
     };
     match &answer.usage {
         Some(counted) => {
@@ -258,6 +270,9 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
             usage.cache_write = counted.cache_write_tokens;
             usage.tokens_out = counted.output_tokens;
             usage.measured = true;
+            if usage.subscription {
+                return usage;
+            }
             usage.agent_usd = counted.usd;
             usage.usd = cfg
                 .price(call.binding_name, call.binding)
@@ -970,7 +985,7 @@ pub fn score(run: &Run, known: &[Known]) -> Result<Score> {
         caught,
         missed,
         false_findings,
-        usd: run.usage.iter().map(|u| u.usd).sum(),
+        usd: dollars(&run.usage),
         tokens: run.usage.iter().map(Usage::tokens).sum(),
         failures: run
             .lenses
@@ -1077,8 +1092,9 @@ lenses:
 
     #[test]
     fn a_call_its_agent_counted_is_recorded_as_counted() {
-        let prices = "costs: {prices: {example/glm-flash: {input_per_mtok: 1, output_per_mtok: 2, cached_input_per_mtok: 0.1}, \
-                      opus: {input_per_mtok: 1, output_per_mtok: 2, cached_input_per_mtok: 0.1}}, \
+        let prices = "costs: {prices: {example/small-model: {input_per_mtok: 1, output_per_mtok: 2, cached_input_per_mtok: 0.1}, \
+                      example/medium-model: {input_per_mtok: 1, output_per_mtok: 2, cached_input_per_mtok: 0.1}, \
+                      example/large-model: {input_per_mtok: 1, output_per_mtok: 2, cached_input_per_mtok: 0.1}}, \
                       per_call: {reviewer: {input_tokens: 99999}}}";
         let cfg = config("exception", 1, 1, "", prices);
         let mut fake = Fake::new(defect_in("alpha", 99));
@@ -1107,6 +1123,22 @@ lenses:
         assert_eq!(json["calls_estimated"], 0);
         let calls = run.usage.len() as f64;
         assert!((json["agent_usd"].as_f64().unwrap() - 9.0 * calls).abs() < 1e-9);
+        // On a subscription, neither the config's price nor the agent's
+        // counts: only tokens.
+        let mut subscribed = cfg.clone();
+        for b in subscribed.allowed_bindings.values_mut() {
+            b.subscription = true;
+        }
+        let (run, _) = go(&subscribed, &["a.src"], &fake);
+        assert!(
+            run.usage
+                .iter()
+                .all(|u| u.subscription && u.usd.is_none() && u.agent_usd.is_none())
+        );
+        assert!(run.usage.iter().all(|u| u.tokens() == 3_000_000));
+        let json = serde_json::to_value(report::report(&run, &subscribed)).unwrap();
+        assert_eq!(json["usd"], serde_json::Value::Null);
+        assert_eq!(json["calls_on_subscription"], run.usage.len());
         // With no price in the config, the agent's own is used.
         let bare = plain("exception", 1, 1);
         let (run, _) = go(&bare, &["a.src"], &fake);
@@ -1217,8 +1249,9 @@ lenses:
 
     #[test]
     fn history_is_the_rounds_finished_reviews_took() {
-        let prices = "costs: {prices: {example/glm-flash: {input_per_mtok: 1, output_per_mtok: 2}, \
-                      opus: {input_per_mtok: 5, output_per_mtok: 25}}}";
+        let prices = "costs: {prices: {example/small-model: {input_per_mtok: 1, output_per_mtok: 2}, \
+                      example/medium-model: {input_per_mtok: 1, output_per_mtok: 2}, \
+                      example/large-model: {input_per_mtok: 1, output_per_mtok: 2}}}";
         let cfg = config("exception", 3, 1, "", prices);
         let fake = Fake::new(defect_in("alpha", 1));
         let (done, _) = go(&cfg, &["a.src"], &fake);
@@ -1235,9 +1268,9 @@ lenses:
         assert_eq!(history.runs, 1, "only a finished review counts");
         let plan = plan::dry_run(&cfg, &change(&["a.src"]), &history).unwrap();
         let (low, expected, worst) = (
-            plan.low_usd.unwrap(),
-            plan.expected_usd.unwrap(),
-            plan.worst_usd.unwrap(),
+            plan.least.usd.unwrap(),
+            plan.expected.unwrap().usd.unwrap(),
+            plan.most.usd.unwrap(),
         );
         assert!(
             low < expected && expected < worst,
@@ -1599,7 +1632,7 @@ lenses:
 
     #[test]
     fn a_lens_can_have_its_own_binding() {
-        let extra = r#"  - {id: gamma, criteria: "gamma criteria", triggers: {paths: ["**/*.src"]}, binding: glm-flash}"#;
+        let extra = r#"  - {id: gamma, criteria: "gamma criteria", triggers: {paths: ["**/*.src"]}, binding: small}"#;
         let cfg = config("exception", 3, 1, extra, "");
         let fake = Fake::new(|_, _: &str| Ok(CLEAN.to_string()));
         go(&cfg, &["a.src"], &fake);
@@ -1608,12 +1641,12 @@ lenses:
             .iter()
             .find(|c| c.3.contains("gamma criteria"))
             .unwrap();
-        assert_eq!(gamma.1, "glm-flash");
+        assert_eq!(gamma.1, "small");
         let alpha = calls
             .iter()
             .find(|c| c.3.contains("alpha criteria"))
             .unwrap();
-        assert_eq!(alpha.1, "glm-flash-high");
+        assert_eq!(alpha.1, "medium");
     }
 
     #[test]
@@ -1631,8 +1664,9 @@ lenses:
     #[test]
     fn the_report_can_be_read_by_a_machine() {
         let top = "integrations:\n  comment: full\n  labels: {not_ready: nr, ready: rd, waiting: \"wait:{lens}\", confirmed: \"ok:{lens}\"}\n\
-                   costs: {prices: {example/glm-flash: {input_per_mtok: 0.1, output_per_mtok: 0.4}, \
-                   opus: {input_per_mtok: 5, output_per_mtok: 25}}, \
+                   costs: {prices: {example/small-model: {input_per_mtok: 0.1, output_per_mtok: 0.4}, \
+                   example/medium-model: {input_per_mtok: 0.1, output_per_mtok: 0.4}, \
+                   example/large-model: {input_per_mtok: 0.1, output_per_mtok: 0.4}}, \
                    per_call: {reviewer: {input_tokens: 1000, output_tokens: 500}}}";
         let cfg = config("exception", 2, 1, "", top);
         let fake = Fake::new(defect_in("alpha", 99));
@@ -1649,7 +1683,7 @@ lenses:
         let used = json["bindings_used"].as_array().unwrap();
         assert!(
             used.iter()
-                .any(|b| b["role"] == "reviewer" && b["binding"] == "glm-flash-high")
+                .any(|b| b["role"] == "reviewer" && b["binding"] == "medium")
         );
         assert!(json["tokens"].as_u64().unwrap() > 0);
         assert!(json["usd"].as_f64().unwrap() > 0.0);

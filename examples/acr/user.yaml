@@ -1,27 +1,32 @@
-# Your ACR config, at ~/.config/tailbus/acr.yaml. Only this file can say how
-# models are reached. A repository chooses among these names. The agents and
-# models here are examples: set your own. A repository's `costs` prices them.
-# A binding can set input_per_mtok and output_per_mtok itself, and then keeps
-# its own prices.
+# Your ACR config, at ~/.config/tailbus/acr.yaml. Only this file says how
+# models are reached: which bridge agent, which of its models, with which
+# tools. A repository chooses among these names. tailbus assumes no provider,
+# model or binding of its own, so everything here is an example: set your own.
 version: 1
 allowed_bindings:
-  glm-flash:
-    agent: omp@server
-    model: example/glm-flash
+  small:
+    agent: models@my-mac
+    model: example/small-model
     tools: [read, grep, glob]
     timeout: 300
-  glm-flash-high:
-    agent: omp@server
-    model: example/glm-flash
+  medium:
+    agent: models@my-mac
+    model: example/medium-model
     effort: high
     tools: [read, grep, glob]
     timeout: 900
-  opus-medium:
-    agent: acr-opus@laptop
-    model: opus
+  large:
+    agent: models@my-mac
+    model: example/large-model
     effort: medium
     tools: [read, grep, glob]
     timeout: 900
     workdir: /Users/you/Work/the-repo
 defaults:
   human_gate: exception
+  # Every role needs a binding, here or in the repository's config.
+  bindings:
+    sizer: small
+    reviewer: medium
+    orchestrator: large
+    judge: large
