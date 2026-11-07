@@ -207,8 +207,50 @@ pub fn tagged(item: &Item) -> String {
     if let Some(r) = &m.reply_to {
         let _ = write!(attrs, " reply-to=\"{r}\"");
     }
-    let body = m.body.replace("</tailbus-message", "<\\/tailbus-message");
-    format!("<tailbus-message {attrs}>\n{body}\n</tailbus-message>\n")
+    if let Some(r) = m.result() {
+        let _ = write!(
+            attrs,
+            " status=\"{}\" run-id=\"{}\" duration-ms=\"{}\"",
+            r.status.as_str(),
+            attr(&r.run_id),
+            r.duration_ms
+        );
+        if let Some(code) = r.exit_code {
+            let _ = write!(attrs, " exit-code=\"{code}\"");
+        }
+        if let Some(a) = &r.applied {
+            let _ = write!(
+                attrs,
+                " session=\"{}\" timeout=\"{}\" workdir=\"{}\"",
+                attr(&a.session),
+                a.timeout,
+                attr(&a.workdir)
+            );
+            if let Some(model) = &a.model {
+                let _ = write!(attrs, " model=\"{}\"", attr(model));
+            }
+            if let Some(tools) = &a.tools {
+                let _ = write!(attrs, " tools=\"{}\"", attr(&tools.join(",")));
+            }
+        }
+    }
+    let close = |text: &str| text.replace("</tailbus-", "<\\/tailbus-");
+    let mut out = format!("<tailbus-message {attrs}>\n{}\n", close(&m.body));
+    if let Some(tail) = m.result().and_then(|r| r.stderr_tail.as_ref()) {
+        let _ = writeln!(out, "<tailbus-stderr>\n{}\n</tailbus-stderr>", close(tail));
+    }
+    for a in m.attachments() {
+        let path = a.path.as_deref().unwrap_or("not on this machine");
+        let _ = writeln!(
+            out,
+            "<tailbus-attachment name=\"{}\" size=\"{}\" path=\"{}\"/>",
+            attr(&a.name),
+            a.size,
+            attr(path)
+        );
+    }
+    out.push_str("</tailbus-message>\n");
+    out
 }
 
 /// About how many tokens: `12.5 million`, or the count under a million.
@@ -442,6 +484,7 @@ mod tests {
                 created_at: 0,
                 pipe: None,
                 attended: false,
+                ext: None,
             },
             incoming: true,
             state: "new".into(),

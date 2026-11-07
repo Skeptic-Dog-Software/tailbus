@@ -61,6 +61,10 @@ impl Paths {
         self.state.join("daemon.log")
     }
 
+    pub fn attachments(&self) -> PathBuf {
+        self.state.join("attachments")
+    }
+
     /// Creates the state directory, or tightens it to `0700` if it exists.
     pub fn make_state_dir(&self) -> Result<()> {
         fs::DirBuilder::new()
@@ -118,6 +122,15 @@ pub struct Config {
     /// that and this.
     #[serde(default = "default_max_subagents")]
     pub max_subagents: u32,
+    /// The largest attachment, sent or received.
+    #[serde(default = "default_max_attachment")]
+    pub max_attachment_bytes: u64,
+    /// The most all attachments here can take up together.
+    #[serde(default = "default_attachment_store")]
+    pub attachment_store_bytes: u64,
+    /// Days to keep attachments no open message needs.
+    #[serde(default = "default_attachment_retention")]
+    pub attachment_retention_days: u32,
     /// Headless agents `tailbus bridge` runs: agent name to its settings.
     /// Kept unparsed here, so a mistake in one stops that bridge and not
     /// the bus.
@@ -127,6 +140,18 @@ pub struct Config {
 
 fn default_max_subagents() -> u32 {
     5
+}
+
+fn default_max_attachment() -> u64 {
+    1 << 30
+}
+
+fn default_attachment_store() -> u64 {
+    16 << 30
+}
+
+fn default_attachment_retention() -> u32 {
+    7
 }
 
 fn default_port() -> u16 {
@@ -177,6 +202,8 @@ mod tests {
         assert!(cfg.clients.is_empty());
         assert_eq!(cfg.max_subagents, 5);
         assert!(cfg.bridges.is_empty());
+        assert_eq!(cfg.max_attachment_bytes, 1 << 30);
+        assert_eq!(cfg.attachment_retention_days, 7);
         let cfg: Config = toml::from_str("[bridges.omp]\nnot_a_setting = 1").unwrap();
         assert!(cfg.bridges.contains_key("omp"));
         let cfg: Config = toml::from_str("[clients]\nwork = \"acme\"").unwrap();

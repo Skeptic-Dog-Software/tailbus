@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,9 +15,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
+use crate::attach::Attachments;
+use crate::config::{Config, Paths};
 use crate::format::{self, Tools};
 use crate::local::{self, Client, Held, Hello, Inbox, Peers, Request, Sent, Thread};
-use crate::proto::{Billing, MAX_BATCH, Pipe, PipeStage, Plan, Used};
+use crate::proto::{Billing, Extras, MAX_BATCH, Pipe, PipeStage, Plan, RunOptions, Used};
 use crate::{usage, util};
 
 /// Revisions this server speaks. Claude Code also offers 2026-07-28, but
@@ -264,18 +266,52 @@ impl Server {
         let socket = &self.socket;
         match name {
             "msg_send" => {
+                let (to, body, reply_to) = (need("to")?, need("body")?, str_arg("reply_to"));
+                let expects_reply = args["expects_reply"].as_bool();
+                let sent: Sent = match extras(args)? {
+                    // A new request, so an old daemon says no rather than
+                    // dropping the options.
+                    Some(ext) => local::call(
+                        socket,
+                        &Request::Call {
+                            agent: self.agent.clone(),
+                            to,
+                            body,
+                            reply_to,
+                            expects_reply,
+                            ext: Some(Box::new(ext)),
+                            wait_secs: None,
+                        },
+                    )?,
+                    None => local::call(
+                        socket,
+                        &Request::Send {
+                            agent: self.agent.clone(),
+                            to,
+                            body,
+                            reply_to,
+                            expects_reply,
+                            pipe: None,
+                            ext: None,
+                        },
+                    )?,
+                };
+                Ok(format::sent(&sent))
+            }
+            "msg_cancel" => {
+                let run_id = need("run_id")?;
                 let sent: Sent = local::call(
                     socket,
-                    &Request::Send {
+                    &Request::Cancel {
                         agent: self.agent.clone(),
-                        to: need("to")?,
-                        body: need("body")?,
-                        reply_to: str_arg("reply_to"),
-                        expects_reply: args["expects_reply"].as_bool(),
-                        pipe: None,
+                        run_id: run_id.clone(),
                     },
                 )?;
-                Ok(format::sent(&sent))
+                Ok(format!(
+                    "{} The bridge answers this, and run {run_id}'s own reply comes with status \
+                     cancelled.",
+                    format::sent(&sent)
+                ))
             }
             "msg_recv" => {
                 let max = args["max"]
@@ -325,6 +361,7 @@ impl Server {
                             effort: str_arg("effort"),
                             ..Pipe::new(PipeStage::Task)
                         }),
+                        ext: None,
                     },
                 )?;
                 Ok(format!(
@@ -517,6 +554,7 @@ impl Server {
                 reply_to: Some(reply_to),
                 expects_reply: Some(expects_reply),
                 pipe: Some(pipe),
+                ext: None,
             },
         )?;
         Ok(format::sent(&sent))
@@ -590,6 +628,40 @@ fn check_questions(questions: &Value) -> Result<()> {
     Ok(())
 }
 
+/// What `msg_send` carries beside its text, if anything.
+fn extras(args: &Value) -> Result<Option<Extras>> {
+    let options = match &args["options"] {
+        Value::Null => None,
+        options => Some(
+            serde_json::from_value::<RunOptions>(options.clone())
+                .map_err(|e| anyhow!("options: {e}"))?,
+        ),
+    };
+    let files: Vec<&str> = args["attachments"]
+        .as_array()
+        .map(|list| list.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if options.is_none() && files.is_empty() {
+        return Ok(None);
+    }
+    let paths = Paths::find()?;
+    let cfg = Config::load(&paths.config)?;
+    let store = Attachments::new(
+        paths.attachments(),
+        cfg.max_attachment_bytes,
+        cfg.attachment_store_bytes,
+    );
+    let attachments = files
+        .into_iter()
+        .map(|f| store.add_file(Path::new(f)))
+        .collect::<Result<_>>()?;
+    Ok(Some(Extras {
+        options,
+        attachments,
+        ..Extras::default()
+    }))
+}
+
 fn tools() -> Value {
     // Closed world: everything stays among agents on your own tailnet. Codex
     // runs tools marked this way without asking each time.
@@ -606,9 +678,34 @@ fn tools() -> Value {
                     "to": {"type": "string", "description": "The recipient, as name@machine"},
                     "body": {"type": "string", "description": "The message: up to 64 KiB of text"},
                     "reply_to": {"type": "string", "description": "The id of the message this answers"},
-                    "expects_reply": {"type": "boolean", "description": "Whether it asks for an answer. Defaults to true for a new message and false for a reply."}
+                    "expects_reply": {"type": "boolean", "description": "Whether it asks for an answer. Defaults to true for a new message and false for a reply."},
+                    "options": {
+                        "type": "object",
+                        "description": "For a bridge agent: what this run may use. These can only narrow what the agent's config allows, and anything else gets a reply with status refused and no run.",
+                        "properties": {
+                            "tools": {"type": "array", "items": {"type": "string"}, "description": "A subset of the tools the agent's config allows"},
+                            "session": {"type": "string", "enum": ["fresh", "per-sender"]},
+                            "timeout": {"type": "integer", "description": "Seconds, up to the agent's configured maximum"},
+                            "workdir": {"type": "string", "description": "From the agent's allow-list"},
+                            "model": {"type": "string", "description": "From the agent's allow-list"}
+                        },
+                        "additionalProperties": false
+                    },
+                    "attachments": {"type": "array", "items": {"type": "string"}, "description": "Paths of files to send with it, checked by hash. The recipient gets each as a local file. Use this for anything over 64 KiB."}
                 },
                 "required": ["to", "body"]
+            },
+            "annotations": acts
+        },
+        {
+            "name": "msg_cancel",
+            "description": "Cancel a run of yours on a bridge agent, by its run ID, which is the id msg_send gave your request. It kills the whole process tree, and the run's reply comes with status cancelled. You can't cancel another sender's run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string", "description": "The id of your request"}
+                },
+                "required": ["run_id"]
             },
             "annotations": acts
         },

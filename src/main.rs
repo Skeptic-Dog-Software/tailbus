@@ -3,8 +3,10 @@
 
 mod alert;
 mod ask;
+mod attach;
 mod bridge;
 mod bus;
+mod call;
 mod config;
 mod daemon;
 mod format;
@@ -31,7 +33,7 @@ use clap::{Parser, Subcommand};
 use crate::config::Paths;
 use crate::format::Tools;
 use crate::local::{Client, Events, Inbox, Peers, Request, Sent, Status, Thread};
-use crate::proto::AgentList;
+use crate::proto::{AgentList, RunOptions};
 use crate::util::{derive_agent_name, normalize_name, rfc3339, valid_name};
 
 #[derive(Parser)]
@@ -68,6 +70,46 @@ enum Cmd {
         #[arg(long, conflicts_with = "expects_reply")]
         no_reply: bool,
     },
+    /// Send a request, wait for its reply, print it, and exit with its status.
+    Call {
+        /// The recipient, as name@machine.
+        to: String,
+        /// The message. Read from stdin when left out or `-`. One over 64
+        /// KiB is sent as an attachment.
+        body: Option<String>,
+        /// Limit the run to these of the tools the agent's config allows.
+        #[arg(long, value_delimiter = ',', value_name = "NAMES")]
+        tools: Option<Vec<String>>,
+        /// `fresh` or `per-sender`, if the agent's config allows it.
+        #[arg(long, value_name = "MODE")]
+        session: Option<String>,
+        /// How long the run can take, up to the agent's configured maximum.
+        #[arg(long, value_name = "SECS")]
+        run_timeout: Option<u64>,
+        /// Run in this directory, if the agent's config allows it.
+        #[arg(long, value_name = "DIR")]
+        workdir: Option<String>,
+        /// Run on this model, if the agent's config allows it.
+        #[arg(long, value_name = "NAME")]
+        model: Option<String>,
+        /// A file to attach. Can be given more than once.
+        #[arg(long, value_name = "FILE")]
+        attach: Vec<PathBuf>,
+        /// How long this command waits for the reply, and then cancels.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+        /// Leave the run going if this command is interrupted or times out.
+        #[arg(long)]
+        no_cancel: bool,
+        /// Print the reply and its details as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Also print the run's ID and what it used to stderr.
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Cancel a run of yours, by its ID.
+    Cancel { run_id: String },
     /// Take your next messages.
     Recv {
         /// Wait for one to arrive.
@@ -177,6 +219,17 @@ enum BridgeCmd {
     Uninstall { agent: String },
     /// Show how the bridges in the config are doing.
     Status { agent: Option<String> },
+    /// Show what's kept of a run: its record, or its output.
+    Log {
+        agent: String,
+        run_id: String,
+        /// Print its stdout instead.
+        #[arg(long, conflicts_with = "stderr")]
+        stdout: bool,
+        /// Print its stderr instead.
+        #[arg(long)]
+        stderr: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -262,7 +315,53 @@ fn run(cli: Cli) -> Result<ExitCode> {
             BridgeCmd::Install { agent } => setup::bridge_install(&paths, &agent)?,
             BridgeCmd::Uninstall { agent } => setup::bridge_uninstall(&agent)?,
             BridgeCmd::Status { agent } => bridge::status(&paths, agent.as_deref())?,
+            BridgeCmd::Log {
+                agent,
+                run_id,
+                stdout,
+                stderr,
+            } => {
+                let part = match (stdout, stderr) {
+                    (true, _) => Some("stdout"),
+                    (_, true) => Some("stderr"),
+                    _ => None,
+                };
+                bridge::show_log(&paths, &agent, &run_id, part)?;
+            }
         },
+        Cmd::Call {
+            to,
+            body,
+            tools,
+            session,
+            run_timeout,
+            workdir,
+            model,
+            attach,
+            timeout,
+            no_cancel,
+            json,
+            verbose,
+        } => {
+            let args = call::Args {
+                to,
+                body,
+                options: RunOptions {
+                    tools,
+                    session,
+                    timeout: run_timeout,
+                    workdir,
+                    model,
+                },
+                attach,
+                timeout,
+                no_cancel,
+                json,
+                verbose,
+            };
+            return Ok(call::call(&paths, agent_name(cli.agent)?, args));
+        }
+        Cmd::Cancel { run_id } => return Ok(call::cancel(&paths, agent_name(cli.agent)?, &run_id)),
         Cmd::Send {
             to,
             body,
@@ -295,6 +394,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     reply_to,
                     expects_reply,
                     pipe: None,
+                    ext: None,
                 },
             )?;
             println!("{}", format::sent(&sent));

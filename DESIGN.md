@@ -446,6 +446,44 @@ message can't crash-loop the bridge forever.
 `[bridges.*]` tables stay unparsed in the daemon's config, so a mistake in one
 stops that bridge, not the bus.
 
+#### Requests that carry more
+
+Added 2026-11-07, so a caller gets what a direct shell call gives. The
+[README](README.md#per-request-options) has the options, exit codes and
+attachments. What's behind them:
+
+- **One optional `ext` field** on a message holds its options, attachments,
+  result and cancel, in one new `ext` column in `inbox` and `sent`. An old
+  binary ignores the column, so a rollback keeps the database.
+- **An old bus must fail, not drop.** A bus before this ignores fields it
+  doesn't know, so a request's options would vanish and it would run on
+  defaults. Messages with options, attachments or a cancel go by `POST
+  /v2/messages`, which an old bus answers with 404, and that fails the
+  message. On the local socket, `Call` is a new request an old daemon turns
+  down. A reply's result is only detail, and goes the old way.
+- **Attachments are pushed, by hash.** `PUT /v2/attachments/<sha256>` streams to
+  a temporary file, and it's kept only if the hash matches. Pushing means no
+  route that hands files out. Each message with attachments gets a thread, so
+  a large upload doesn't hold up the rest of the outbox. The receiver refuses
+  a message naming an attachment it doesn't have, and never believes a path
+  from a sender.
+- **A reply can't be left behind by its attachment.** If a machine turns an
+  attachment down for good, a request fails, and a reply goes without it and
+  says why, so whoever's waiting still hears.
+- **A run's ID is its request's ID.** The sender has it before anything runs,
+  and every try at a request shares it.
+- **The receiver takes every message at once.** Workers used to take their
+  own, so with all of them busy a cancel would wait behind the run it was
+  meant to stop. Taken messages stay pending on the bus, so this is as safe.
+  It also lets a sender's waiting messages stand aside for other senders.
+- **A blocking call gets its own reply.** The daemon marks the request as
+  awaited before it's sent, and `take` leaves replies to awaited requests out
+  of the agent's queue, so nothing else can take them.
+
+Rejected: asking the receiving bus what it supports before sending. It costs
+a round trip on every message, and the answer can be out of date by the time
+it's used. A route that isn't there can't be.
+
 #### omp on `server`, checked 2026-11-06 on omp 18.17.0
 
 No real model: a stand-in on `127.0.0.1` returned canned text.
@@ -460,6 +498,12 @@ No real model: a stand-in on `127.0.0.1` returned canned text.
 | Where a conversation is stored with `--session-dir` | Only there. `HOME` keeps a pointer of about 100 bytes per session. |
 | stdin left open | omp waits for it forever, so stdin must end. |
 
+On 2026-11-07, real omp through a bridge, with `tools_env` read by a test
+extension that hides what's not listed: a request for `read` left its model
+offered `read` and nothing else, and a request for `read` and a connector's
+query tool left those two, without that connector's write tool. A flag can't
+do this, but an extension can.
+
 So a shared `HOME` is safe at `max_concurrent` above 1, and a `HOME` for each
 run isn't needed, and wouldn't work: it holds the sign-in.
 
@@ -470,8 +514,11 @@ later runs.
 
 Rust's `Command` passes on the parent's signal mask, so blocking the stop
 signals in the bridge blocked them in the agent too, and it could only be
-killed. Only a timing test on the real binary showed it. The agent's mask is
-now cleared before it starts.
+killed. Only a timing test on the real binary showed it. Clearing the mask
+in `pre_exec` fixed that and caused something worse: `pre_exec` makes Rust
+`fork`, and on macOS its error pipe isn't close-on-exec from the start, so one
+run could inherit it and hold another's `spawn` open until it ended. So the
+bridge blocks no signals: a handler writes to a pipe, and a thread reads it.
 
 ## Permissions and conversation limits
 

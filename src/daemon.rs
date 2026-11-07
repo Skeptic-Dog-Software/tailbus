@@ -14,11 +14,11 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::ask;
-use crate::bus::{Bus, Claim, Handoff, Waited};
+use crate::bus::{Bus, Claim, Draft, Handoff, Waited};
 use crate::config::{Config, Paths};
 use crate::local::{
-    self, AgentStatus, BRIDGE_SESSION, Events, Held, Hello, Item, Messages, Request, Status,
-    Thread, Verdict, Woken,
+    self, AgentStatus, Awaited, BRIDGE_SESSION, Events, Held, Hello, Item, Messages, Request,
+    Status, Thread, Verdict, Woken,
 };
 use crate::net;
 use crate::permission;
@@ -30,6 +30,8 @@ use crate::util::{now_ms, valid_name};
 const CONFIRM_WITHIN: Duration = Duration::from_secs(30);
 /// The longest `recv --wait`.
 const MAX_WAIT: u64 = 3600;
+/// The longest a blocking call waits.
+const MAX_CALL_WAIT: u64 = 7 * 86_400;
 /// The longest a permission prompt waits for an alert's answer: the
 /// permission hook's own timeout.
 const MAX_PERMISSION_WAIT: Duration = Duration::from_secs(86_400);
@@ -47,7 +49,7 @@ pub fn run(paths: &Paths) -> Result<()> {
     }
     let _ = fs::remove_file(&socket);
     let store = Store::open(&paths.db())?;
-    let bus = Bus::start(cfg, store);
+    let bus = Bus::start(cfg, store, paths.attachments());
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("listening on {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
@@ -210,8 +212,46 @@ impl Conn {
     }
 }
 
-fn items(found: &[Incoming]) -> Vec<Item> {
-    found.iter().cloned().map(Item::from).collect()
+fn items(bus: &Bus, found: &[Incoming]) -> Vec<Item> {
+    let mut items: Vec<Item> = found.iter().cloned().map(Item::from).collect();
+    for item in &mut items {
+        bus.locate(item);
+    }
+    items
+}
+
+/// Waits for the reply to `id`, for a blocking call on this connection, and
+/// hands it over.
+fn await_reply(bus: &Bus, conn: &mut Conn, agent: &str, id: &str, wait_secs: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(wait_secs.min(MAX_CALL_WAIT));
+    let mut acked = None;
+    let got = bus.wait_until(
+        deadline,
+        || bus.check_awaited(agent, id, &mut acked),
+        || conn.gone(),
+    );
+    let got = got.inspect_err(|_| bus.stop_awaiting(id))?;
+    let gone = conn.gone();
+    let Some(got) = got else {
+        bus.stop_awaiting(id);
+        return if gone {
+            Ok(())
+        } else {
+            Ok(conn.write(&Awaited::TimedOut)?)
+        };
+    };
+    let written = conn.write(&got);
+    if let (Ok(()), Awaited::Reply { item }) = (&written, &got) {
+        let reply = item.msg.id.clone();
+        // In a statement of its own, so the lock is let go before `deliver`.
+        let found = bus.db().incoming(&reply)?;
+        if let Some(found) = found {
+            bus.deliver(agent, &[found], "cli", Handoff::Free)?;
+        }
+        bus.ack(agent, &reply)?;
+    }
+    bus.stop_awaiting(id);
+    Ok(written?)
 }
 
 pub(crate) fn serve_conn(bus: &Bus, stream: UnixStream) -> Result<()> {
@@ -290,6 +330,7 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             reply_to,
             expects_reply,
             pipe,
+            ext,
         } => {
             // A pipe task goes only to a live session, found by client name
             // or address.
@@ -297,9 +338,48 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
                 Some(p) if p.stage == PipeStage::Task => bus.pipe_target(&to)?,
                 _ => to,
             };
-            let sent = bus.send(&agent, &to, body, reply_to, expects_reply, pipe)?;
+            let draft = Draft {
+                reply_to,
+                expects_reply,
+                pipe,
+                ext,
+                awaited: false,
+            };
+            let sent = bus.send_draft(&agent, &to, body, draft)?;
             conn.write(&sent)?;
         }
+        Request::Call {
+            agent,
+            to,
+            body,
+            reply_to,
+            expects_reply,
+            ext,
+            wait_secs,
+        } => {
+            let draft = Draft {
+                reply_to,
+                expects_reply,
+                pipe: None,
+                ext,
+                awaited: wait_secs.is_some(),
+            };
+            let sent = bus.send_draft(&agent, &to, body, draft)?;
+            let id = sent.id.clone();
+            conn.write(&sent)?;
+            if let Some(wait_secs) = wait_secs {
+                await_reply(bus, conn, &agent, &id, wait_secs)?;
+            }
+        }
+        Request::Await {
+            agent,
+            id,
+            wait_secs,
+        } => {
+            bus.start_awaiting(&id);
+            await_reply(bus, conn, &agent, &id, wait_secs)?;
+        }
+        Request::Cancel { agent, run_id } => conn.write(&bus.cancel_run(&agent, &run_id)?)?,
         Request::Recv {
             agent,
             session,
@@ -350,7 +430,7 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
                 }
             };
             let reply = Messages {
-                messages: items(&found),
+                messages: items(bus, &found),
                 paused: note,
             };
             conn.hand_over(bus, &agent, &session, reply, &found, how)?;
@@ -370,7 +450,7 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             let result = match waited {
                 Ok(Some(Waited::Messages(found))) => {
                     let reply = Woken::Messages {
-                        messages: items(&found),
+                        messages: items(bus, &found),
                     };
                     conn.hand_over(bus, &agent, &session, reply, &found, Handoff::Wake)
                 }
@@ -400,7 +480,7 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
                 bus.take(&agent, &session, MAX_BATCH, false)?
             };
             let reply = Messages {
-                messages: items(&found),
+                messages: items(bus, &found),
                 paused: None,
             };
             conn.hand_over(bus, &agent, &session, reply, &found, Handoff::Free)?;

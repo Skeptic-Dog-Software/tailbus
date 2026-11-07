@@ -12,15 +12,17 @@ use anyhow::{Context, Result, bail};
 
 use crate::alert;
 use crate::ask::{self, Asks, Prompt};
+use crate::attach::Attachments;
 use crate::config::Config;
 use crate::format;
-use crate::local::{Event, Inbox, Item, PeerMachine, Peers, Sent};
+use crate::local::{Awaited, Event, Inbox, Item, PeerMachine, Peers, Sent};
 use crate::net;
 use crate::proto::{
-    AgentInfo, AgentList, Billing, Estimate, MAX_BATCH, MAX_BODY, Message, MessageBatch, Pipe,
-    PipeStage, Plan, Receipt, ReceiptBatch, SendState, StoreResult, StoreResults, StoreStatus,
+    AgentInfo, AgentList, Billing, Estimate, Extras, MAX_BATCH, MAX_BODY, Message, MessageBatch,
+    Pipe, PipeStage, Plan, Receipt, ReceiptBatch, SendState, StoreResult, StoreResults,
+    StoreStatus,
 };
-use crate::store::{Acked, Incoming, Store, Stored, machine_part, name_part};
+use crate::store::{Acked, Due, Incoming, Store, Stored, machine_part, name_part};
 use crate::tailscale::{Status, Tailscale, Whois};
 use crate::usage;
 use crate::util::{Address, is_id, new_id, now_ms, valid_name};
@@ -37,6 +39,11 @@ const CLOCK_SLACK_MS: i64 = 60_000;
 const STATUS_TTL: Duration = Duration::from_secs(10);
 const WHOIS_TTL: Duration = Duration::from_secs(60);
 const MAX_EVENTS: usize = 1000;
+/// How long to wait for the reply to something already acknowledged, which
+/// can land after the receipt, before deciding there isn't one.
+const REPLY_GRACE: Duration = Duration::from_secs(5);
+/// The longest an upload and the message after it can take.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 /// How long the dialog about a paused session stays up.
 const PAUSE_DIALOG: Duration = Duration::from_secs(86_400);
 
@@ -65,6 +72,10 @@ pub struct Bus {
     pub listening: Mutex<Result<SocketAddr, String>>,
     /// Dialogs out to the user's Macs, and shown here for theirs.
     pub asks: Asks,
+    pub attachments: Attachments,
+    /// Messages going out with attachments or options, each on a thread of
+    /// its own, so a large file doesn't hold up the rest of the outbox.
+    uploading: Mutex<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -81,6 +92,9 @@ struct Live {
     online: HashMap<String, bool>,
     /// Messages being handed over right now, which nobody else may take.
     in_flight: HashSet<String>,
+    /// Requests a blocking call is waiting on. Their replies go to it,
+    /// however many calls an agent has going, and not to its queue.
+    awaited: HashSet<String>,
     /// Each agent's handoffs since its user last typed in its session.
     runs: HashMap<String, Run>,
     /// How each agent's current turn started.
@@ -134,6 +148,17 @@ pub enum Handoff {
     Tool,
     /// With a prompt the user typed, or to the CLI: doesn't.
     Free,
+}
+
+/// What a message has beyond its sender, recipient and text.
+#[derive(Default)]
+pub struct Draft {
+    pub reply_to: Option<String>,
+    pub expects_reply: Option<bool>,
+    pub pipe: Option<Pipe>,
+    pub ext: Option<Box<Extras>>,
+    /// A blocking call will wait for its reply.
+    pub awaited: bool,
 }
 
 /// The session holding an agent name.
@@ -192,10 +217,16 @@ fn preview(body: &str) -> String {
 }
 
 impl Bus {
-    pub fn start(cfg: Config, store: Store) -> Arc<Bus> {
+    pub fn start(cfg: Config, store: Store, attachments: PathBuf) -> Arc<Bus> {
         Arc::new_cyclic(|this| Bus {
             this: this.clone(),
             ts: Tailscale::find(cfg.tailscale.as_deref()),
+            attachments: Attachments::new(
+                attachments,
+                cfg.max_attachment_bytes,
+                cfg.attachment_store_bytes,
+            ),
+            uploading: Mutex::new(HashSet::new()),
             cfg,
             store: Mutex::new(store),
             live: Mutex::new(Live::default()),
@@ -207,6 +238,31 @@ impl Bus {
             listening: Mutex::new(Err("starting".into())),
             asks: Asks::default(),
         })
+    }
+
+    /// Has this bus believe in a peer without Tailscale, for tests that run
+    /// two buses on this machine.
+    #[cfg(test)]
+    pub fn pretend_peer(&self, machine: &str, ip: Ipv4Addr) {
+        let me = self.me().expect("set up by the test");
+        let peer = crate::tailscale::Peer {
+            machine: machine.to_string(),
+            ipv4: Some(ip),
+            online: true,
+            owner: me.owner.clone(),
+        };
+        let status = Status {
+            machine: me.machine,
+            ipv4: None,
+            owner: me.owner.clone(),
+            peers: vec![peer],
+        };
+        *lock(&self.status) = Some((Instant::now() + Duration::from_secs(3600), status));
+        let who = Whois {
+            machine: machine.to_string(),
+            owner: me.owner,
+        };
+        lock(&self.whois).insert(ip.into(), (Instant::now() + Duration::from_secs(3600), who));
     }
 
     /// This bus, for work that outlives a call.
@@ -594,6 +650,10 @@ impl Bus {
         let found: Vec<Incoming> = found
             .into_iter()
             .filter(|m| !live.in_flight.contains(&m.msg.id))
+            .filter(|m| {
+                let answers = m.msg.reply_to.as_ref();
+                !answers.is_some_and(|r| live.awaited.contains(r))
+            })
             .take(max)
             .collect();
         if to_wake && !found.iter().any(|m| m.wakes) {
@@ -1015,6 +1075,7 @@ impl Bus {
 
     // Sending.
 
+    #[cfg(test)]
     pub fn send(
         &self,
         from: &str,
@@ -1024,10 +1085,35 @@ impl Bus {
         expects_reply: Option<bool>,
         pipe: Option<Pipe>,
     ) -> Result<Sent> {
+        let draft = Draft {
+            reply_to,
+            expects_reply,
+            pipe,
+            ..Draft::default()
+        };
+        self.send_draft(from, to, body, draft)
+    }
+
+    pub fn send_draft(&self, from: &str, to: &str, body: String, draft: Draft) -> Result<Sent> {
+        let Draft {
+            reply_to,
+            expects_reply,
+            pipe,
+            ext,
+            awaited,
+        } = draft;
         // A new message is a request; a reply is a response unless it asks
         // something back.
         let expects_reply = expects_reply.unwrap_or(reply_to.is_none());
         let me = self.me()?;
+        if let Some(ext) = &ext {
+            if let Some(missing) = ext.attachments.iter().find(|a| !self.attachments.has(a)) {
+                bail!("attachment {} isn't on this bus", missing.name);
+            }
+            if let Some(run) = ext.cancel.as_ref().filter(|r| !is_id(r)) {
+                bail!("{run:?} isn't a run ID");
+            }
+        }
         if !valid_name(from) {
             bail!("{from:?} isn't a valid agent name: use lowercase letters, digits and hyphens");
         }
@@ -1077,72 +1163,16 @@ impl Bus {
             pipe,
             // The bus says so, not the agent.
             attended: self.attended(from),
+            ext,
         };
-
-        let (state, warning) = if to.machine == me.machine {
-            let stored = self.db().store_incoming(&msg, &me.owner, now)?;
-            if stored == Stored::UnknownAgent {
-                bail!(
-                    "there's no agent {} on {}. peer_list shows the agents you can reach.",
-                    to.agent,
-                    me.machine
-                );
-            }
-            self.db().record_sent(&msg, SendState::Stored, now)?;
-            self.notify();
-            let warning = self
-                .agent_list()?
-                .agents
-                .into_iter()
-                .find(|a| a.name == to.agent)
-                .and_then(|a| staleness(&to.to_string(), a.live, a.last_live, now));
-            (SendState::Stored, warning)
-        } else {
-            let status = self.status()?;
-            let Some(peer) = status.peers.iter().find(|p| p.machine == to.machine) else {
-                bail!(
-                    "there's no machine named {} on this tailnet. peer_list shows the agents you can reach.",
-                    to.machine
-                );
-            };
-            let online = peer.online;
-            self.db().record_sent(&msg, SendState::Queued, now)?;
-            self.notify();
-            // Give the forwarder a moment, so the answer can say whether it
-            // got there.
-            let settled = if online {
-                self.wait_until(
-                    Instant::now() + Duration::from_secs(5),
-                    || {
-                        let sent = self.db().outgoing(&msg.id)?;
-                        Ok(sent.filter(|s| s.state != SendState::Queued))
-                    },
-                    || false,
-                )?
-            } else {
-                None
-            };
-            match settled {
-                Some(s) if s.state == SendState::Failed => {
-                    bail!("{}", s.error.unwrap_or_else(|| "not delivered".into()))
-                }
-                Some(s) => (s.state, lock(&self.notes).remove(&msg.id)),
-                None if !online => (
-                    SendState::Queued,
-                    Some(format!(
-                        "{} is offline; the message goes as soon as it's back",
-                        to.machine
-                    )),
-                ),
-                None => (
-                    SendState::Queued,
-                    Some(format!(
-                        "{} hasn't taken it yet; it's queued and will keep being retried",
-                        to.machine
-                    )),
-                ),
-            }
-        };
+        if awaited {
+            lock(&self.live).awaited.insert(msg.id.clone());
+        }
+        let dispatched = self.dispatch(&msg, &to, &me, now);
+        if dispatched.is_err() {
+            self.stop_awaiting(&msg.id);
+        }
+        let (state, warning) = dispatched?;
         // A reply acknowledges the message it answers.
         if let Some(r) = &msg.reply_to {
             let acked = self.db().ack(from, r, now)?;
@@ -1186,6 +1216,154 @@ impl Bus {
             state: state.as_str().into(),
             warning,
         })
+    }
+
+    /// Stores a message for an agent here, or queues it for another machine
+    /// and gives it a moment to get there.
+    fn dispatch(
+        &self,
+        msg: &Message,
+        to: &Address,
+        me: &Me,
+        now: i64,
+    ) -> Result<(SendState, Option<String>)> {
+        if to.machine == me.machine {
+            let stored = self.db().store_incoming(msg, &me.owner, now)?;
+            if stored == Stored::UnknownAgent {
+                bail!(
+                    "there's no agent {} on {}. peer_list shows the agents you can reach.",
+                    to.agent,
+                    me.machine
+                );
+            }
+            self.db().record_sent(msg, SendState::Stored, now)?;
+            self.notify();
+            let warning = self
+                .agent_list()?
+                .agents
+                .into_iter()
+                .find(|a| a.name == to.agent)
+                .and_then(|a| staleness(&to.to_string(), a.live, a.last_live, now));
+            return Ok((SendState::Stored, warning));
+        }
+        let status = self.status()?;
+        let Some(peer) = status.peers.iter().find(|p| p.machine == to.machine) else {
+            bail!(
+                "there's no machine named {} on this tailnet. peer_list shows the agents you can reach.",
+                to.machine
+            );
+        };
+        let online = peer.online;
+        self.db().record_sent(msg, SendState::Queued, now)?;
+        self.notify();
+        // Give the forwarder a moment, so the answer can say whether it got
+        // there.
+        let settled = if online {
+            self.wait_until(
+                Instant::now() + Duration::from_secs(5),
+                || {
+                    let sent = self.db().outgoing(&msg.id)?;
+                    Ok(sent.filter(|s| s.state != SendState::Queued))
+                },
+                || false,
+            )?
+        } else {
+            None
+        };
+        Ok(match settled {
+            Some(s) if s.state == SendState::Failed => {
+                bail!("{}", s.error.unwrap_or_else(|| "not delivered".into()))
+            }
+            Some(s) => (s.state, lock(&self.notes).remove(&msg.id)),
+            None if !online => (
+                SendState::Queued,
+                Some(format!(
+                    "{} is offline; the message goes as soon as it's back",
+                    to.machine
+                )),
+            ),
+            None => (
+                SendState::Queued,
+                Some(format!(
+                    "{} hasn't taken it yet; it's queued and will keep being retried",
+                    to.machine
+                )),
+            ),
+        })
+    }
+
+    /// Says a blocking call is waiting on `id`, for one that reconnected.
+    pub fn start_awaiting(&self, id: &str) {
+        lock(&self.live).awaited.insert(id.to_string());
+    }
+
+    /// Hands a request's reply back to the agent's queue.
+    pub fn stop_awaiting(&self, id: &str) {
+        lock(&self.live).awaited.remove(id);
+        self.notify();
+    }
+
+    /// Whether a blocking call's wait is over. `acked` holds when the
+    /// request was first seen acknowledged with no reply.
+    pub fn check_awaited(
+        &self,
+        agent: &str,
+        id: &str,
+        acked: &mut Option<Instant>,
+    ) -> Result<Option<Awaited>> {
+        let reply = self.db().reply_for(agent, id)?;
+        if let Some(reply) = reply {
+            let mut item = Item::from(reply);
+            self.locate(&mut item);
+            return Ok(Some(Awaited::Reply {
+                item: Box::new(item),
+            }));
+        }
+        let Some(sent) = self.db().outgoing(id)? else {
+            bail!("{agent} sent no message {id}");
+        };
+        Ok(match sent.state {
+            SendState::Failed => Some(Awaited::Undelivered {
+                why: sent.error.unwrap_or_else(|| "not delivered".into()),
+            }),
+            SendState::Acknowledged
+                if acked.get_or_insert_with(Instant::now).elapsed() >= REPLY_GRACE =>
+            {
+                Some(Awaited::Unanswered)
+            }
+            _ => None,
+        })
+    }
+
+    /// Fills in where a message's attachments are on this machine.
+    pub fn locate(&self, item: &mut Item) {
+        if let Some(ext) = &mut item.msg.ext {
+            for a in &mut ext.attachments {
+                a.path = self
+                    .attachments
+                    .has(a)
+                    .then(|| self.attachments.path(&a.sha256).display().to_string());
+            }
+        }
+    }
+
+    /// Asks the bridge that has one of `agent`'s runs to cancel it. Only a
+    /// run this agent sent can be named here, and the bridge checks too.
+    pub fn cancel_run(&self, agent: &str, run: &str) -> Result<Sent> {
+        let sent = self
+            .db()
+            .outgoing(run)?
+            .filter(|o| name_part(&o.msg.from) == agent)
+            .with_context(|| format!("{agent} has no run {run}"))?;
+        let draft = Draft {
+            expects_reply: Some(true),
+            ext: Some(Box::new(Extras {
+                cancel: Some(run.to_string()),
+                ..Extras::default()
+            })),
+            ..Draft::default()
+        };
+        self.send_draft(agent, &sent.msg.to, format!("Cancel run {run}."), draft)
     }
 
     /// Checks a `/pipe` step, and fills in what its bus sets rather than its
@@ -1335,7 +1513,31 @@ impl Bus {
                     .push(d);
             }
             for (machine, items) in by_machine {
+                let (rich, items): (Vec<_>, Vec<_>) =
+                    items.into_iter().partition(|d| d.item.needs_new_bus());
+                let rich: Vec<_> = rich.into_iter().filter(|d| !self.is_uploading(d)).collect();
                 let peer = status.peers.iter().find(|p| p.machine == machine);
+                for d in rich {
+                    match peer {
+                        Some(p) if p.online && p.ipv4.is_some() => {
+                            self.forward_rich(d, p.ipv4.expect("just checked"), machine.clone());
+                        }
+                        Some(_) => {
+                            let why = format!("{machine} is offline");
+                            self.db()
+                                .retry_send(&d.item.id, now + backoff(d.attempts), &why)?;
+                        }
+                        None => {
+                            let why = format!("there's no machine named {machine} on this tailnet");
+                            self.db().set_send_state(
+                                &d.item.id,
+                                SendState::Failed,
+                                Some(&why),
+                                now,
+                            )?;
+                        }
+                    }
+                }
                 let ip = match peer {
                     None => {
                         for d in &items {
@@ -1439,6 +1641,87 @@ impl Bus {
         Ok(())
     }
 
+    fn is_uploading(&self, d: &Due<Message>) -> bool {
+        lock(&self.uploading).contains(&d.item.id)
+    }
+
+    /// Sends a message by the route an old bus turns down, after whatever
+    /// it has attached, on a thread of its own.
+    fn forward_rich(&self, d: Due<Message>, ip: Ipv4Addr, machine: String) {
+        let Some(bus) = self.arc() else {
+            return;
+        };
+        lock(&self.uploading).insert(d.item.id.clone());
+        thread::spawn(move || {
+            if let Err(e) = bus.send_rich(&d, ip, &machine) {
+                bus.event(format!("forwarding {} failed: {e:#}", d.item.id));
+            }
+            lock(&bus.uploading).remove(&d.item.id);
+            bus.notify();
+        });
+    }
+
+    fn send_rich(&self, d: &Due<Message>, ip: Ipv4Addr, machine: &str) -> Result<()> {
+        let http = net::http_agent(Duration::from_secs(5), UPLOAD_TIMEOUT);
+        let port = self.cfg.port;
+        let now = now_ms();
+        let msg = &d.item;
+        let mut result = Ok(());
+        for a in msg.attachments() {
+            let path = self.attachments.path(&a.sha256);
+            result = net::upload(&http, ip, port, &path, a);
+            if result.is_err() {
+                break;
+            }
+        }
+        let stored = result.and_then(|()| {
+            let batch = MessageBatch {
+                messages: vec![msg.clone()],
+            };
+            net::post::<_, StoreResults>(&http, ip, port, "/v2/messages", &batch)
+        });
+        match stored {
+            Ok(res) => self.apply_results(std::slice::from_ref(d), res.results, now),
+            Err(e) => match e.downcast_ref::<net::HttpError>() {
+                Some(refused) if refused.is_final() => {
+                    self.undeliverable(d, machine, refused.describe(machine))
+                }
+                _ => self.db().retry_send(
+                    &msg.id,
+                    now + backoff(d.attempts),
+                    &format!("{machine}: {e:#}"),
+                ),
+            },
+        }
+    }
+
+    /// A machine turned a message's extras down for good. A request fails,
+    /// which its sender sees. A reply goes without its attachments, so
+    /// whoever's waiting on it still hears.
+    fn undeliverable(&self, d: &Due<Message>, machine: &str, why: String) -> Result<()> {
+        let now = now_ms();
+        let msg = &d.item;
+        if msg.reply_to.is_none() || msg.attachments().is_empty() {
+            self.event(format!("{} -> {}: failed: {why}", msg.from, msg.to));
+            return self
+                .db()
+                .set_send_state(&msg.id, SendState::Failed, Some(&why), now);
+        }
+        let mut msg = msg.clone();
+        if let Some(ext) = &mut msg.ext {
+            ext.attachments.clear();
+            if let Some(result) = &mut ext.result {
+                result.full_reply = None;
+            }
+        }
+        msg.body = format!("{}\n\n[{machine} couldn't take the rest: {why}]", msg.body);
+        self.event(format!(
+            "{}: sending without its attachments: {why}",
+            msg.id
+        ));
+        self.db().rewrite_sent(&msg, now)
+    }
+
     fn apply_results(
         &self,
         sent: &[crate::store::Due<Message>],
@@ -1504,7 +1787,11 @@ impl Bus {
                 _ if msg.pipe.as_ref().is_some_and(|p| check_pipe(p).is_err()) => {
                     Some("bad /pipe model or effort".into())
                 }
-                _ => None,
+                _ => msg
+                    .attachments()
+                    .iter()
+                    .find(|a| !self.attachments.has(a))
+                    .map(|a| format!("attachment {:?} isn't here", a.name)),
             };
             if let Some(problem) = problem {
                 result.error = Some(problem);
@@ -1518,6 +1805,11 @@ impl Bus {
             msg.from = format!("{from}@{}", who.machine);
             msg.to = to.to_string();
             msg.attended &= !me.owner.is_empty() && who.owner == me.owner;
+            if let Some(ext) = &mut msg.ext {
+                for a in &mut ext.attachments {
+                    a.path = None;
+                }
+            }
             let stored = self.db().store_incoming(&msg, &who.owner, now)?;
             match stored {
                 Stored::UnknownAgent => {
@@ -1609,6 +1901,10 @@ impl Bus {
                 .open_incoming(agent)?
                 .into_iter()
                 .map(Item::from)
+                .map(|mut item| {
+                    self.locate(&mut item);
+                    item
+                })
                 .collect(),
             outgoing: db
                 .open_outgoing(agent, now_ms() - DAY_MS)?
@@ -1751,6 +2047,16 @@ impl Bus {
             Ok(0) => {}
             Ok(n) => self.event(format!("pruned {n} finished messages")),
             Err(e) => self.event(format!("pruning failed: {e:#}")),
+        }
+        let age = u64::from(self.cfg.attachment_retention_days) * 86_400;
+        match self.db().attachments_in_use() {
+            Ok(used) => {
+                let gone = self.attachments.prune(Duration::from_secs(age), &used);
+                if gone > 0 {
+                    self.event(format!("pruned {gone} old attachments"));
+                }
+            }
+            Err(e) => self.event(format!("pruning attachments failed: {e:#}")),
         }
     }
 }
@@ -1961,13 +2267,32 @@ pub(crate) mod tests {
     pub fn bus() -> Arc<Bus> {
         let mut cfg: Config = toml::from_str("alerts = false").unwrap();
         cfg.handoff_limit = 3;
-        let bus = Bus::start(cfg, Store::memory());
+        let bus = Bus::start(
+            cfg,
+            Store::memory(),
+            std::env::temp_dir().join(format!("tb-att-{}", new_id())),
+        );
         *bus.me.write().unwrap() = Some(Me {
             machine: "here".into(),
             owner: "o".into(),
             ipv4: None,
         });
         bus.db().add_agent("api", 1).unwrap();
+        bus
+    }
+
+    /// A bus on machine `machine`, as one of two in a test, sending to port
+    /// `port`.
+    pub fn bus_on(machine: &str, port: u16, extra: &str) -> Arc<Bus> {
+        let cfg: Config =
+            toml::from_str(&format!("alerts = false\nport = {port}\n{extra}")).unwrap();
+        let dir = std::env::temp_dir().join(format!("tb-att-{}", new_id()));
+        let bus = Bus::start(cfg, Store::memory(), dir);
+        *bus.me.write().unwrap() = Some(Me {
+            machine: machine.into(),
+            owner: "o".into(),
+            ipv4: None,
+        });
         bus
     }
 
@@ -1982,6 +2307,7 @@ pub(crate) mod tests {
             created_at: 1,
             pipe: None,
             attended: false,
+            ext: None,
         };
         bus.db().store_incoming(&msg, "o", 1).unwrap();
     }
@@ -2165,6 +2491,7 @@ pub(crate) mod tests {
                 created_at: 1,
                 pipe: None,
                 attended: true,
+                ext: None,
             };
             let who = Whois {
                 machine: "there".into(),
@@ -2189,7 +2516,11 @@ pub(crate) mod tests {
     fn a_worker_must_be_billed_to_an_api_key() {
         let mut cfg: Config = toml::from_str("alerts = false").unwrap();
         cfg.clients.insert("work".into(), "acme".into());
-        let bus = Bus::start(cfg, Store::memory());
+        let bus = Bus::start(
+            cfg,
+            Store::memory(),
+            std::env::temp_dir().join(format!("tb-att-{}", new_id())),
+        );
         let billed = |method: &str| Billing {
             method: method.into(),
             plan: None,
@@ -2280,7 +2611,11 @@ pub(crate) mod tests {
     /// and a transcript folder for the worker's session.
     fn pipe_bus(cfg: &str) -> (Arc<Bus>, PathBuf) {
         let cfg: Config = toml::from_str(cfg).unwrap();
-        let bus = Bus::start(cfg, Store::memory());
+        let bus = Bus::start(
+            cfg,
+            Store::memory(),
+            std::env::temp_dir().join(format!("tb-att-{}", new_id())),
+        );
         *bus.me.write().unwrap() = Some(Me {
             machine: "here".into(),
             owner: "o".into(),
@@ -2607,6 +2942,7 @@ pub(crate) mod tests {
             created_at: 0,
             pipe: Some(pipe),
             attended: false,
+            ext: None,
         };
         let plans = [msg(
             "p",

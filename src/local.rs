@@ -48,6 +48,39 @@ pub enum Request {
         /// A `/pipe` step.
         #[serde(default)]
         pipe: Option<crate::proto::Pipe>,
+        /// A bridge's result and attachments. An older daemon drops these,
+        /// which costs the detail and not the reply.
+        #[serde(default)]
+        ext: Option<Box<crate::proto::Extras>>,
+    },
+    /// Sends a message that may carry extras, which an older daemon turns
+    /// down instead of dropping them. With `wait_secs`, a second reply on
+    /// this connection is an `Awaited`.
+    Call {
+        agent: String,
+        to: String,
+        body: String,
+        #[serde(default)]
+        reply_to: Option<String>,
+        #[serde(default)]
+        expects_reply: Option<bool>,
+        #[serde(default)]
+        ext: Option<Box<crate::proto::Extras>>,
+        #[serde(default)]
+        wait_secs: Option<u64>,
+    },
+    /// Waits for the reply to a message already sent, as a blocking call
+    /// does after a daemon restart. The reply is an `Awaited`.
+    Await {
+        agent: String,
+        id: String,
+        wait_secs: u64,
+    },
+    /// Asks the bridge running one of this agent's runs to cancel it. The
+    /// reply is a `Sent`.
+    Cancel {
+        agent: String,
+        run_id: String,
     },
     /// Takes messages, waiting up to `wait_secs` for one. A reply with
     /// messages must be followed by `Confirm` before they count as delivered.
@@ -217,6 +250,22 @@ pub enum Woken {
     Refused {
         reason: String,
     },
+}
+
+/// How a blocking call's wait came out.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Awaited {
+    Reply {
+        item: Box<Item>,
+    },
+    /// It can't be delivered.
+    Undelivered {
+        why: String,
+    },
+    /// Its recipient marked it handled without answering.
+    Unanswered,
+    TimedOut,
 }
 
 /// The answer to a `Permission` request.

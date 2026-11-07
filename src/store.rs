@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS inbox (
     session       TEXT,
     acked_at      INTEGER,
     pipe          TEXT,
-    attended      INTEGER NOT NULL DEFAULT 0
+    attended      INTEGER NOT NULL DEFAULT 0,
+    ext           TEXT
 );
 CREATE INDEX IF NOT EXISTS inbox_open ON inbox (agent, acked_at, seq);
 CREATE INDEX IF NOT EXISTS inbox_reply ON inbox (reply_to);
@@ -58,7 +59,8 @@ CREATE TABLE IF NOT EXISTS sent (
     next_try      INTEGER NOT NULL DEFAULT 0,
     updated_at    INTEGER NOT NULL,
     pipe          TEXT,
-    attended      INTEGER NOT NULL DEFAULT 0
+    attended      INTEGER NOT NULL DEFAULT 0,
+    ext           TEXT
 );
 CREATE INDEX IF NOT EXISTS sent_due ON sent (state, next_try);
 CREATE INDEX IF NOT EXISTS sent_agent ON sent (agent, created_at);
@@ -154,14 +156,15 @@ impl ThreadEntry {
 
 // Columns added later go at the end of each list, so earlier indexes hold.
 const INCOMING: &str = "id, sender, recipient, body, reply_to, expects_reply, created_at, \
-                        owner, delivered_at, session, acked_at, wakes, pipe, attended";
+                        owner, delivered_at, session, acked_at, wakes, pipe, attended, ext";
 const OUTGOING: &str = "id, sender, recipient, body, reply_to, expects_reply, created_at, \
-                        state, error, pipe, attended";
+                        state, error, pipe, attended, ext";
 
-/// A message from a row, with its `pipe` and `attended` columns at `extra`
-/// and the one after.
+/// A message from a row, with its `pipe`, `attended` and `ext` columns at
+/// `extra` and the two after.
 fn message(r: &Row, extra: usize) -> rusqlite::Result<Message> {
     let pipe: Option<String> = r.get(extra)?;
+    let ext: Option<String> = r.get(extra + 2)?;
     Ok(Message {
         id: r.get(0)?,
         from: r.get(1)?,
@@ -172,6 +175,7 @@ fn message(r: &Row, extra: usize) -> rusqlite::Result<Message> {
         created_at: r.get(6)?,
         pipe: pipe.and_then(|p| serde_json::from_str(&p).ok()),
         attended: r.get(extra + 1)?,
+        ext: ext.and_then(|e| serde_json::from_str(&e).ok()),
     })
 }
 
@@ -179,6 +183,10 @@ fn pipe_column(msg: &Message) -> Option<String> {
     msg.pipe
         .as_ref()
         .and_then(|p| serde_json::to_string(p).ok())
+}
+
+fn ext_column(msg: &Message) -> Option<String> {
+    msg.ext.as_ref().and_then(|e| serde_json::to_string(e).ok())
 }
 
 fn incoming(r: &Row) -> rusqlite::Result<Incoming> {
@@ -242,6 +250,8 @@ impl Store {
             ("inbox", "attended", "INTEGER NOT NULL DEFAULT 0"),
             ("sent", "pipe", "TEXT"),
             ("sent", "attended", "INTEGER NOT NULL DEFAULT 0"),
+            ("inbox", "ext", "TEXT"),
+            ("sent", "ext", "TEXT"),
         ] {
             let has = db
                 .prepare(&format!(
@@ -321,8 +331,8 @@ impl Store {
         let n = self.db.execute(
             "INSERT OR IGNORE INTO inbox
              (id, agent, sender, recipient, owner, body, reply_to, expects_reply, wakes,
-              created_at, stored_at, pipe, attended)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              created_at, stored_at, pipe, attended, ext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 msg.id,
                 agent,
@@ -336,7 +346,8 @@ impl Store {
                 msg.created_at,
                 now,
                 pipe_column(msg),
-                msg.attended
+                msg.attended,
+                ext_column(msg)
             ],
         )?;
         Ok(if n == 1 {
@@ -406,6 +417,28 @@ impl Store {
         }
         tx.commit()?;
         Ok(first)
+    }
+
+    #[cfg(test)]
+    pub fn sent_ids(&self, agent: &str) -> Result<Vec<String>> {
+        let mut stmt = self.db.prepare("SELECT id FROM sent WHERE agent = ?1")?;
+        let rows = stmt.query_map([agent], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The answer `agent` got to its message `id`, if it has one.
+    pub fn reply_for(&self, agent: &str, id: &str) -> Result<Option<Incoming>> {
+        Ok(self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT {INCOMING} FROM inbox WHERE agent = ?1 AND reply_to = ?2
+                     ORDER BY seq LIMIT 1"
+                ),
+                [agent, id],
+                incoming,
+            )
+            .optional()?)
     }
 
     pub fn incoming(&self, id: &str) -> Result<Option<Incoming>> {
@@ -523,8 +556,8 @@ impl Store {
         self.db.execute(
             "INSERT INTO sent
              (id, agent, sender, recipient, body, reply_to, expects_reply, created_at, state,
-              updated_at, pipe, attended)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              updated_at, pipe, attended, ext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 msg.id,
                 name_part(&msg.from),
@@ -537,10 +570,39 @@ impl Store {
                 state.as_str(),
                 now,
                 pipe_column(msg),
-                msg.attended
+                msg.attended,
+                ext_column(msg)
             ],
         )?;
         Ok(())
+    }
+
+    /// Replaces a queued message's text and extras, as when its attachments
+    /// can't go.
+    pub fn rewrite_sent(&self, msg: &Message, now: i64) -> Result<()> {
+        self.db.execute(
+            "UPDATE sent SET body = ?2, ext = ?3, next_try = ?4, updated_at = ?4 WHERE id = ?1",
+            params![msg.id, msg.body, ext_column(msg), now],
+        )?;
+        Ok(())
+    }
+
+    /// The hashes of attachments messages here still need: open ones, and
+    /// ones still on their way out.
+    pub fn attachments_in_use(&self) -> Result<HashSet<String>> {
+        let mut used = HashSet::new();
+        for query in [
+            "SELECT ext FROM inbox WHERE acked_at IS NULL AND ext IS NOT NULL",
+            "SELECT ext FROM sent WHERE state = 'queued' AND ext IS NOT NULL",
+        ] {
+            let mut stmt = self.db.prepare(query)?;
+            for ext in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                if let Ok(ext) = serde_json::from_str::<crate::proto::Extras>(&ext?) {
+                    used.extend(ext.attachments.into_iter().map(|a| a.sha256));
+                }
+            }
+        }
+        Ok(used)
     }
 
     pub fn outgoing(&self, id: &str) -> Result<Option<Outgoing>> {
@@ -563,7 +625,7 @@ impl Store {
         let rows = stmt.query_map(params![now, limit as i64], |r| {
             Ok(Due {
                 item: message(r, 9)?,
-                attempts: r.get(11)?,
+                attempts: r.get(12)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -803,6 +865,7 @@ mod tests {
             created_at: 1000,
             pipe: None,
             attended: false,
+            ext: None,
         }
     }
 

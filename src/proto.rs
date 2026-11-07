@@ -32,6 +32,114 @@ pub struct Message {
     /// A receiving bus believes it only from its owner's own machines.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub attended: bool,
+    /// What a bridge request or its reply carries beside the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Box<Extras>>,
+}
+
+/// What travels beside a message's text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Extras {
+    /// A request's options for its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<RunOptions>,
+    /// Files that go with it, already on the receiving bus when it arrives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+    /// On a bridge's reply, how the run went.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<RunResult>,
+    /// Asks a bridge to cancel the run with this ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<String>,
+}
+
+/// What a request asks of its run. These can only narrow what the agent's
+/// config allows, and the bridge refuses anything else. Values are strings
+/// so that a bad one gets a refusal that names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// A file held by its hash on each bus it reaches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+    /// Where it is on this machine. The local bus sets it, and it never
+    /// travels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunStatus {
+    Ok,
+    Failed,
+    Timeout,
+    Refused,
+    Cancelled,
+}
+
+impl RunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunStatus::Ok => "ok",
+            RunStatus::Failed => "failed",
+            RunStatus::Timeout => "timeout",
+            RunStatus::Refused => "refused",
+            RunStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// How a bridge's run went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunResult {
+    pub status: RunStatus,
+    /// The ID of the request, which every try at it shares.
+    pub run_id: String,
+    /// Left out when the agent didn't exit by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    /// The end of stderr on a failure, with secrets taken out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
+    /// What the run really used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<Applied>,
+    /// The hash of the attachment holding the whole reply, when it's too
+    /// large for the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_reply: Option<String>,
+}
+
+/// The options a run actually had.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Applied {
+    /// Set when the request narrowed the tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    pub session: String,
+    pub timeout: u64,
+    pub workdir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// A `/pipe` message: a task handed to a worker, the worker's clarifying
@@ -154,6 +262,23 @@ pub struct Used {
 }
 
 impl Message {
+    pub fn attachments(&self) -> &[Attachment] {
+        self.ext.as_ref().map_or(&[], |e| &e.attachments)
+    }
+
+    pub fn result(&self) -> Option<&RunResult> {
+        self.ext.as_ref().and_then(|e| e.result.as_ref())
+    }
+
+    /// Whether its meaning would change on a bus that dropped `ext`, so it
+    /// has to go by a route an old bus turns down. A reply's result is
+    /// only extra detail, and goes the old way.
+    pub fn needs_new_bus(&self) -> bool {
+        self.ext
+            .as_ref()
+            .is_some_and(|e| e.options.is_some() || e.cancel.is_some() || !e.attachments.is_empty())
+    }
+
     /// What it is to its recipient: a request asks for an answer, while a
     /// response (to one of the recipient's messages) or a notice needs
     /// nothing back.

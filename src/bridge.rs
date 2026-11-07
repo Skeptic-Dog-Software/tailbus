@@ -14,13 +14,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::Shutdown;
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,14 +31,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::attach::Attachments;
 use crate::config::{Config, Paths};
 use crate::format;
 use crate::local::{
     self, BRIDGE_SESSION, Client, Held, Inbox, Item, Messages, Refused, Request, Sent, Status,
 };
-use crate::proto::{MAX_BODY, Message};
+use crate::proto::{
+    Applied, Attachment, Extras, MAX_BODY, Message, RunOptions, RunResult, RunStatus,
+};
 use crate::setup;
-use crate::util::{ago, new_id, now_ms, valid_name};
+use crate::util::{ago, is_id, new_id, now_ms, valid_name};
 
 /// What `tailbus status` shows a bridge's sessions as.
 const APP: &str = "tailbus-bridge";
@@ -49,8 +54,16 @@ const MAX_ATTEMPTS: u32 = 3;
 const TERM_WAIT: Duration = Duration::from_secs(3);
 /// How often a run is checked on.
 const POLL: Duration = Duration::from_millis(50);
-/// How much of a failed run's stderr goes in its failure reply.
+/// How much of a failed run's stderr goes in its failure reply's text.
 const STDERR_TAIL: usize = 300;
+/// The connection slot of the receiver.
+const RECV_SLOT: usize = 0;
+/// The most messages one receive takes.
+const RECV_MAX: usize = 20;
+/// Kept free in a cut reply, for a note a bus adds if it can't send the rest.
+const ROOM_FOR_A_NOTE: usize = 1024;
+/// How often old run logs are cleared.
+const LOG_PRUNE_EVERY: Duration = Duration::from_secs(3600);
 /// The pause after failing to reach the daemon.
 const RETRY: Duration = Duration::from_secs(3);
 /// How long the bridge keeps offering a reply the bus refuses. It may be
@@ -106,6 +119,45 @@ pub struct Settings {
     /// `GH_TOKEN`. Read for each run, so a new token needs no restart.
     #[serde(default)]
     pub secrets: BTreeMap<String, PathBuf>,
+    /// The model `{MODEL}` means when a request doesn't name one.
+    pub model: Option<String>,
+    /// The most stderr a result carries, in bytes.
+    #[serde(default = "default_stderr_tail")]
+    pub stderr_tail_bytes: usize,
+    /// Days to keep each run's log.
+    #[serde(default = "default_log_retention")]
+    pub log_retention_days: u32,
+    /// What a request may ask for. Left out, it may ask for nothing.
+    #[serde(default)]
+    pub options: Allowed,
+}
+
+/// The most a request's options can ask for. This is the authority: a
+/// request narrows it, or is refused.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Allowed {
+    /// The tools a request may narrow the agent to.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Added to the arguments when a request names tools. `{TOOLS}` is
+    /// their names, joined with commas.
+    #[serde(default)]
+    pub tools_args: Vec<String>,
+    /// An environment variable that gets the same list, for an agent that
+    /// enforces it, as a flag can't for every kind of tool.
+    pub tools_env: Option<String>,
+    /// Session modes a request may choose, besides the agent's own.
+    #[serde(default)]
+    pub sessions: Vec<SessionMode>,
+    /// The longest timeout a request may ask for. Left out, `timeout_secs`.
+    pub max_timeout_secs: Option<u64>,
+    /// Working directories a request may choose, besides the agent's own.
+    #[serde(default)]
+    pub workdirs: Vec<PathBuf>,
+    /// Models a request may choose, besides `model`.
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -116,6 +168,38 @@ pub enum SessionMode {
     Fresh,
     /// Each sender has one running conversation.
     PerSender,
+}
+
+impl SessionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            SessionMode::Fresh => "fresh",
+            SessionMode::PerSender => "per-sender",
+        }
+    }
+}
+
+/// What one run will use, once its request's options have been checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Plan {
+    session: SessionMode,
+    timeout: u64,
+    workdir: PathBuf,
+    model: Option<String>,
+    /// Set when the request narrowed the tools.
+    tools: Option<Vec<String>>,
+}
+
+impl Plan {
+    fn applied(&self) -> Applied {
+        Applied {
+            tools: self.tools.clone(),
+            session: self.session.as_str().into(),
+            timeout: self.timeout,
+            workdir: self.workdir.display().to_string(),
+            model: self.model.clone(),
+        }
+    }
 }
 
 fn default_message() -> String {
@@ -134,6 +218,14 @@ fn default_timeout() -> u64 {
 
 fn default_grace() -> u64 {
     10
+}
+
+fn default_stderr_tail() -> usize {
+    4096
+}
+
+fn default_log_retention() -> u32 {
+    14
 }
 
 /// Reads a bridge's settings from the config, and checks them.
@@ -190,8 +282,7 @@ impl Settings {
             if RESERVED.contains(&name.as_str()) {
                 bail!("{name} is set by the bridge; use `home` and `path`");
             }
-            let plain = name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-            if !plain || name.is_empty() || name.as_bytes()[0].is_ascii_digit() {
+            if !plain_env_name(name) {
                 bail!("{name:?} isn't an environment variable's name");
             }
         }
@@ -208,15 +299,135 @@ impl Settings {
                  it goes to stdin, and {{MESSAGE_FILE}} is its path"
             );
         }
-        if self.session == SessionMode::PerSender
-            && !on_command_line.clone().any(|a| a.contains("{SESSION_DIR}"))
-        {
+        let per_sender = self.session == SessionMode::PerSender
+            || self.options.sessions.contains(&SessionMode::PerSender);
+        if per_sender && !on_command_line.clone().any(|a| a.contains("{SESSION_DIR}")) {
             bail!("a per-sender session needs {{SESSION_DIR}} in args, to keep senders apart");
         }
+        let wants_model = self.args.iter().any(|a| a.contains("{MODEL}"));
+        if wants_model && self.model.is_none() {
+            bail!("args use {{MODEL}}, so `model` has to say which one is the default");
+        }
+        if self.args.iter().any(|a| a.contains("{TOOLS}")) {
+            bail!("{{TOOLS}} belongs in options.tools_args, used only when a request names tools");
+        }
+        self.options.check(wants_model, self.timeout_secs)?;
         for (name, path) in &self.secrets {
             read_secret(name, path)?;
         }
         Ok(())
+    }
+}
+
+impl Allowed {
+    fn check(&self, wants_model: bool, timeout_secs: u64) -> Result<()> {
+        if !self.tools.is_empty() && self.tools_args.is_empty() && self.tools_env.is_none() {
+            bail!("options.tools needs tools_args or tools_env, or nothing would enforce it");
+        }
+        if let Some(bad) = self.tools.iter().find(|t| !plain_tool(t)) {
+            bail!("{bad:?} can't be a tool's name in options.tools");
+        }
+        if let Some(name) = &self.tools_env
+            && (RESERVED.contains(&name.as_str()) || !plain_env_name(name))
+        {
+            bail!("options.tools_env can't be {name:?}");
+        }
+        if !self.models.is_empty() && !wants_model {
+            bail!("options.models needs {{MODEL}} in args, or a request's model would do nothing");
+        }
+        if self.max_timeout_secs.is_some_and(|m| m < timeout_secs) {
+            bail!("options.max_timeout_secs is less than timeout_secs");
+        }
+        if let Some(dir) = self.workdirs.iter().find(|d| !d.is_absolute()) {
+            bail!(
+                "options.workdirs needs absolute paths, not {}",
+                dir.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn plain_tool(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
+fn plain_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+impl Settings {
+    /// What a run will use, or why its request can't have it. Every value
+    /// must match config exactly, so a value can't reach the agent unless
+    /// config already names it, however it's written.
+    fn plan(&self, options: Option<&RunOptions>) -> Result<Plan, String> {
+        let mut plan = Plan {
+            session: self.session,
+            timeout: self.timeout_secs,
+            workdir: self.working_directory.clone(),
+            model: self.model.clone(),
+            tools: None,
+        };
+        let Some(options) = options else {
+            return Ok(plan);
+        };
+        if let Some(tools) = &options.tools {
+            if tools.is_empty() {
+                return Err("tools can't be empty".into());
+            }
+            if self.options.tools.is_empty() {
+                return Err("this agent's config doesn't let a request choose tools".into());
+            }
+            if let Some(bad) = tools.iter().find(|t| !self.options.tools.contains(t)) {
+                return Err(format!("tool {bad:?} isn't one this agent's config allows"));
+            }
+            plan.tools = Some(tools.clone());
+        }
+        if let Some(session) = &options.session {
+            let mode = [SessionMode::Fresh, SessionMode::PerSender]
+                .into_iter()
+                .find(|m| m.as_str() == session)
+                .ok_or_else(|| format!("{session:?} isn't a session mode"))?;
+            if mode != self.session && !self.options.sessions.contains(&mode) {
+                return Err(format!(
+                    "this agent's config doesn't allow {session} sessions"
+                ));
+            }
+            plan.session = mode;
+        }
+        if let Some(timeout) = options.timeout {
+            let most = self.options.max_timeout_secs.unwrap_or(self.timeout_secs);
+            if timeout == 0 || timeout > most {
+                return Err(format!(
+                    "a timeout of {timeout} seconds isn't allowed: it must be 1 to {most}"
+                ));
+            }
+            plan.timeout = timeout;
+        }
+        if let Some(dir) = &options.workdir {
+            let dir = PathBuf::from(dir);
+            if dir != self.working_directory && !self.options.workdirs.contains(&dir) {
+                return Err(format!(
+                    "working directory {} isn't one this agent's config allows",
+                    dir.display()
+                ));
+            }
+            plan.workdir = dir;
+        }
+        if let Some(model) = &options.model {
+            if self.model.as_ref() != Some(model) && !self.options.models.contains(model) {
+                return Err(format!(
+                    "model {model:?} isn't one this agent's config allows"
+                ));
+            }
+            plan.model = Some(model.clone());
+        }
+        Ok(plan)
     }
 }
 
@@ -295,17 +506,16 @@ fn slug(sender: &str) -> String {
         .collect()
 }
 
-/// Cuts a reply down to what a message can carry.
-fn fit(text: String) -> String {
-    const NOTE: &str = "\n\n[Cut here: a tailbus message can't hold any more.]";
+/// Cuts text down to what a message can carry, ending with `note`.
+fn fit(text: &str, note: &str) -> String {
     if text.len() <= MAX_BODY {
-        return text;
+        return text.to_string();
     }
-    let mut end = MAX_BODY - NOTE.len();
+    let mut end = MAX_BODY - note.len() - ROOM_FOR_A_NOTE;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{NOTE}", &text[..end])
+    format!("{}{note}", &text[..end])
 }
 
 /// The last `max` characters of `text`.
@@ -314,26 +524,146 @@ fn tail(text: &str, max: usize) -> &str {
     start.map_or(text, |(i, _)| &text[i..]).trim()
 }
 
-/// What's in a run's output, up to twice what a message can carry, so a
-/// secret across the cut is still whole when it's redacted.
-fn read_output(path: &Path) -> Result<String> {
+/// Up to `max` bytes from the start of a file, whole characters only.
+fn read_start(path: &Path, max: usize) -> Result<String> {
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take(2 * MAX_BODY as u64)
-        .read_to_end(&mut bytes)?;
+    File::open(path)?.take(max as u64).read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// The end of a run's stderr.
-fn read_end(path: &Path) -> String {
+/// Up to `max` bytes from the end of a file.
+fn read_end(path: &Path, max: usize) -> String {
     let Ok(mut file) = File::open(path) else {
         return String::new();
     };
     let len = file.metadata().map_or(0, |m| m.len());
-    let _ = file.seek(SeekFrom::Start(len.saturating_sub(8 * STDERR_TAIL as u64)));
+    let _ = file.seek(SeekFrom::Start(len.saturating_sub(max as u64)));
     let mut bytes = Vec::new();
     let _ = file.read_to_end(&mut bytes);
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Takes what looks like a credential out of text, line by line. This is a
+/// net under the configured secrets, for tokens the bridge was never told
+/// about, and it can't catch everything.
+#[derive(Default)]
+struct Scrubber {
+    /// Inside a private key.
+    in_key: bool,
+}
+
+/// Prefixes that start a credential, with how many characters follow one.
+const TOKEN_PREFIXES: [(&str, usize); 17] = [
+    ("ghp_", 20),
+    ("gho_", 20),
+    ("ghu_", 20),
+    ("ghs_", 20),
+    ("ghr_", 20),
+    ("github_pat_", 20),
+    ("glpat-", 16),
+    ("sk-", 20),
+    ("xoxb-", 10),
+    ("xoxp-", 10),
+    ("xoxa-", 10),
+    ("xoxr-", 10),
+    ("xoxs-", 10),
+    ("AKIA", 16),
+    ("ASIA", 16),
+    ("AIza", 30),
+    ("npm_", 20),
+];
+/// Words whose value, after `=` or `:`, is taken to be a credential.
+const SECRET_WORDS: [&str; 7] = [
+    "password", "passwd", "secret", "token", "api_key", "api-key", "apikey",
+];
+const REDACTED: &str = "[redacted]";
+
+fn token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+}
+
+/// How long the credential starting `text` is, if one does.
+fn token_at(text: &str) -> Option<usize> {
+    let run = |s: &str| s.find(|c| !token_char(c)).unwrap_or(s.len());
+    for (prefix, least) in TOKEN_PREFIXES {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let n = run(rest);
+            if n >= least {
+                return Some(prefix.len() + n);
+            }
+        }
+    }
+    // A JSON web token: three parts, the first two of them base64 JSON.
+    if text.starts_with("eyJ") {
+        let first = run(text);
+        let second = text[first..].strip_prefix('.').map(run)?;
+        let third = text[first + 1 + second..].strip_prefix('.').map(run)?;
+        if second > 0 && third > 0 {
+            return Some(first + second + third + 2);
+        }
+    }
+    None
+}
+
+impl Scrubber {
+    fn line(&mut self, line: &str) -> String {
+        if line.contains("PRIVATE KEY-----") {
+            self.in_key = line.contains("-----BEGIN");
+            return format!("{REDACTED}\n");
+        }
+        if self.in_key {
+            return String::new();
+        }
+        let mut out = String::with_capacity(line.len());
+        let mut at = 0;
+        while at < line.len() {
+            let rest = &line[at..];
+            let starts_word = !line[..at].chars().next_back().is_some_and(token_char);
+            if starts_word && let Some(n) = token_at(rest) {
+                out.push_str(REDACTED);
+                at += n;
+                continue;
+            }
+            if starts_word && let Some(n) = secret_value_at(rest, &mut out) {
+                at += n;
+                continue;
+            }
+            let c = rest.chars().next().expect("not at the end");
+            out.push(c);
+            at += c.len_utf8();
+        }
+        out
+    }
+}
+
+/// A word like `token=` or `Bearer `, and the value after it. Copies the
+/// word to `out` and returns how much of `text` that took care of.
+fn secret_value_at(text: &str, out: &mut String) -> Option<usize> {
+    let word = text.find(|c| !token_char(c)).unwrap_or(text.len());
+    let lower = text[..word].to_ascii_lowercase();
+    let rest = &text[word..];
+    let gap = if lower == "bearer" {
+        rest.find(|c| c != ' ').filter(|n| *n > 0)?
+    } else if SECRET_WORDS.iter().any(|w| lower.ends_with(w)) {
+        let sep = rest.find(|c: char| c != ' ' && c != '"' && c != '\'')?;
+        if !matches!(rest[sep..].chars().next(), Some('=' | ':')) {
+            return None;
+        }
+        let after = &rest[sep + 1..];
+        sep + 1 + after.find(|c: char| c != ' ' && c != '"' && c != '\'')?
+    } else {
+        return None;
+    };
+    let value = &rest[gap..];
+    let len = value
+        .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '&'))
+        .unwrap_or(value.len());
+    if len < 8 {
+        return None;
+    }
+    out.push_str(&text[..word + gap]);
+    out.push_str(REDACTED);
+    Some(word + gap + len)
 }
 
 /// Creates a file only you can read.
@@ -447,19 +777,49 @@ fn process_exists(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// Blocks the signals that stop a bridge, in this thread and those it
-/// starts, so that one thread can wait for them. A child inherits the
-/// block, so `command` lifts it for the agent.
-fn block_stop_signals() -> libc::sigset_t {
+/// The write end of the pipe `on_stop_signal` reads.
+static STOP_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn stop_signal(signal: libc::c_int) {
+    // A second one ends the process the usual way.
+    let byte = signal as u8;
     unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-            libc::sigaddset(&mut set, signal);
-        }
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        set
+        libc::signal(signal, libc::SIG_DFL);
+        libc::write(
+            STOP_PIPE.load(Ordering::Relaxed),
+            (&raw const byte).cast(),
+            1,
+        );
     }
+}
+
+/// Calls `work` on a thread of its own when a signal to stop arrives. It's
+/// a handler and a pipe, not a blocked signal and `sigwait`, for what each
+/// does to the agent: a blocked signal is inherited, so an agent couldn't
+/// be asked to stop, and lifting it in `pre_exec` makes Rust `fork` rather
+/// than `posix_spawn`. On macOS that lets one run hold another's `spawn`
+/// open for as long as it lasts.
+pub fn on_stop_signal(work: impl FnOnce(i32) + Send + 'static) -> Result<()> {
+    let mut ends = [0; 2];
+    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error()).context("making a pipe");
+    }
+    for end in ends {
+        unsafe { libc::fcntl(end, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    STOP_PIPE.store(ends[1], Ordering::Relaxed);
+    let handler = stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        unsafe { libc::signal(signal, handler) };
+    }
+    let mut pipe = unsafe { File::from_raw_fd(ends[0]) };
+    thread::spawn(move || {
+        let mut byte = [0];
+        if pipe.read_exact(&mut byte).is_ok() {
+            work(i32::from(byte[0]));
+        }
+    });
+    Ok(())
 }
 
 // The bridge's records.
@@ -474,6 +834,23 @@ struct Journal {
     leader_started: Option<String>,
 }
 
+/// A reply, saved before it's sent.
+#[derive(Debug, Serialize, Deserialize)]
+struct Saved {
+    body: String,
+    ext: Option<Box<Extras>>,
+}
+
+/// What `log/<run id>/meta.json` holds, beside the run's output.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunLog {
+    sender: String,
+    at: i64,
+    /// What the request asked for.
+    options: Option<RunOptions>,
+    result: RunResult,
+}
+
 /// What `tailbus bridge status` reads.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Report {
@@ -484,6 +861,10 @@ struct Report {
     answered: u64,
     failed: u64,
     ignored: u64,
+    #[serde(default)]
+    refused: u64,
+    #[serde(default)]
+    cancelled: u64,
     last_failure: Option<Failure>,
 }
 
@@ -520,6 +901,25 @@ pub fn started_since(paths: &Paths, agent: &str, since: i64) -> bool {
     read_report(paths, agent).is_some_and(|r| r.alive() && r.started_at >= since)
 }
 
+/// Prints what's kept of a run: its record, and where its output is, or
+/// `part`, which is `stdout` or `stderr`.
+pub fn show_log(paths: &Paths, agent: &str, run: &str, part: Option<&str>) -> Result<()> {
+    if !is_id(run) {
+        bail!("{run:?} isn't a run ID");
+    }
+    let dir = state_dir(paths, agent).join("log").join(run);
+    if !dir.exists() {
+        bail!("{agent} has no log of run {run}; it may have passed log_retention_days");
+    }
+    if let Some(part) = part {
+        io::copy(&mut File::open(dir.join(part))?, &mut io::stdout())?;
+        return Ok(());
+    }
+    print!("{}", fs::read_to_string(dir.join("meta.json"))?);
+    println!("\nOutput: {}", dir.display());
+    Ok(())
+}
+
 // The bridge.
 
 #[derive(Default)]
@@ -532,6 +932,18 @@ enum Hold {
     Refused(String),
 }
 
+/// A request waiting for a worker.
+struct Job {
+    item: Item,
+    plan: Plan,
+}
+
+/// A run, from when it's queued until it's over.
+struct Tracked {
+    sender: String,
+    cancelled: bool,
+}
+
 #[derive(Default)]
 struct State {
     /// When a stop was asked for.
@@ -539,24 +951,41 @@ struct State {
     hold: Hold,
     /// Connections blocked on the daemon, to shut down on a stop.
     conns: HashMap<usize, UnixStream>,
-    /// Each sender's place in its `per-sender` session.
-    turns: HashMap<String, Turns>,
+    /// Requests taken from the bus, in the order it gave them out. They
+    /// stay pending there until they're answered.
+    queue: VecDeque<Job>,
+    /// Senders with a run in their `per-sender` session.
+    busy: HashSet<String>,
+    /// Every run queued or going, by ID.
+    runs: HashMap<String, Tracked>,
 }
 
-/// Who's in a sender's session: one run at a time, in the order the bus
-/// gave out the messages. (IDs don't say: they're random within a
-/// millisecond.)
-#[derive(Default)]
-struct Turns {
-    running: Option<String>,
-    waiting: VecDeque<String>,
+/// How a request came out, for its sender.
+#[derive(Debug)]
+struct Finished {
+    status: RunStatus,
+    body: String,
+    exit_code: Option<i32>,
+    stderr_tail: Option<String>,
+    attachment: Option<Attachment>,
 }
 
-/// How a run came out.
+impl Finished {
+    fn new(status: RunStatus, body: String) -> Finished {
+        Finished {
+            status,
+            body,
+            exit_code: None,
+            stderr_tail: None,
+            attachment: None,
+        }
+    }
+}
+
+/// How a try at a request came out.
 #[derive(Debug)]
 enum Outcome {
-    Answer(String),
-    Failed(String),
+    Finished(Finished),
     /// A stop cut it short, so it stays pending for the next start.
     Stopped,
 }
@@ -565,6 +994,7 @@ enum End {
     Exited(ExitStatus),
     TimedOut,
     Stopped,
+    Cancelled,
 }
 
 /// The connection slot of the one that holds the agent's name.
@@ -575,16 +1005,19 @@ struct Bridge {
     cfg: Settings,
     socket: PathBuf,
     dir: PathBuf,
+    attachments: Attachments,
     /// New for each start, which is what brings back what a stopped bridge
     /// left pending.
     session: String,
     recv_wait: u64,
     reply_patience: Duration,
-    /// Held to take a message.
-    taking: Mutex<()>,
     state: Mutex<State>,
     changed: Condvar,
     report: Mutex<Report>,
+    /// Replies and refusals on their way out, which mustn't hold up the
+    /// receiver, so that a cancel always gets through.
+    helpers: Mutex<Vec<thread::JoinHandle<()>>>,
+    logs_pruned: Mutex<Option<Instant>>,
     /// Every secret value seen, to keep out of logs and replies.
     secrets: Mutex<Vec<String>>,
     out: Mutex<Box<dyn Write + Send>>,
@@ -598,22 +1031,25 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub fn run(paths: &Paths, agent: &str) -> Result<()> {
     let cfg = load(paths, agent)?;
     paths.make_state_dir()?;
-    let signals = block_stop_signals();
+    let bus = Config::load(&paths.config)?;
     let bridge = Arc::new(Bridge::new(
         agent,
         cfg,
         paths.socket(),
         state_dir(paths, agent),
+        Attachments::new(
+            paths.attachments(),
+            bus.max_attachment_bytes,
+            bus.attachment_store_bytes,
+        ),
         Box::new(io::stdout()),
     )?);
     {
         let bridge = bridge.clone();
-        thread::spawn(move || {
-            let mut signal = 0;
-            unsafe { libc::sigwait(&signals, &mut signal) };
+        on_stop_signal(move |signal| {
             bridge.log(format!("got signal {signal}, stopping"));
             bridge.stop();
-        });
+        })?;
     }
     bridge.serve()
 }
@@ -624,9 +1060,10 @@ impl Bridge {
         cfg: Settings,
         socket: PathBuf,
         dir: PathBuf,
+        attachments: Attachments,
         out: Box<dyn Write + Send>,
     ) -> Result<Bridge> {
-        for sub in ["inflight", "runs"] {
+        for sub in ["inflight", "runs", "log"] {
             let path = dir.join(sub);
             fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
         }
@@ -640,13 +1077,15 @@ impl Bridge {
             cfg,
             socket,
             dir,
+            attachments,
             session: format!("{BRIDGE_SESSION}{agent}-{}", new_id()),
             recv_wait: RECV_WAIT_SECS,
             reply_patience: REPLY_PATIENCE,
-            taking: Mutex::new(()),
             state: Mutex::default(),
             changed: Condvar::new(),
             report: Mutex::default(),
+            helpers: Mutex::default(),
+            logs_pruned: Mutex::default(),
             secrets: Mutex::new(secrets),
             out: Mutex::new(out),
         })
@@ -690,14 +1129,20 @@ impl Bridge {
             "listening as {}: {mode}, up to {} at once, {}s timeout",
             self.agent, self.cfg.max_concurrent, self.cfg.timeout_secs
         ));
+        self.prune_logs();
         let workers: Vec<_> = (0..self.cfg.max_concurrent)
-            .map(|slot| {
+            .map(|_| {
                 let bridge = self.clone();
-                thread::spawn(move || bridge.worker(slot))
+                thread::spawn(move || bridge.worker())
             })
             .collect();
+        self.receiver();
         for worker in workers {
             let _ = worker.join();
+        }
+        let helpers = std::mem::take(&mut *lock(&self.helpers));
+        for helper in helpers {
+            let _ = helper.join();
         }
     }
 
@@ -892,6 +1337,10 @@ impl Bridge {
         self.dir.join("inflight").join(format!("{id}.reply"))
     }
 
+    fn log_dir(&self, id: &str) -> PathBuf {
+        self.dir.join("log").join(id)
+    }
+
     fn save_journal(&self, id: &str, journal: &Journal) {
         if let Err(e) = write_json(&self.journal_path(id), journal) {
             self.log(format!("couldn't record {id}: {e:#}"));
@@ -903,19 +1352,54 @@ impl Bridge {
         let _ = fs::remove_file(self.reply_path(id));
     }
 
+    /// A reply saved for this message. A bridge before this one saved plain
+    /// text.
+    fn saved_reply(&self, id: &str) -> Option<Saved> {
+        let text = fs::read_to_string(self.reply_path(id)).ok()?;
+        Some(serde_json::from_str(&text).unwrap_or(Saved {
+            body: text,
+            ext: None,
+        }))
+    }
+
+    /// Clears run logs past `log_retention_days`, at most once an hour.
+    fn prune_logs(&self) {
+        let mut pruned = lock(&self.logs_pruned);
+        if pruned.is_some_and(|t| t.elapsed() < LOG_PRUNE_EVERY) {
+            return;
+        }
+        *pruned = Some(Instant::now());
+        drop(pruned);
+        let age = Duration::from_secs(u64::from(self.cfg.log_retention_days) * 86_400);
+        let Ok(entries) = fs::read_dir(self.dir.join("log")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|d| d >= age);
+            if old {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
     // Taking messages.
 
-    /// One of `max_concurrent` loops. Each takes a message and sees it
-    /// through, so that's the limit on runs at once.
-    fn worker(&self, slot: usize) {
+    /// Takes every message as it arrives, whatever's running. They stay
+    /// pending on the bus until they're answered, so that's safe, and it
+    /// means a cancel never waits behind the runs it's meant to stop.
+    fn receiver(self: &Arc<Self>) {
         let mut last_error = None;
         while self.wait_held() {
-            match self.take(slot) {
+            match self.receive() {
                 Ok(got) => {
                     last_error = None;
-                    for item in &got.messages {
-                        self.handle(item);
-                        self.end_turn(&item.msg);
+                    for item in got.messages {
+                        self.arrived(item);
                     }
                 }
                 Err(_) if self.stopping() => {}
@@ -931,38 +1415,25 @@ impl Bridge {
         }
     }
 
-    /// Takes the next message. One worker takes at a time, so a sender's
-    /// messages line up for its session in the order they came.
-    fn take(&self, slot: usize) -> Result<Messages> {
-        let _taking = lock(&self.taking);
-        let got = self.receive(slot)?;
-        if self.cfg.session == SessionMode::PerSender {
-            let mut state = self.lock_state();
-            for item in &got.messages {
-                let turns = state.turns.entry(item.msg.from.clone()).or_default();
-                turns.waiting.push_back(item.msg.id.clone());
-            }
-        }
-        Ok(got)
-    }
-
-    fn receive(&self, slot: usize) -> Result<Messages> {
+    fn receive(&self) -> Result<Messages> {
         let mut client = Client::connect(&self.socket)?;
-        self.track(slot, client.socket()?);
+        self.track(RECV_SLOT, client.socket()?);
         let got = local::recv(
             &mut client,
             &Request::Recv {
                 agent: self.agent.clone(),
                 session: self.session.clone(),
-                max: 1,
+                max: RECV_MAX,
                 wait_secs: self.recv_wait,
             },
         );
-        self.lock_state().conns.remove(&slot);
+        self.lock_state().conns.remove(&RECV_SLOT);
         got
     }
 
-    fn handle(&self, item: &Item) {
+    /// Works out what a message is. The owner comes first: nothing else in
+    /// a message from anyone else is even read.
+    fn arrived(self: &Arc<Self>, item: Item) {
         let msg = &item.msg;
         // Taken just as a stop began: it's pending, and the next start gets
         // it.
@@ -981,43 +1452,118 @@ impl Bridge {
             self.ack(&msg.id);
             return;
         }
-        self.log(format!("request {} from {}", msg.id, msg.from));
-        if let Ok(reply) = fs::read_to_string(self.reply_path(&msg.id)) {
-            self.log(format!("{} already has an answer, so sending it", msg.id));
-            self.send_reply(msg, &reply);
+        if let Some(run) = msg.ext.as_ref().and_then(|e| e.cancel.clone()) {
+            self.cancel(item, run);
             return;
         }
-        let reply = match self.answer(item) {
-            Outcome::Answer(text) => {
-                self.report(|r| r.answered += 1);
-                text
-            }
-            Outcome::Failed(why) => {
-                let why = self.redact(&why);
-                self.log(format!("failed {}: {why}", msg.id));
-                self.report(|r| {
-                    r.failed += 1;
-                    r.last_failure = Some(Failure {
-                        at: now_ms(),
-                        id: msg.id.clone(),
-                        why: why.clone(),
-                    });
+        self.log(format!("request {} from {}", msg.id, msg.from));
+        // A /pipe task needs its plan approved before work starts, which a
+        // single run can't do.
+        let plan = match &msg.pipe {
+            Some(pipe) => Err(format!(
+                "it answers plain requests, not /pipe steps (this was a {})",
+                pipe.stage.as_str()
+            )),
+            None => self
+                .cfg
+                .plan(msg.ext.as_ref().and_then(|e| e.options.as_ref())),
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(why) => {
+                self.in_background(move |bridge| {
+                    let body = format!("{} refused this request: {why}", bridge.agent);
+                    let done = Finished::new(RunStatus::Refused, body);
+                    bridge.conclude(&item, None, done, Instant::now());
                 });
-                format!("{} could not answer: {why}", self.agent)
-            }
-            Outcome::Stopped => {
-                self.tell_stopped(msg);
                 return;
             }
         };
-        let reply = fit(self.redact(&reply));
-        // Saved first, so a restart sends it rather than running it again.
-        let saved = create_private(&self.reply_path(&msg.id))
-            .and_then(|mut file| file.write_all(reply.as_bytes()));
-        if let Err(e) = saved {
-            self.log(format!("couldn't save the reply to {}: {e:#}", msg.id));
+        let mut state = self.lock_state();
+        state.runs.insert(
+            msg.id.clone(),
+            Tracked {
+                sender: msg.from.clone(),
+                cancelled: false,
+            },
+        );
+        state.queue.push_back(Job { item, plan });
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn in_background(self: &Arc<Self>, work: impl FnOnce(&Bridge) + Send + 'static) {
+        let bridge = self.clone();
+        let helper = thread::spawn(move || work(&bridge));
+        lock(&self.helpers).push(helper);
+    }
+
+    /// Cancels a run for the sender it belongs to. Queued, it's over at
+    /// once. Going, its worker sees the mark and kills the process tree.
+    fn cancel(self: &Arc<Self>, item: Item, run: String) {
+        let msg = &item.msg;
+        let mut state = self.lock_state();
+        let answer = match state.runs.get_mut(&run) {
+            None => Err(format!("there's no run {run} here; it may have finished")),
+            Some(tracked) if tracked.sender != msg.from => {
+                Err(format!("run {run} isn't one {} sent", msg.from))
+            }
+            Some(tracked) => {
+                tracked.cancelled = true;
+                Ok(format!("Cancelling run {run}."))
+            }
+        };
+        let queued = state
+            .queue
+            .iter()
+            .position(|j| answer.is_ok() && j.item.msg.id == run);
+        let queued = queued.and_then(|i| state.queue.remove(i));
+        if queued.is_some() {
+            state.runs.remove(&run);
         }
-        self.send_reply(msg, &reply);
+        drop(state);
+        self.changed.notify_all();
+        self.log(format!(
+            "cancel of {run} from {}: {}",
+            msg.from,
+            if answer.is_ok() {
+                "accepted"
+            } else {
+                "refused"
+            }
+        ));
+        self.in_background(move |bridge| {
+            if let Some(job) = queued {
+                let done = Finished::new(RunStatus::Cancelled, bridge.cancelled_text());
+                bridge.conclude(&job.item, Some(&job.plan), done, Instant::now());
+            }
+            let (status, body) = match answer {
+                Ok(text) => (RunStatus::Ok, text),
+                Err(why) => (RunStatus::Refused, why),
+            };
+            let result = RunResult {
+                status,
+                run_id: run,
+                exit_code: None,
+                duration_ms: 0,
+                stderr_tail: None,
+                applied: None,
+                full_reply: None,
+            };
+            let ext = Extras {
+                result: Some(result),
+                ..Extras::default()
+            };
+            let saved = Saved {
+                body,
+                ext: Some(Box::new(ext)),
+            };
+            bridge.send_reply(&item.msg, &saved);
+        });
+    }
+
+    fn cancelled_text(&self) -> String {
+        format!("{} cancelled this request, as you asked.", self.agent)
     }
 
     fn ack(&self, id: &str) {
@@ -1033,17 +1579,149 @@ impl Bridge {
         }
     }
 
+    // Answering them.
+
+    /// One of `max_concurrent` loops, each seeing one request through, so
+    /// that's the limit on runs at once.
+    fn worker(&self) {
+        while let Some(job) = self.next_job() {
+            self.handle(&job);
+            self.prune_logs();
+            let msg = &job.item.msg;
+            let mut state = self.lock_state();
+            if job.plan.session == SessionMode::PerSender {
+                state.busy.remove(&msg.from);
+            }
+            state.runs.remove(&msg.id);
+            drop(state);
+            self.changed.notify_all();
+        }
+    }
+
+    /// The oldest request that can run. A sender's `per-sender` runs go one
+    /// at a time: omp forks a conversation that two runs continue at once,
+    /// and says so only on stderr. They wait without using up a worker.
+    fn next_job(&self) -> Option<Job> {
+        let mut state = self.lock_state();
+        loop {
+            if state.stop_at.is_some() {
+                return None;
+            }
+            let ready = state.queue.iter().position(|job| {
+                job.plan.session == SessionMode::Fresh || !state.busy.contains(&job.item.msg.from)
+            });
+            if let Some(job) = ready.and_then(|i| state.queue.remove(i)) {
+                if job.plan.session == SessionMode::PerSender {
+                    state.busy.insert(job.item.msg.from.clone());
+                }
+                return Some(job);
+            }
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn handle(&self, job: &Job) {
+        let msg = &job.item.msg;
+        if let Some(saved) = self.saved_reply(&msg.id) {
+            self.log(format!("{} already has an answer, so sending it", msg.id));
+            self.send_reply(msg, &saved);
+            return;
+        }
+        let started = Instant::now();
+        match self.attempt(job) {
+            Outcome::Finished(done) => self.conclude(&job.item, Some(&job.plan), done, started),
+            Outcome::Stopped => self.tell_stopped(msg),
+        }
+    }
+
+    /// Records how a request came out, and tells its sender.
+    fn conclude(&self, item: &Item, plan: Option<&Plan>, done: Finished, started: Instant) {
+        let msg = &item.msg;
+        let body = fit(
+            &self.redact(&done.body),
+            "\n\n[Cut here: a tailbus message can't hold any more.]",
+        );
+        match done.status {
+            RunStatus::Ok => self.report(|r| r.answered += 1),
+            RunStatus::Cancelled => {
+                self.log(format!("cancelled {}", msg.id));
+                self.report(|r| r.cancelled += 1);
+            }
+            RunStatus::Refused => {
+                self.log(format!("refused {}: {body}", msg.id));
+                self.report(|r| r.refused += 1);
+            }
+            RunStatus::Failed | RunStatus::Timeout => {
+                let why = body
+                    .strip_prefix(&format!("{} could not answer: ", self.agent))
+                    .unwrap_or(&body);
+                self.log(format!("failed {}: {why}", msg.id));
+                self.report(|r| {
+                    r.failed += 1;
+                    r.last_failure = Some(Failure {
+                        at: now_ms(),
+                        id: msg.id.clone(),
+                        why: why.to_string(),
+                    });
+                });
+            }
+        }
+        let result = RunResult {
+            status: done.status,
+            run_id: msg.id.clone(),
+            exit_code: done.exit_code,
+            duration_ms: started.elapsed().as_millis() as u64,
+            stderr_tail: done.stderr_tail,
+            applied: plan.map(Plan::applied),
+            full_reply: done.attachment.as_ref().map(|a| a.sha256.clone()),
+        };
+        let log = RunLog {
+            sender: msg.from.clone(),
+            at: now_ms(),
+            options: msg.ext.as_ref().and_then(|e| e.options.clone()),
+            result: result.clone(),
+        };
+        let dir = self.log_dir(&msg.id);
+        let logged = fs::create_dir_all(&dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| write_json(&dir.join("meta.json"), &log));
+        if let Err(e) = logged {
+            self.log(format!("couldn't log {}: {e:#}", msg.id));
+        }
+        let ext = Extras {
+            result: Some(result),
+            attachments: done.attachment.into_iter().collect(),
+            ..Extras::default()
+        };
+        let saved = Saved {
+            body,
+            ext: Some(Box::new(ext)),
+        };
+        // Saved first, so a restart sends it rather than running it again.
+        let kept = serde_json::to_vec(&saved)
+            .map_err(anyhow::Error::from)
+            .and_then(|json| {
+                let mut file = create_private(&self.reply_path(&msg.id))?;
+                Ok(file.write_all(&json)?)
+            });
+        if let Err(e) = kept {
+            self.log(format!("couldn't save the reply to {}: {e:#}", msg.id));
+        }
+        self.send_reply(msg, &saved);
+    }
+
     /// Sends a reply, which acknowledges the message. It keeps trying while
     /// the daemon's away. If it's stopped first, the saved reply goes out
     /// from the next start.
-    fn send_reply(&self, msg: &Message, reply: &str) {
+    fn send_reply(&self, msg: &Message, reply: &Saved) {
         let req = Request::Send {
             agent: self.agent.clone(),
             to: msg.from.clone(),
-            body: reply.to_string(),
+            body: reply.body.clone(),
             reply_to: Some(msg.id.clone()),
             expects_reply: None,
             pipe: None,
+            ext: reply.ext.clone(),
         };
         let give_up = Instant::now() + self.reply_patience;
         let mut logged = false;
@@ -1096,6 +1774,7 @@ impl Bridge {
                 reply_to: None,
                 expects_reply: Some(false),
                 pipe: None,
+                ext: None,
             },
         );
         if let Err(e) = told {
@@ -1105,75 +1784,34 @@ impl Bridge {
 
     // Running the agent.
 
-    fn answer(&self, item: &Item) -> Outcome {
-        let msg = &item.msg;
-        // A /pipe task needs its plan approved before work starts, which a
-        // single run can't do.
-        if let Some(pipe) = &msg.pipe {
-            return Outcome::Failed(format!(
-                "it answers plain requests, not /pipe steps (this was a {})",
-                pipe.stage.as_str()
-            ));
-        }
-        if !self.wait_turn(msg) {
-            return Outcome::Stopped;
-        }
-        self.attempt(item)
+    fn failed(&self, why: String) -> Finished {
+        Finished::new(
+            RunStatus::Failed,
+            format!("{} could not answer: {why}", self.agent),
+        )
     }
 
-    /// Waits for a message's turn in its sender's session. There's one run
-    /// at a time in a session: omp forks a conversation that two runs
-    /// continue at once, and says so only on stderr. False if it's stopping.
-    fn wait_turn(&self, msg: &Message) -> bool {
-        if self.cfg.session == SessionMode::Fresh {
-            return true;
-        }
-        let mut state = self.lock_state();
-        loop {
-            if state.stop_at.is_some() {
-                return false;
-            }
-            let turns = state.turns.entry(msg.from.clone()).or_default();
-            if turns.running.is_none() && turns.waiting.front() == Some(&msg.id) {
-                turns.running = turns.waiting.pop_front();
-                return true;
-            }
-            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
+    fn is_cancelled(&self, id: &str) -> bool {
+        self.lock_state().runs.get(id).is_some_and(|r| r.cancelled)
     }
 
-    fn end_turn(&self, msg: &Message) {
-        if self.cfg.session == SessionMode::Fresh {
-            return;
+    fn attempt(&self, job: &Job) -> Outcome {
+        let msg = &job.item.msg;
+        if self.is_cancelled(&msg.id) {
+            return Outcome::Finished(Finished::new(RunStatus::Cancelled, self.cancelled_text()));
         }
-        let mut state = self.lock_state();
-        if let Some(turns) = state.turns.get_mut(&msg.from) {
-            turns.waiting.retain(|id| *id != msg.id);
-            if turns.running.as_ref() == Some(&msg.id) {
-                turns.running = None;
-            }
-            if turns.running.is_none() && turns.waiting.is_empty() {
-                state.turns.remove(&msg.from);
-            }
-        }
-        drop(state);
-        self.changed.notify_all();
-    }
-
-    fn attempt(&self, item: &Item) -> Outcome {
-        let msg = &item.msg;
         let mut journal: Journal = read_json(&self.journal_path(&msg.id)).unwrap_or_default();
         journal.attempts += 1;
         if journal.attempts > MAX_ATTEMPTS {
-            return Outcome::Failed(format!(
+            return Outcome::Finished(self.failed(format!(
                 "the bridge stopped during all {MAX_ATTEMPTS} tries at this request"
-            ));
+            )));
         }
         self.save_journal(&msg.id, &journal);
         let run_dir = self.dir.join("runs").join(&msg.id);
         let outcome = self
-            .run(item, &mut journal, &run_dir)
-            .unwrap_or_else(|e| Outcome::Failed(format!("{e:#}")));
+            .run(job, &mut journal, &run_dir)
+            .unwrap_or_else(|e| Outcome::Finished(self.failed(format!("{e:#}"))));
         let _ = fs::remove_dir_all(&run_dir);
         self.report(|r| {
             r.running.remove(&msg.id);
@@ -1187,29 +1825,56 @@ impl Bridge {
         outcome
     }
 
-    fn session_dir(&self, msg: &Message, run_dir: &Path) -> PathBuf {
-        match self.cfg.session {
+    fn session_dir(&self, job: &Job, run_dir: &Path) -> PathBuf {
+        match job.plan.session {
             SessionMode::Fresh => run_dir.join("session"),
             SessionMode::PerSender => self
                 .cfg
                 .sessions_dir
                 .clone()
                 .unwrap_or_else(|| self.dir.join("sessions"))
-                .join(slug(&msg.from)),
+                .join(slug(&job.item.msg.from)),
         }
     }
 
-    fn run(&self, item: &Item, journal: &mut Journal, run_dir: &Path) -> Result<Outcome> {
-        let msg = &item.msg;
+    /// Copies a request's attachments in for the run. Copies, because the
+    /// agent can write to them and the store is kept by hash. Returns the
+    /// message with its attachments' paths changed to match.
+    fn bring_attachments(&self, item: &Item, run_dir: &Path) -> Result<Item> {
+        let dir = run_dir.join("attachments");
+        fs::create_dir_all(&dir)?;
+        let mut item = item.clone();
+        if let Some(ext) = &mut item.msg.ext {
+            for a in &mut ext.attachments {
+                if !self.attachments.has(a) {
+                    bail!("attachment {} isn't on this machine", a.name);
+                }
+                let mut path = dir.join(&a.name);
+                let mut copy = 1;
+                while path.exists() {
+                    copy += 1;
+                    path = dir.join(format!("{copy}-{}", a.name));
+                }
+                fs::copy(self.attachments.path(&a.sha256), &path)?;
+                a.path = Some(path.display().to_string());
+            }
+        }
+        Ok(item)
+    }
+
+    fn run(&self, job: &Job, journal: &mut Journal, run_dir: &Path) -> Result<Outcome> {
+        let msg = &job.item.msg;
+        let plan = &job.plan;
         let tmp = run_dir.join("tmp");
-        let session_dir = self.session_dir(msg, run_dir);
+        let session_dir = self.session_dir(job, run_dir);
         for dir in [&tmp, &session_dir] {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let continuing = self.cfg.session == SessionMode::PerSender
-            && fs::read_dir(&session_dir)?.next().is_some();
+        let item = self.bring_attachments(&job.item, run_dir)?;
+        let continuing =
+            plan.session == SessionMode::PerSender && fs::read_dir(&session_dir)?.next().is_some();
         let (stdout, stderr) = (run_dir.join("stdout"), run_dir.join("stderr"));
-        let mut command = self.command(item, run_dir, &session_dir, continuing)?;
+        let mut command = self.command(&item, plan, run_dir, &session_dir, continuing)?;
         command
             .stdout(create_private(&stdout)?)
             .stderr(create_private(&stderr)?);
@@ -1230,33 +1895,100 @@ impl Bridge {
                 },
             );
         });
-        let end = self.wait_for(&mut child)?;
+        let end = self.wait_for(&mut child, msg, plan)?;
 
-        let errors = self.redact(&read_end(&stderr));
-        let errors = tail(&errors, STDERR_TAIL);
-        Ok(match end {
-            End::Stopped => Outcome::Stopped,
-            End::TimedOut => Outcome::Failed(format!(
-                "it timed out after {} seconds",
-                self.cfg.timeout_secs
-            )),
+        // Kept whatever happened, with secrets out, and it's what everything
+        // after this reads.
+        let log_dir = self.log_dir(&msg.id);
+        fs::create_dir_all(&log_dir)?;
+        let (stdout, stderr) = (
+            self.keep_output(&stdout, &log_dir.join("stdout"), false)?,
+            self.keep_output(&stderr, &log_dir.join("stderr"), true)?,
+        );
+        let tail_of_stderr = read_end(&stderr, self.cfg.stderr_tail_bytes);
+        let brief = read_end(&stderr, 8 * STDERR_TAIL);
+        let errors = tail(&brief, STDERR_TAIL);
+        let mut done = match end {
+            End::Stopped => return Ok(Outcome::Stopped),
+            End::Cancelled => Finished::new(RunStatus::Cancelled, self.cancelled_text()),
+            End::TimedOut => {
+                let mut done = self.failed(format!("it timed out after {} seconds", plan.timeout));
+                done.status = RunStatus::Timeout;
+                done
+            }
             End::Exited(status) if !status.success() => {
                 let how = match status.code() {
                     Some(code) => format!("exit {code}"),
                     None => format!("killed by signal {}", status.signal().unwrap_or(0)),
                 };
-                Outcome::Failed(format!("{} {how}: {errors}", self.agent))
+                let mut done = self.failed(format!("{} {how}: {errors}", self.agent));
+                done.exit_code = status.code();
+                done
             }
             End::Exited(_) => {
-                let output = read_output(&stdout)?;
-                let output = output.trim();
-                if output.is_empty() {
-                    Outcome::Failed(format!("{} gave no output: {errors}", self.agent))
-                } else {
-                    Outcome::Answer(output.to_string())
-                }
+                let mut done = self.output(&stdout, errors)?;
+                done.exit_code = Some(0);
+                done
             }
-        })
+        };
+        if done.status != RunStatus::Ok {
+            let tail_of_stderr = tail_of_stderr.trim();
+            done.stderr_tail = (!tail_of_stderr.is_empty()).then(|| tail_of_stderr.to_string());
+        }
+        Ok(Outcome::Finished(done))
+    }
+
+    /// Copies a run's output to its log with secrets out. Stderr, which
+    /// goes back to the sender, also loses what looks like a credential.
+    /// Returns where it went.
+    fn keep_output(&self, from: &Path, to: &Path, scrub: bool) -> Result<PathBuf> {
+        let mut input = BufReader::new(File::open(from)?);
+        let mut output = io::BufWriter::new(create_private(to)?);
+        let mut scrubber = Scrubber::default();
+        let mut line = Vec::new();
+        while input.read_until(b'\n', &mut line)? > 0 {
+            let mut clean = self.redact(&String::from_utf8_lossy(&line));
+            if scrub {
+                clean = scrubber.line(&clean);
+            }
+            output.write_all(clean.as_bytes())?;
+            line.clear();
+        }
+        output.flush()?;
+        Ok(to.to_path_buf())
+    }
+
+    /// What a run that exited cleanly has to say. Anything too large for a
+    /// message goes as an attachment, with as much as fits in the text.
+    fn output(&self, stdout: &Path, errors: &str) -> Result<Finished> {
+        let size = fs::metadata(stdout)?.len();
+        let start = read_start(stdout, MAX_BODY + 1)?;
+        let text = start.trim();
+        if text.is_empty() {
+            return Ok(self.failed(format!("{} gave no output: {errors}", self.agent)));
+        }
+        if start.len() <= MAX_BODY {
+            return Ok(Finished::new(RunStatus::Ok, text.to_string()));
+        }
+        let note =
+            format!("\n\n[Cut here: the whole reply, {size} bytes, is attached as reply.txt.]");
+        let cut = fit(text, &note);
+        match self
+            .attachments
+            .add("reply.txt", &mut File::open(stdout)?, size)
+        {
+            Ok(a) => {
+                let mut done = Finished::new(RunStatus::Ok, cut);
+                done.attachment = Some(a);
+                Ok(done)
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                Ok(self.failed(format!(
+                    "its {size} bytes of output are too large to send: {why}"
+                )))
+            }
+        }
     }
 
     /// What a run executes, in an environment of its own. The message goes
@@ -1264,14 +1996,18 @@ impl Bridge {
     fn command(
         &self,
         item: &Item,
+        plan: &Plan,
         run_dir: &Path,
         session_dir: &Path,
         continuing: bool,
     ) -> Result<Command> {
         let msg = &item.msg;
         let message_file = run_dir.join("message");
+        let attachments = run_dir.join("attachments");
         let (run_text, session_text) = (run_dir.to_string_lossy(), session_dir.to_string_lossy());
         let (file_text, tagged) = (message_file.to_string_lossy(), format::tagged(item));
+        let attachments_text = attachments.to_string_lossy();
+        let tools = plan.tools.as_ref().map(|t| t.join(","));
         let vars = [
             ("AGENT", self.agent.as_str()),
             ("ID", msg.id.as_str()),
@@ -1279,6 +2015,9 @@ impl Bridge {
             ("RUN_DIR", run_text.as_ref()),
             ("SESSION_DIR", session_text.as_ref()),
             ("MESSAGE_FILE", file_text.as_ref()),
+            ("ATTACHMENTS_DIR", attachments_text.as_ref()),
+            ("MODEL", plan.model.as_deref().unwrap_or_default()),
+            ("TOOLS", tools.as_deref().unwrap_or_default()),
             ("MESSAGE", tagged.as_str()),
             ("BODY", msg.body.as_str()),
         ];
@@ -1292,20 +2031,16 @@ impl Bridge {
                 command.arg(expand(arg, &vars)?);
             }
         }
+        if tools.is_some() {
+            for arg in &self.cfg.options.tools_args {
+                command.arg(expand(arg, &vars)?);
+            }
+        }
         command
-            .current_dir(&self.cfg.working_directory)
+            .current_dir(&plan.workdir)
             .env_clear()
             .stdin(File::open(&message_file)?)
             .process_group(0);
-        // Without this the agent can't be asked to stop, only killed.
-        unsafe {
-            command.pre_exec(|| {
-                let mut none: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut none);
-                libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
-                Ok(())
-            });
-        }
         for name in INHERITED {
             if let Some(value) = env::var_os(name) {
                 command.env(name, value);
@@ -1316,6 +2051,9 @@ impl Bridge {
             .env("PATH", &self.cfg.path)
             .env("TMPDIR", run_dir.join("tmp"))
             .envs(&self.cfg.env);
+        if let (Some(name), Some(tools)) = (&self.cfg.options.tools_env, &tools) {
+            command.env(name, tools);
+        }
         for (name, path) in &self.cfg.secrets {
             let value = read_secret(name, path)?;
             let mut known = lock(&self.secrets);
@@ -1329,13 +2067,16 @@ impl Bridge {
     }
 
     /// Waits for a run to end, and leaves nothing of it running.
-    fn wait_for(&self, child: &mut Child) -> Result<End> {
+    fn wait_for(&self, child: &mut Child, msg: &Message, plan: &Plan) -> Result<End> {
         let pid = child.id() as i32;
-        let deadline = Instant::now() + Duration::from_secs(self.cfg.timeout_secs);
+        let deadline = Instant::now() + Duration::from_secs(plan.timeout);
         let grace = Duration::from_secs(self.cfg.shutdown_grace_secs);
         let cut_short = loop {
             if exited(pid) {
                 break None;
+            }
+            if self.is_cancelled(&msg.id) {
+                break Some(End::Cancelled);
             }
             if Instant::now() >= deadline {
                 break Some(End::TimedOut);
@@ -1429,8 +2170,8 @@ fn describe(paths: &Paths, agent: &str, bus: Option<&Status>) -> String {
     }
     if let Some(r) = &report {
         out.push_str(&format!(
-            "  Answered {}, failed {}, ignored {}\n",
-            r.answered, r.failed, r.ignored
+            "  Answered {}, failed {}, refused {}, cancelled {}, ignored {}\n",
+            r.answered, r.failed, r.refused, r.cancelled, r.ignored
         ));
         if r.alive() {
             for (id, run) in &r.running {
@@ -1465,7 +2206,8 @@ mod tests {
     use std::thread::JoinHandle;
 
     use super::*;
-    use crate::bus::Bus;
+    use crate::bus::{Bus, Draft};
+    use crate::call;
     use crate::daemon;
     use crate::proto::{Pipe, PipeStage};
     use crate::store::Incoming;
@@ -1567,6 +2309,12 @@ mod tests {
         /// Settings that run `script` with the session directory and the
         /// run directory as its arguments, and the message's body on stdin.
         fn settings(&self, script: &str, extra: &str) -> Settings {
+            let cfg = self.unchecked(script, extra);
+            cfg.check().unwrap();
+            cfg
+        }
+
+        fn unchecked(&self, script: &str, extra: &str) -> Settings {
             let agent = self.dir.join("agent");
             fs::write(&agent, format!("#!/bin/sh\n{script}\n")).unwrap();
             fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1587,7 +2335,6 @@ mod tests {
                 home = self.dir.join("home").display(),
             ))
             .unwrap();
-            cfg.check().unwrap();
             cfg
         }
 
@@ -1597,8 +2344,17 @@ mod tests {
 
         fn bridge(&self, cfg: Settings) -> Bridge {
             let log = Box::new(self.log.clone());
-            let mut bridge =
-                Bridge::new("api", cfg, self.socket.clone(), self.state(), log).unwrap();
+            let store = &self.bus.attachments;
+            let attachments = Attachments::new(store.dir().to_path_buf(), store.max_file, u64::MAX);
+            let mut bridge = Bridge::new(
+                "api",
+                cfg,
+                self.socket.clone(),
+                self.state(),
+                attachments,
+                log,
+            )
+            .unwrap();
             bridge.recv_wait = 1;
             bridge
         }
@@ -1614,6 +2370,35 @@ mod tests {
 
         fn ask(&self, body: &str) -> String {
             self.ask_as("sim", body)
+        }
+
+        fn ask_with(&self, ext: Option<Box<Extras>>) -> String {
+            self.ask_body_with("hello", ext)
+        }
+
+        fn ask_body_with(&self, body: &str, ext: Option<Box<Extras>>) -> String {
+            let draft = Draft {
+                ext,
+                ..Draft::default()
+            };
+            let sent = self.bus.send_draft("sim", "api@here", body.into(), draft);
+            sent.unwrap().id
+        }
+
+        /// The whole reply to a message.
+        fn reply_item(&self, id: &str) -> Incoming {
+            until("a reply", || {
+                let sender = name_of(id, self);
+                self.bus.db().reply_for(sender, id).ok()?
+            })
+        }
+
+        /// `sim`'s replies, acknowledged by a blocking call.
+        fn acked_for_sim(&self) -> Vec<Incoming> {
+            let ids = self.bus.db().sent_ids("sim").unwrap();
+            ids.iter()
+                .filter_map(|id| self.bus.db().reply_for("sim", id).ok().flatten())
+                .collect()
         }
 
         fn ask_as(&self, sender: &str, body: &str) -> String {
@@ -1635,6 +2420,7 @@ mod tests {
                 created_at: now_ms(),
                 pipe,
                 attended: false,
+                ext: None,
             };
             self.bus.db().add_agent("sim", 1).unwrap();
             self.bus.db().store_incoming(&msg, owner, now_ms()).unwrap();
@@ -1700,6 +2486,15 @@ mod tests {
                 let text = fs::read_to_string(self.home(name)).ok()?;
                 text.trim().parse().ok()
             })
+        }
+    }
+
+    /// Who sent a message, which is who gets its reply.
+    fn name_of<'a>(id: &str, rig: &'a Rig) -> &'a str {
+        let sender = rig.bus.db().outgoing(id).ok().flatten();
+        match sender.map(|s| s.msg.from) {
+            Some(from) if from.starts_with("mallory") => "mallory",
+            _ => "sim",
         }
     }
 
@@ -2069,9 +2864,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_can_be_asked_to_stop_though_the_bridge_blocks_signals() {
-        // As `run` does, and every thread started from here keeps it.
-        block_stop_signals();
+    fn a_run_can_be_asked_to_stop() {
         let rig = Rig::new();
         let script = r#"trap 'touch "$HOME/asked"; exit 0' TERM
             sleep 300 &
@@ -2201,18 +2994,895 @@ mod tests {
         bridge.stop().unwrap();
     }
 
+    /// Options for a bridge that allows a good deal of them.
+    const ALLOWS: &str = r#"
+        model = "m1"
+        timeout_secs = 10
+        [options]
+        tools = ["read", "grep", "mcp__jira_query"]
+        tools_args = ["--tools", "{TOOLS}"]
+        tools_env = "ALLOWED_TOOLS"
+        sessions = ["per-sender"]
+        max_timeout_secs = 100
+        models = ["m2", "my model"]
+        "#;
+
+    fn generous(rig: &Rig, script: &str) -> Settings {
+        let mut cfg = rig.unchecked(script, ALLOWS);
+        cfg.args.push("--model".into());
+        cfg.args.push("{MODEL}".into());
+        cfg.options.workdirs.push(rig.dir.join("home"));
+        cfg.check().unwrap();
+        cfg
+    }
+
+    fn with(options: RunOptions) -> Option<Box<Extras>> {
+        Some(Box::new(Extras {
+            options: Some(options),
+            ..Extras::default()
+        }))
+    }
+
     #[test]
-    fn long_output_is_cut_to_fit_a_message() {
+    fn options_narrow_what_config_allows_and_never_widen_it() {
+        let rig = Rig::new();
+        let cfg = generous(&rig, "echo hi");
+        let plan = |o: RunOptions| cfg.plan(Some(&o));
+        let defaults = cfg.plan(None).unwrap();
+        assert_eq!(defaults.timeout, 10);
+        assert_eq!(defaults.model.as_deref(), Some("m1"));
+        assert_eq!(defaults.tools, None);
+        assert_eq!(cfg.plan(Some(&RunOptions::default())).unwrap(), defaults);
+
+        let tools = Some(vec!["read".to_string()]);
+        let some = |s: &str| Some(s.to_string());
+        let narrowed = plan(RunOptions {
+            tools: tools.clone(),
+            session: some("per-sender"),
+            timeout: Some(100),
+            workdir: Some(rig.dir.join("home").display().to_string()),
+            model: some("m2"),
+        })
+        .unwrap();
+        assert_eq!(narrowed.tools, tools);
+        assert_eq!(narrowed.session, SessionMode::PerSender);
+        assert_eq!(narrowed.timeout, 100);
+        assert_eq!(narrowed.workdir, rig.dir.join("home"));
+        assert_eq!(narrowed.model.as_deref(), Some("m2"));
+
+        let widened = [
+            RunOptions {
+                tools: Some(vec!["read".into(), "bash".into()]),
+                ..RunOptions::default()
+            },
+            RunOptions {
+                tools: Some(Vec::new()),
+                ..RunOptions::default()
+            },
+            RunOptions {
+                timeout: Some(101),
+                ..RunOptions::default()
+            },
+            RunOptions {
+                timeout: Some(0),
+                ..RunOptions::default()
+            },
+            RunOptions {
+                workdir: some("/"),
+                ..RunOptions::default()
+            },
+            RunOptions {
+                model: some("m3"),
+                ..RunOptions::default()
+            },
+        ];
+        for options in widened {
+            assert!(plan(options.clone()).is_err(), "{options:?}");
+        }
+
+        // A config that allows nothing refuses all of it, though asking for
+        // what the agent has anyway is fine.
+        let bare = rig.settings("echo hi", "timeout_secs = 10");
+        let refused = |o: RunOptions| bare.plan(Some(&o)).unwrap_err();
+        assert!(
+            refused(RunOptions {
+                tools: tools.clone(),
+                ..RunOptions::default()
+            })
+            .contains("doesn't let a request choose tools")
+        );
+        assert!(
+            refused(RunOptions {
+                session: some("per-sender"),
+                ..RunOptions::default()
+            })
+            .contains("doesn't allow per-sender")
+        );
+        assert!(
+            refused(RunOptions {
+                timeout: Some(11),
+                ..RunOptions::default()
+            })
+            .contains("1 to 10")
+        );
+        assert!(
+            refused(RunOptions {
+                model: some("m2"),
+                ..RunOptions::default()
+            })
+            .contains("m2")
+        );
+        assert_eq!(
+            bare.plan(Some(&RunOptions {
+                session: some("fresh"),
+                timeout: Some(5),
+                ..RunOptions::default()
+            }))
+            .unwrap()
+            .timeout,
+            5
+        );
+    }
+
+    #[test]
+    fn malicious_option_values_are_refused() {
+        let rig = Rig::new();
+        let cfg = generous(&rig, "echo hi");
+        let evil = [
+            "--auto-approve",
+            "read,bash",
+            "read --evil",
+            "read\n--evil",
+            "read\0",
+            " read",
+            "READ",
+            "$(touch /tmp/owned)",
+            "`id`",
+            "; rm -rf /",
+            "../../etc/passwd",
+            "*",
+            "",
+        ];
+        for value in evil {
+            let as_tool = RunOptions {
+                tools: Some(vec![value.to_string()]),
+                ..RunOptions::default()
+            };
+            let as_session = RunOptions {
+                session: Some(value.to_string()),
+                ..RunOptions::default()
+            };
+            let as_workdir = RunOptions {
+                workdir: Some(value.to_string()),
+                ..RunOptions::default()
+            };
+            let as_model = RunOptions {
+                model: Some(value.to_string()),
+                ..RunOptions::default()
+            };
+            for options in [as_tool, as_session, as_workdir, as_model] {
+                assert!(cfg.plan(Some(&options)).is_err(), "{options:?}");
+            }
+        }
+        // A path that comes to an allowed one by another way isn't it.
+        let sideways = format!("{}/../home", rig.dir.join("home").display());
+        let options = RunOptions {
+            workdir: Some(sideways),
+            ..RunOptions::default()
+        };
+        assert!(cfg.plan(Some(&options)).is_err());
+        let options = RunOptions {
+            timeout: Some(u64::MAX),
+            ..RunOptions::default()
+        };
+        assert!(cfg.plan(Some(&options)).is_err());
+    }
+
+    #[test]
+    fn a_bad_config_for_options_wont_start() {
+        let rig = Rig::new();
+        let good = rig.settings("echo hi", "");
+        let refused = |change: fn(&mut Settings), says: &str| {
+            let mut cfg = good.clone();
+            change(&mut cfg);
+            let err = format!("{:#}", cfg.check().unwrap_err());
+            assert!(err.contains(says), "{err}");
+        };
+        refused(
+            |c| c.options.tools.push("read".into()),
+            "nothing would enforce",
+        );
+        refused(
+            |c| {
+                c.options.tools.push("a,b".into());
+                c.options.tools_env = Some("T".into());
+            },
+            "tool's name",
+        );
+        refused(|c| c.options.tools_env = Some("PATH".into()), "tools_env");
+        refused(|c| c.options.models.push("m".into()), "{MODEL}");
+        refused(|c| c.args.push("{MODEL}".into()), "default");
+        refused(|c| c.args.push("{TOOLS}".into()), "tools_args");
+        refused(|c| c.options.max_timeout_secs = Some(1), "max_timeout_secs");
+        refused(|c| c.options.workdirs.push("rel".into()), "absolute");
+        assert!(toml::from_str::<Allowed>("nope = 1").is_err());
+    }
+
+    #[test]
+    fn a_refused_request_never_runs() {
+        let rig = Rig::new();
+        let script = r#"touch "$HOME/ran"; echo hi"#;
+        let bridge = rig.start(generous(&rig, script));
+        let id = rig.ask_with(with(RunOptions {
+            model: Some("gpt-evil".into()),
+            ..RunOptions::default()
+        }));
+        let reply = rig.reply_item(&id);
+        let result = reply.msg.result().unwrap();
+        assert_eq!(result.status, RunStatus::Refused);
+        assert_eq!(result.run_id, id);
+        assert_eq!(result.applied, None);
+        assert!(reply.msg.body.contains("gpt-evil"), "{}", reply.msg.body);
+        rig.wait_acked(&id);
+        bridge.stop().unwrap();
+        assert!(!rig.home("ran").exists());
+        // It's on record, with what was asked.
+        let log: RunLog = read_json(&rig.state().join("log").join(&id).join("meta.json")).unwrap();
+        assert_eq!(log.result.status, RunStatus::Refused);
+        assert_eq!(log.options.unwrap().model.as_deref(), Some("gpt-evil"));
+    }
+
+    #[test]
+    fn options_reach_the_agent_as_arguments_and_the_reply_says_what_applied() {
+        let rig = Rig::new();
+        let script = r#"printf '[%s]\n' "$@"
+            echo "cwd: $(pwd)"
+            echo "env: $ALLOWED_TOOLS"
+            cat"#;
+        let bridge = rig.start(generous(&rig, script));
+        let workdir = rig.dir.join("home").display().to_string();
+        let options = RunOptions {
+            tools: Some(vec!["read".into(), "mcp__jira_query".into()]),
+            timeout: Some(50),
+            workdir: Some(workdir.clone()),
+            model: Some("my model".into()),
+            ..RunOptions::default()
+        };
+        let id = rig.ask_body_with("--auto-approve; touch owned", with(options));
+        let reply = rig.reply_item(&id);
+        bridge.stop().unwrap();
+        let body = &reply.msg.body;
+        assert!(body.contains("[--tools]\n[read,mcp__jira_query]"), "{body}");
+        // One argument, spaces and all, because no shell is involved.
+        assert!(body.contains("[--model]\n[my model]"), "{body}");
+        assert!(body.contains(&format!("cwd: {workdir}")), "{body}");
+        assert!(body.contains("env: read,mcp__jira_query"), "{body}");
+        // The message stays text.
+        assert!(!body.contains("[--auto-approve"), "{body}");
+        assert!(body.ends_with("--auto-approve; touch owned"), "{body}");
+        assert!(!rig.dir.join("home").join("owned").exists());
+        let applied = reply.msg.result().unwrap().applied.clone().unwrap();
+        assert_eq!(applied.session, "fresh");
+        assert_eq!(applied.timeout, 50);
+        assert_eq!(applied.workdir, workdir);
+        assert_eq!(applied.model.as_deref(), Some("my model"));
+        assert_eq!(
+            applied.tools,
+            Some(vec!["read".to_string(), "mcp__jira_query".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_request_can_choose_a_per_sender_session() {
+        let rig = Rig::new();
+        let script = r#"n=$(cat "$1/turns" 2>/dev/null || echo 0)
+            n=$((n + 1))
+            echo $n > "$1/turns"
+            echo "turn $n""#;
+        let bridge = rig.start(generous(&rig, script));
+        let chat = || {
+            with(RunOptions {
+                session: Some("per-sender".into()),
+                ..RunOptions::default()
+            })
+        };
+        let first = rig.ask_with(chat());
+        assert_eq!(rig.reply_to(&first), "turn 1");
+        let second = rig.ask_with(chat());
+        assert_eq!(rig.reply_to(&second), "turn 2");
+        let fresh = rig.ask("hello");
+        assert_eq!(rig.reply_to(&fresh), "turn 1");
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn the_owner_is_checked_before_any_option_is_read() {
+        let rig = Rig::new();
+        let bridge = rig.start(generous(&rig, r#"touch "$HOME/ran"; echo hi"#));
+        let id = new_id();
+        let msg = Message {
+            id: id.clone(),
+            from: "sim@here".into(),
+            to: "api@here".into(),
+            body: "hello".into(),
+            reply_to: None,
+            expects_reply: true,
+            created_at: now_ms(),
+            pipe: None,
+            attended: false,
+            ext: with(RunOptions {
+                model: Some("not-allowed".into()),
+                ..RunOptions::default()
+            }),
+        };
+        rig.bus.db().add_agent("sim", 1).unwrap();
+        rig.bus
+            .db()
+            .store_incoming(&msg, "stranger", now_ms())
+            .unwrap();
+        rig.bus.notify();
+        rig.wait_acked(&id);
+        bridge.stop().unwrap();
+        // Had the options been read, it would have got a refusal.
+        assert_eq!(rig.replies(), 0);
+        assert!(!rig.home("ran").exists());
+        let log = rig.log.text();
+        assert!(log.contains("ack without answering"), "{log}");
+        assert!(!log.contains("not-allowed"), "{log}");
+    }
+
+    #[test]
+    fn a_request_with_no_options_runs_as_configured() {
+        let rig = Rig::new();
+        let script = r#"printf '[%s]\n' "$@"; echo "env: [$ALLOWED_TOOLS]"; cat"#;
+        let bridge = rig.start(generous(&rig, script));
+        let id = rig.ask("plain");
+        let reply = rig.reply_item(&id);
+        bridge.stop().unwrap();
+        let body = &reply.msg.body;
+        assert!(!body.contains("--tools"), "{body}");
+        assert!(body.contains("[--model]\n[m1]"), "{body}");
+        assert!(body.contains("env: []"), "{body}");
+        let result = reply.msg.result().unwrap();
+        assert_eq!(result.status, RunStatus::Ok);
+        assert_eq!(result.exit_code, Some(0));
+        let applied = result.applied.as_ref().unwrap();
+        assert_eq!(applied.tools, None);
+        assert_eq!(applied.session, "fresh");
+        assert_eq!(applied.timeout, 10);
+    }
+
+    fn call_args(to: &str, timeout: Option<u64>) -> call::Args {
+        call::Args {
+            to: to.into(),
+            body: None,
+            options: RunOptions::default(),
+            attach: Vec::new(),
+            timeout,
+            no_cancel: false,
+            json: false,
+            verbose: false,
+        }
+    }
+
+    /// A blocking call, as `tailbus call` makes it, and its exit code.
+    fn blocking(rig: &Rig, body: &str, options: RunOptions, timeout: Option<u64>) -> u8 {
+        let run = Mutex::new(None);
+        let ext = Extras {
+            options: (options != RunOptions::default()).then_some(options),
+            ..Extras::default()
+        };
+        call::request(
+            &rig.socket,
+            "sim",
+            body.into(),
+            ext,
+            &call_args("api@here", timeout),
+            &run,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_status_has_its_metadata_and_exit_code() {
+        let rig = Rig::new();
+        let script = r#"case "$(cat)" in
+              ok) echo fine ;;
+              fail) echo "it broke" >&2; exit 3 ;;
+              slow) touch "$HOME/slow"; sleep 300 ;;
+            esac"#;
+        let mut cfg = generous(&rig, script);
+        cfg.timeout_secs = 1;
+        cfg.max_concurrent = 2;
+        let bridge = rig.start(cfg);
+
+        assert_eq!(blocking(&rig, "ok", RunOptions::default(), None), 0);
+        assert_eq!(blocking(&rig, "fail", RunOptions::default(), None), 1);
+        assert_eq!(blocking(&rig, "slow", RunOptions::default(), None), 124);
+        fs::remove_file(rig.home("slow")).unwrap();
+        let refused = RunOptions {
+            model: Some("nope".into()),
+            ..RunOptions::default()
+        };
+        assert_eq!(blocking(&rig, "ok", refused, None), 77);
+        let long = RunOptions {
+            timeout: Some(60),
+            ..RunOptions::default()
+        };
+        let cancelled = {
+            let bus = rig.bus.clone();
+            let home = rig.home("slow");
+            thread::spawn(move || {
+                until("the run", || home.exists().then_some(()));
+                let run = bus.db().open_incoming("api").unwrap();
+                bus.cancel_run("sim", &run[0].msg.id).unwrap();
+            })
+        };
+        assert_eq!(blocking(&rig, "slow", long, Some(20)), 130);
+        cancelled.join().unwrap();
+        bridge.stop().unwrap();
+
+        let replies = rig.acked_for_sim();
+        let results: Vec<RunResult> = replies
+            .iter()
+            .filter_map(|m| m.msg.result().cloned())
+            .collect();
+        let of = |status: RunStatus| results.iter().find(|r| r.status == status).unwrap();
+        assert_eq!(of(RunStatus::Ok).exit_code, Some(0));
+        assert_eq!(of(RunStatus::Ok).stderr_tail, None);
+        let failed = of(RunStatus::Failed);
+        assert_eq!(failed.exit_code, Some(3));
+        assert_eq!(failed.stderr_tail.as_deref(), Some("it broke"));
+        assert!(of(RunStatus::Timeout).exit_code.is_none());
+        assert!(of(RunStatus::Timeout).duration_ms >= 1000);
+        assert!(of(RunStatus::Cancelled).exit_code.is_none());
+        assert!(of(RunStatus::Refused).applied.is_none());
+        assert!(results.iter().all(|r| crate::util::is_id(&r.run_id)));
+    }
+
+    #[test]
+    fn a_calls_own_timeout_cancels_its_run() {
+        let rig = Rig::new();
+        let script = r#"sleep 300 &
+            echo $! > "$HOME/child"
+            wait"#;
+        let bridge = rig.start(rig.settings(script, ""));
+        assert_eq!(blocking(&rig, "hello", RunOptions::default(), Some(1)), 125);
+        wait_gone(rig.pid_in("child"));
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_call_says_when_nobody_answered() {
+        let rig = Rig::new();
+        let mut cfg = rig.settings("echo hi", "");
+        cfg.owner = "someone-else".into();
+        let bridge = rig.start(cfg);
+        assert_eq!(blocking(&rig, "hello", RunOptions::default(), Some(30)), 77);
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_call_says_when_there_is_nobody_to_ask() {
+        let rig = Rig::new();
+        let run = Mutex::new(None);
+        let err = call::request(
+            &rig.socket,
+            "sim",
+            "hello".into(),
+            Extras::default(),
+            &call_args("nobody@here", Some(5)),
+            &run,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("no agent nobody"), "{err:#}");
+    }
+
+    #[test]
+    fn parallel_blocking_calls_each_get_their_own_reply() {
+        let rig = Rig::new();
+        let script = r#"body=$(cat)
+            sleep "0.$((body % 3))"
+            echo "answer to $body""#;
+        let mut cfg = rig.settings(script, "");
+        cfg.max_concurrent = 4;
+        let bridge = rig.start(cfg);
+        // Every call is the same agent, and something else is reading its
+        // queue the whole time.
+        let reader = {
+            let socket = rig.socket.clone();
+            thread::spawn(move || {
+                let mut client = Client::connect(&socket).unwrap();
+                let got = local::recv(
+                    &mut client,
+                    &Request::Recv {
+                        agent: "sim".into(),
+                        session: "cli".into(),
+                        max: 100,
+                        wait_secs: 3,
+                    },
+                );
+                got.unwrap().messages.len()
+            })
+        };
+        let calls: Vec<_> = (0..12)
+            .map(|n| {
+                let socket = rig.socket.clone();
+                thread::spawn(move || {
+                    let mut client = Client::connect(&socket).unwrap();
+                    client
+                        .send(&Request::Call {
+                            agent: "sim".into(),
+                            to: "api@here".into(),
+                            body: n.to_string(),
+                            reply_to: None,
+                            expects_reply: Some(true),
+                            ext: None,
+                            wait_secs: Some(30),
+                        })
+                        .unwrap();
+                    let sent: Sent = client.reply().unwrap();
+                    match client.reply::<local::Awaited>().unwrap() {
+                        local::Awaited::Reply { item } => {
+                            assert_eq!(item.msg.reply_to.as_deref(), Some(sent.id.as_str()));
+                            assert_eq!(item.msg.body, format!("answer to {n}"));
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                })
+            })
+            .collect();
+        for call in calls {
+            call.join().unwrap();
+        }
+        assert_eq!(reader.join().unwrap(), 0, "the queue took a call's reply");
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn cancelling_kills_the_whole_tree_with_every_worker_busy() {
+        let rig = Rig::new();
+        let script = r#"sleep 300 &
+            echo $! > "$HOME/child"
+            perl -e 'use POSIX; POSIX::setsid();
+                     open(my $f, ">", "$ENV{HOME}/stray"); print $f $$; close $f;
+                     sleep 300' &
+            wait"#;
+        let bridge = rig.start(rig.settings(script, ""));
+        let id = rig.ask("hello");
+        let pids = [rig.pid_in("child"), rig.pid_in("stray")];
+        let cancel = rig.bus.cancel_run("sim", &id).unwrap();
+        let reply = rig.reply_item(&id);
+        assert_eq!(reply.msg.result().unwrap().status, RunStatus::Cancelled);
+        assert_eq!(reply.msg.result().unwrap().run_id, id);
+        for pid in pids {
+            wait_gone(pid);
+        }
+        let answer = rig.reply_item(&cancel.id);
+        assert_eq!(answer.msg.result().unwrap().status, RunStatus::Ok);
+        rig.wait_acked(&id);
+        bridge.stop().unwrap();
+        assert!(rig.log.text().contains(&format!("cancelled {id}")));
+    }
+
+    #[test]
+    fn cancelling_a_queued_run_means_it_never_starts() {
+        let rig = Rig::new();
+        let script = r#"echo run >> "$HOME/runs"; sleep 1; echo done"#;
+        let bridge = rig.start(rig.settings(script, ""));
+        let first = rig.ask("first");
+        until("the first run", || rig.home("runs").exists().then_some(()));
+        let second = rig.ask("second");
+        rig.bus.cancel_run("sim", &second).unwrap();
+        let reply = rig.reply_item(&second);
+        assert_eq!(reply.msg.result().unwrap().status, RunStatus::Cancelled);
+        assert_eq!(rig.reply_to(&first), "done");
+        bridge.stop().unwrap();
+        assert_eq!(fs::read_to_string(rig.home("runs")).unwrap(), "run\n");
+    }
+
+    #[test]
+    fn another_senders_run_cant_be_cancelled() {
+        let rig = Rig::new();
+        let script = r#"touch "$HOME/started"; sleep 300"#;
+        let bridge = rig.start(rig.settings(script, ""));
+        let id = rig.ask("mine");
+        until("the run", || rig.home("started").exists().then_some(()));
+
+        // The bus won't send it for an agent that never sent the run.
+        let refused = rig.bus.cancel_run("mallory", &id).unwrap_err();
+        assert!(format!("{refused:#}").contains("no run"), "{refused:#}");
+
+        // Nor does the bridge take it from one that forges it.
+        let forged = Draft {
+            ext: Some(Box::new(Extras {
+                cancel: Some(id.clone()),
+                ..Extras::default()
+            })),
+            ..Draft::default()
+        };
+        let sent = rig
+            .bus
+            .send_draft("mallory", "api@here", "stop".into(), forged);
+        let answer = until("the refusal", || {
+            let got = rig.bus.db().open_incoming("mallory").ok()?;
+            got.into_iter().next()
+        });
+        assert_eq!(answer.msg.reply_to, Some(sent.unwrap().id));
+        assert_eq!(answer.msg.result().unwrap().status, RunStatus::Refused);
+        assert!(
+            answer.msg.body.contains("isn't one mallory"),
+            "{}",
+            answer.msg.body
+        );
+        assert_eq!(rig.replies(), 0, "the run should still be going");
+        assert!(rig.open().iter().any(|m| m.msg.id == id));
+
+        rig.bus.cancel_run("sim", &id).unwrap();
+        let reply = rig.reply_item(&id);
+        assert_eq!(reply.msg.result().unwrap().status, RunStatus::Cancelled);
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn cancelling_something_finished_says_so() {
+        let rig = Rig::new();
+        let bridge = rig.start(rig.settings("echo hi", ""));
+        let id = rig.ask("hello");
+        rig.reply_to(&id);
+        rig.wait_acked(&id);
+        let cancel = rig.bus.cancel_run("sim", &id).unwrap();
+        let answer = rig.reply_item(&cancel.id);
+        assert_eq!(answer.msg.result().unwrap().status, RunStatus::Refused);
+        assert!(
+            answer.msg.body.contains("may have finished"),
+            "{}",
+            answer.msg.body
+        );
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn stderr_leaves_with_secrets_and_tokens_out_and_within_its_cap() {
+        let rig = Rig::new();
+        let token = rig.dir.join("token");
+        fs::write(&token, "s3cret-value\n").unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+        let script = r#"echo "configured: $GH_TOKEN" >&2
+            echo "pat ghp_abcdefghijklmnopqrstuvwxyz0123456789" >&2
+            echo "Authorization: Bearer abcdef0123456789" >&2
+            echo "API_KEY=0123456789abcdef" >&2
+            echo "-----BEGIN RSA PRIVATE KEY-----" >&2
+            echo "MIIEpAIBAAKCAQEA7" >&2
+            echo "-----END RSA PRIVATE KEY-----" >&2
+            echo "the plain ending" >&2
+            exit 2"#;
+        let extra = format!(
+            "stderr_tail_bytes = 400\n[secrets]\nGH_TOKEN = \"{}\"",
+            token.display()
+        );
+        let bridge = rig.start(rig.settings(script, &extra));
+        let id = rig.ask("hello");
+        let reply = rig.reply_item(&id);
+        bridge.stop().unwrap();
+        let result = reply.msg.result().unwrap();
+        let tail_text = result.stderr_tail.clone().unwrap();
+        assert!(tail_text.len() <= 400);
+        assert!(tail_text.ends_with("the plain ending"), "{tail_text}");
+        assert!(tail_text.contains("configured: [secret]"), "{tail_text}");
+        let log = rig.state().join("log").join(&id);
+        let kept = fs::read_to_string(log.join("stderr")).unwrap();
+        let meta = fs::read_to_string(log.join("meta.json")).unwrap();
+        let replied = reply.msg.body.clone();
+        for text in [tail_text, kept, meta, replied, rig.log.text()] {
+            for leak in [
+                "s3cret-value",
+                "ghp_abcdef",
+                "abcdef0123456789",
+                "0123456789abcdef",
+                "MIIEpAIBAAKCAQEA7",
+            ] {
+                assert!(!text.contains(leak), "{leak} in {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn scrubbing_takes_tokens_and_leaves_the_rest() {
+        let scrub = |text: &str| {
+            let mut scrubber = Scrubber::default();
+            text.lines()
+                .map(|l| scrubber.line(l))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        for (dirty, clean) in [
+            ("ghs_0123456789abcdefghij0123", "[redacted]"),
+            ("github_pat_0123456789abcdefghij_x", "[redacted]"),
+            ("key sk-ant-0123456789abcdefghij!", "key [redacted]!"),
+            ("xoxb-1234567890-abcdef", "[redacted]"),
+            ("AKIAIOSFODNN7EXAMPLE", "[redacted]"),
+            ("eyJhbGciOi.eyJzdWIiOiIx.abc-def_0", "[redacted]"),
+            ("Bearer abcdefgh12345678", "Bearer [redacted]"),
+            ("password = hunter2hunter2", "password = [redacted]"),
+            (
+                "{\"token\": \"abcd1234efgh\"}",
+                "{\"token\": \"[redacted]\"}",
+            ),
+            ("MY_SECRET=abcd1234efgh next", "MY_SECRET=[redacted] next"),
+            ("", ""),
+        ] {
+            assert_eq!(scrub(dirty), clean, "{dirty}");
+        }
+        // Ordinary text survives, short values and all.
+        for fine in [
+            "exit 1: sk-learn isn't installed",
+            "the token was rejected",
+            "password: short",
+            "task-AKIA",
+            "error: Bearer of bad news",
+            "résumé ghp_ too short",
+        ] {
+            assert_eq!(scrub(fine), fine);
+        }
+        let mut scrubber = Scrubber::default();
+        assert_eq!(
+            scrubber.line("-----BEGIN PRIVATE KEY-----\n"),
+            "[redacted]\n"
+        );
+        assert_eq!(scrubber.line("abc\n"), "");
+        assert_eq!(scrubber.line("-----END PRIVATE KEY-----\n"), "[redacted]\n");
+        assert_eq!(scrubber.line("after\n"), "after\n");
+    }
+
+    #[test]
+    fn a_reply_over_a_message_becomes_an_attachment() {
         let rig = Rig::new();
         let bridge = rig.start(rig.settings("head -c 200000 /dev/zero | tr '\\0' x", ""));
         let id = rig.ask("hello");
-        let reply = rig.reply_to(&id);
-        assert!(reply.len() <= MAX_BODY);
+        let reply = rig.reply_item(&id);
+        bridge.stop().unwrap();
+        assert!(reply.msg.body.len() <= MAX_BODY);
         assert!(
-            reply.ends_with("can't hold any more.]"),
+            reply.msg.body.contains("attached as reply.txt"),
             "{}",
-            tail(&reply, 80)
+            tail(&reply.msg.body, 90)
         );
+        assert!(reply.msg.body.starts_with("xxxx"));
+        let result = reply.msg.result().unwrap();
+        assert_eq!(result.status, RunStatus::Ok);
+        let a = &reply.msg.attachments()[0];
+        assert_eq!(a.name, "reply.txt");
+        assert_eq!(a.size, 200_000);
+        assert_eq!(result.full_reply.as_ref(), Some(&a.sha256));
+        let whole = fs::read(rig.bus.attachments.path(&a.sha256)).unwrap();
+        assert_eq!(whole.len(), 200_000);
+        assert!(whole.iter().all(|b| *b == b'x'));
+        let log = rig.state().join("log").join(&id).join("stdout");
+        assert_eq!(fs::metadata(log).unwrap().len(), 200_000);
+    }
+
+    #[test]
+    fn a_reply_over_the_maximum_is_a_clear_failure() {
+        let rig = Rig::new();
+        let cfg = rig.settings("head -c 200000 /dev/zero | tr '\\0' x", "");
+        let mut bridge = rig.bridge(cfg);
+        let dir = rig.bus.attachments.dir().to_path_buf();
+        bridge.attachments = Attachments::new(dir, 100_000, u64::MAX);
+        let bridge = Arc::new(bridge);
+        let thread = {
+            let bridge = bridge.clone();
+            thread::spawn(move || bridge.serve())
+        };
+        let id = rig.ask("hello");
+        let reply = rig.reply_item(&id);
+        bridge.stop();
+        thread.join().unwrap().unwrap();
+        assert_eq!(reply.msg.result().unwrap().status, RunStatus::Failed);
+        assert!(reply.msg.body.contains("too large"), "{}", reply.msg.body);
+        assert!(
+            reply.msg.body.contains("max_attachment_bytes"),
+            "{}",
+            reply.msg.body
+        );
+        assert!(reply.msg.attachments().is_empty());
+    }
+
+    #[test]
+    fn an_agent_sees_an_attachment_as_a_local_file() {
+        let rig = Rig::new();
+        let script = r#"ls "$3"
+            cat "$3/notes.txt"
+            echo changed > "$3/notes.txt""#;
+        let mut cfg = rig.settings(script, "");
+        cfg.args.push("{ATTACHMENTS_DIR}".into());
+        let bridge = rig.start(cfg);
+        let a = rig
+            .bus
+            .attachments
+            .add("notes.txt", &mut &b"the attached words\n"[..], 19)
+            .unwrap();
+        let sha = a.sha256.clone();
+        let id = rig.ask_with(Some(Box::new(Extras {
+            attachments: vec![a],
+            ..Extras::default()
+        })));
+        let reply = rig.reply_to(&id);
+        bridge.stop().unwrap();
+        assert_eq!(reply, "notes.txt\nthe attached words");
+        // Its copy was its own, so the store still matches its hash.
+        let kept = fs::read(rig.bus.attachments.path(&sha)).unwrap();
+        assert_eq!(kept, b"the attached words\n");
+    }
+
+    #[test]
+    fn the_default_message_points_at_attachments() {
+        let rig = Rig::new();
+        let mut cfg = rig.settings("cat", "");
+        cfg.message = default_message();
+        let bridge = rig.start(cfg);
+        let a = rig
+            .bus
+            .attachments
+            .add("a.txt", &mut &b"words"[..], 5)
+            .unwrap();
+        let id = rig.ask_with(Some(Box::new(Extras {
+            attachments: vec![a],
+            ..Extras::default()
+        })));
+        let reply = rig.reply_to(&id);
+        bridge.stop().unwrap();
+        assert!(reply.contains("name=\"a.txt\""), "{reply}");
+        assert!(reply.contains("/attachments/a.txt\""), "{reply}");
+    }
+
+    #[test]
+    fn each_run_is_logged_under_its_id() {
+        let rig = Rig::new();
+        let script = r#"echo out; echo err >&2"#;
+        let bridge = rig.start(generous(&rig, script));
+        let id = rig.ask_with(with(RunOptions {
+            timeout: Some(7),
+            ..RunOptions::default()
+        }));
+        rig.reply_to(&id);
+        rig.wait_acked(&id);
+        bridge.stop().unwrap();
+        let dir = rig.state().join("log").join(&id);
+        assert_eq!(fs::read_to_string(dir.join("stdout")).unwrap(), "out\n");
+        assert_eq!(fs::read_to_string(dir.join("stderr")).unwrap(), "err\n");
+        let log: RunLog = read_json(&dir.join("meta.json")).unwrap();
+        assert_eq!(log.sender, "sim@here");
+        assert_eq!(log.options.unwrap().timeout, Some(7));
+        assert_eq!(log.result.status, RunStatus::Ok);
+        assert_eq!(log.result.applied.unwrap().timeout, 7);
+    }
+
+    #[test]
+    fn old_run_logs_go_after_their_retention() {
+        let rig = Rig::new();
+        let bridge = rig.start(rig.settings("echo out", "log_retention_days = 0"));
+        let id = rig.ask("hello");
+        rig.reply_to(&id);
+        rig.wait_acked(&id);
+        bridge.stop().unwrap();
+        let dir = rig.state().join("log").join(&id);
+        assert!(dir.exists());
+        let bridge = rig.start(rig.settings("echo out", "log_retention_days = 0"));
+        until("the log to go", || (!dir.exists()).then_some(()));
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_reply_saved_by_the_last_version_still_goes_out() {
+        let rig = Rig::new();
+        let id = rig.left_pending("done already");
+        let inflight = rig.state().join("inflight");
+        fs::create_dir_all(&inflight).unwrap();
+        fs::write(inflight.join(format!("{id}.reply")), "plain saved text").unwrap();
+        rig.journal(&id, &Journal::default());
+        let bridge = rig.start(rig.settings("echo hi", ""));
+        assert_eq!(rig.reply_to(&id), "plain saved text");
         bridge.stop().unwrap();
     }
 
@@ -2278,7 +3948,7 @@ mod tests {
         bridge.set_hold(Hold::Held);
         let worker = {
             let bridge = bridge.clone();
-            thread::spawn(move || bridge.worker(0))
+            thread::spawn(move || bridge.receiver())
         };
         until("the failure", || {
             rig.log.text().contains("receive failed").then_some(())
@@ -2306,6 +3976,7 @@ mod tests {
             created_at: now_ms(),
             pipe: None,
             attended: false,
+            ext: None,
         };
         rig.bus.db().store_incoming(&msg, "o", now_ms()).unwrap();
         let mut bridge = rig.bridge(rig.settings("echo hi", ""));
@@ -2368,9 +4039,10 @@ mod tests {
         assert_eq!(tail("héllo wörld", 5), "wörld");
         assert_eq!(tail("short", 300), "short");
         let text = "é".repeat(MAX_BODY);
-        let cut = fit(text);
-        assert!(cut.len() <= MAX_BODY);
-        assert_eq!(fit("short".into()), "short");
+        let cut = fit(&text, " [cut]");
+        assert!(cut.len() <= MAX_BODY - ROOM_FOR_A_NOTE);
+        assert!(cut.ends_with(" [cut]"));
+        assert_eq!(fit("short", " [cut]"), "short");
     }
 
     #[test]

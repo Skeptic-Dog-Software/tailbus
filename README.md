@@ -246,6 +246,10 @@ path = "/Users/you/.local/bin:/usr/bin:/bin"
 | `max_concurrent` | The most runs at once. Default 1. |
 | `timeout_secs` | How long a run can take. Default 600. |
 | `shutdown_grace_secs` | How long a stop gives runs already going. Default 10. |
+| `model` | What `{MODEL}` means when a request doesn't name one. |
+| `stderr_tail_bytes` | The most stderr a result carries. Default 4096. |
+| `log_retention_days` | Days to keep each run's log. Default 14. |
+| `options` | What a request may ask for, as a table. Left out, it may ask for nothing. See [Per-request options](#per-request-options). |
 | `env` | More environment variables, as a table. |
 | `secrets` | Environment variables read from files, as a table, such as `GH_TOKEN = "/path/to/token"`. Each file must be yours, readable only by you (`chmod 600`). They're read for each run, so a new token needs no restart. |
 
@@ -254,6 +258,9 @@ path = "/Users/you/.local/bin:/usr/bin:/bin"
 | `{AGENT}`, `{ID}`, `{SENDER}` | `args`, `message` | The bus agent, the message's ID, and who sent it. |
 | `{SESSION_DIR}` | `args`, `message` | The run's session directory. Pass this to the agent: it's what keeps sessions apart. |
 | `{RUN_DIR}`, `{MESSAGE_FILE}` | `args`, `message` | A directory for this run alone, and the path of the file holding the message. |
+| `{ATTACHMENTS_DIR}` | `args`, `message` | Where the run's copies of the request's attachments are. |
+| `{MODEL}` | `args` | The request's model, or `model`. |
+| `{TOOLS}` | `options.tools_args` | The tools a request named, joined with commas. |
 | `{FILE:/path}` | `args`, `message` | A file's text, with only `{AGENT}` filled in. For a system prompt. |
 | `{MESSAGE}`, `{BODY}` | `message` | The message tagged with its sender and owner, and its bare text. |
 
@@ -263,6 +270,7 @@ path = "/Users/you/.local/bin:/usr/bin:/bin"
 | `tailbus bridge install <agent>` | Start it now and at every login (macOS, launchd), replacing a running one. |
 | `tailbus bridge uninstall <agent>` | Stop it and stop starting it at login. |
 | `tailbus bridge status [agent]` | Show whether it's up, what's running, and its last failure. |
+| `tailbus bridge log <agent> <run id>` | Show what's kept of a run. `--stdout` and `--stderr` print its output. |
 
 Its log is `~/.local/state/tailbus/bridge/<agent>/bridge.log`. Run `bridge
 status` after changing a table: it says if the settings have a problem. A
@@ -283,17 +291,18 @@ bridge's, including `SSH_AUTH_SOCK`.
 **Failures.** A non-zero exit, empty output, a timeout, or anything else that
 stops a run goes back to the sender as a reply saying why. A timeout kills
 the whole process tree, including anything that left its process group with
-`setsid`, as long as it still has a parent in the tree. Output over 64 KiB is
-cut, with a note saying so. Secrets' values are taken out of the log and of
-everything sent back, wherever they turn up.
+`setsid`, as long as it still has a parent in the tree. Secrets' values are
+taken out of the log and of everything sent back, wherever they turn up.
+Stderr also loses anything that looks like a credential: common token formats,
+`Bearer` values, private keys, and values of words like `token=`. That's a net
+for what the bridge wasn't told about, and it can't catch everything.
 
 **Sessions.** A fresh session gets a new session directory and `TMPDIR`, and
 both are deleted after the run. Runs still share `home` and
 `working_directory`, so **a file a run leaves in either can reach later runs**.
 A sender's `per-sender` runs go one at a time, whatever `max_concurrent`
-says, because omp forks a conversation that two runs continue at once. While
-one sender's messages wait for their turn, they hold a place in
-`max_concurrent`.
+says, because omp forks a conversation that two runs continue at once. Other
+senders' runs go ahead of them meanwhile.
 
 **A stop or a crash.** A message stays pending until its reply is stored,
 which acknowledges it. So nothing a bridge took is lost, and it runs again
@@ -308,6 +317,112 @@ as posting a comment.
   if the process is still the same one.
 - An answer finished but not yet sent is kept, and sent without running again.
 - A message whose runs the bridge died in three times gets a failure reply.
+
+### Per-request options
+
+A request can ask for less than the agent's config gives it. Options can only
+narrow what config allows, and a request can't change config. Anything else
+gets a reply with status `refused`, and nothing runs: there's never a quiet
+fall back to the default. Every value must match config exactly, and goes to
+the agent as its own argument, with no shell involved. A request with no
+options runs just as the table says, and the owner check comes before any
+option is read.
+
+```toml
+[bridges.omp]
+model = "some/default-model"
+args = ["-p", "--model", "{MODEL}", "--session-dir", "{SESSION_DIR}"]
+
+[bridges.omp.options]
+tools = ["read", "grep", "mcp__jira_query"]
+tools_args = ["--tools", "{TOOLS}"]
+tools_env = "TAILBUS_ALLOWED_TOOLS"
+sessions = ["per-sender"]
+max_timeout_secs = 1800
+workdirs = ["/Users/you/agent-home/review"]
+models = ["some/other-model"]
+```
+
+| Option | Allowed by | Means |
+| --- | --- | --- |
+| `tools` | `options.tools`, with `tools_args` or `tools_env` | A subset of those tools. `tools_args` go on the command line, and the variable named by `tools_env` gets the same list, for an agent that has to enforce it itself. |
+| `session` | `options.sessions`, and the agent's own `session` | `fresh` or `per-sender`. |
+| `timeout` | `options.max_timeout_secs`, or else `timeout_secs` | Seconds. |
+| `workdir` | `options.workdirs`, and `working_directory` | A directory to run in. |
+| `model` | `options.models`, and `model` | Needs `{MODEL}` in `args`. |
+
+Be careful what `tools` promises. A flag such as omp's `--tools` doesn't limit
+MCP tools, so naming connectors in `options.tools` means the agent has to
+enforce the list too. For omp that's a few lines in an extension that reads
+`tools_env`. Only list what's really enforced.
+
+Every reply from a bridge carries its result beside the text: `status` (`ok`,
+`failed`, `timeout`, `refused` or `cancelled`), `exit_code`, `duration_ms`,
+`run_id`, what `applied`, and on a failure `stderr_tail`. A run's ID is its
+request's message ID, so a sender knows it from the start. Each run's full
+stdout and stderr, its options and its result are kept in
+`~/.local/state/tailbus/bridge/<agent>/log/<run id>/`, with secrets out.
+
+### Calling an agent from a script
+
+`tailbus call` sends a request, waits for its own reply, prints it to stdout,
+prints any stderr tail to stderr, and exits by status. Scripts can run as many
+as they like at once: each gets the reply to its own request.
+
+```sh
+tailbus call omp@server "Review this" --attach change.diff \
+  --tools read,grep --model some/other-model --run-timeout 900 --timeout 1000
+```
+
+| Exit | Means |
+| --- | --- |
+| 0 | `ok` |
+| 1 | `failed` |
+| 77 | `refused`, or the agent marked it handled without answering, as a bridge does for anyone but its `owner` |
+| 124 | `timeout`: the run took too long |
+| 125 | This call's own `--timeout` passed |
+| 130 | `cancelled` |
+| 131 | Interrupted with `--no-cancel`, so the run goes on |
+| 69 | It never reached the agent |
+| 66 | A local problem, such as a file too large to attach |
+
+Interrupting a call cancels its run, as does its own `--timeout`, unless you
+pass `--no-cancel`. A second interrupt ends the call at once. `--json` prints
+the reply and its details, and `--verbose` prints the run's ID and what it
+used to stderr.
+
+`tailbus cancel <run id>` cancels a run of yours. It kills the whole process
+tree, and the run's reply comes back with status `cancelled`. A queued run
+never starts. You can't cancel another sender's run: the bus won't send that,
+and the bridge checks too. A sender here is an agent name on a machine, which
+any process of that machine's user can claim with `--as`.
+
+An agent session gets the same from its tools: `msg_send` takes `options` and
+`attachments`, `msg_cancel` takes a run ID, and the result shows in the reply's
+tag.
+
+### Attachments
+
+A message stays at 64 KiB, and nothing's cut without saying so. A file of any
+size up to `max_attachment_bytes` (default 1 GiB) can go with a message. It's
+held by its SHA-256 hash, and reaches the other machine's bus before the
+message that names it, where it's checked against that hash. An agent sees a
+local file: a session gets its path in the message, and a bridge copies it
+into the run, at `{ATTACHMENTS_DIR}`.
+
+- `tailbus call` attaches a message over 64 KiB by itself.
+- A reply over 64 KiB becomes an attachment by itself, with as much as fits in
+  the text. `tailbus call` prints the whole of it.
+- Over the maximum, here or on the receiving bus, the sender gets an error
+  saying so. A reply that's too large fails with status `failed`.
+- A bus too old for attachments or options refuses the message, which fails
+  with an error rather than running without them. A large reply to one
+  arrives cut, with a note, as it always did.
+
+`attachment_store_bytes` (default 16 GiB) caps the store, and
+`attachment_retention_days` (default 7) clears what no open message needs.
+
+### Not a sandbox
 
 **This isn't a sandbox.** The agent keeps a shell, and can read anything your
 user can. `home` keeps it from loading what's in your own home directory by
