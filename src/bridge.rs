@@ -339,8 +339,12 @@ impl Settings {
         self.options.check(wants_model, self.timeout_secs)?;
         if let Some(usage) = &self.usage {
             usage.check()?;
-            if !on_command_line.clone().any(|a| a.contains("{SESSION_DIR}")) {
-                bail!("usage is read from the session directory, so args need {{SESSION_DIR}}");
+            let told = on_command_line.clone().any(|a| a.contains("{SESSION_DIR}"))
+                || self.env.values().any(|v| v.contains("{SESSION_DIR}"));
+            if !told {
+                bail!(
+                    "usage is read from the session directory, so args or env need {{SESSION_DIR}}"
+                );
             }
         }
         for (name, path) in &self.secrets {
@@ -2853,6 +2857,10 @@ mod tests {
         cfg.args = vec!["{RUN_DIR}".into()];
         let err = format!("{:#}", cfg.check().unwrap_err());
         assert!(err.contains("SESSION_DIR"), "{err}");
+        // Telling it by the environment is as good.
+        cfg.env
+            .insert("CLAUDE_CONFIG_DIR".into(), "{SESSION_DIR}".into());
+        cfg.check().unwrap();
     }
 
     #[test]
