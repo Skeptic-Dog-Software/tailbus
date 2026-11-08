@@ -263,7 +263,7 @@ pub fn load(paths: &Paths, agent: &str) -> Result<Settings> {
 }
 
 impl Settings {
-    fn check(&self) -> Result<()> {
+    pub fn check(&self) -> Result<()> {
         if self.owner.trim().is_empty() {
             bail!("owner is empty");
         }
@@ -454,8 +454,29 @@ impl Settings {
             plan.timeout = timeout;
         }
         if let Some(dir) = &options.workdir {
-            let dir = PathBuf::from(dir);
-            if dir != self.working_directory && !self.options.workdirs.contains(&dir) {
+            // Given as its real path, so no `..` or link can come at an
+            // allowed one by another way.
+            let given = PathBuf::from(dir);
+            let dir = given
+                .canonicalize()
+                .map_err(|_| format!("working directory {dir} isn't there"))?;
+            if dir != given {
+                return Err(format!(
+                    "working directory {} isn't one this agent's config allows: give its real \
+                     path, {}",
+                    given.display(),
+                    dir.display()
+                ));
+            }
+            // An allowed directory, or one inside it, such as a worktree.
+            let real = |p: &PathBuf| p.canonicalize().unwrap_or_else(|_| p.clone());
+            let allowed = dir == real(&self.working_directory)
+                || self
+                    .options
+                    .workdirs
+                    .iter()
+                    .any(|w| dir.starts_with(real(w)));
+            if !allowed {
                 return Err(format!(
                     "working directory {} isn't one this agent's config allows",
                     dir.display()
@@ -3173,6 +3194,25 @@ mod tests {
         cfg.options.workdirs.push(rig.dir.join("home"));
         cfg.check().unwrap();
         cfg
+    }
+
+    #[test]
+    fn a_workdir_can_be_inside_an_allowed_one_but_never_step_out() {
+        let rig = Rig::new();
+        let cfg = generous(&rig, "echo hi");
+        let inside = rig.dir.join("home/worktrees/pr-1");
+        fs::create_dir_all(&inside).unwrap();
+        let at = |dir: &Path| {
+            cfg.plan(Some(&RunOptions {
+                workdir: Some(dir.display().to_string()),
+                ..RunOptions::default()
+            }))
+        };
+        assert_eq!(at(&inside).unwrap().workdir, inside);
+        assert!(at(&rig.dir.join("home/../home/worktrees")).is_err());
+        let err = at(&rig.dir.join("home/..")).unwrap_err();
+        assert!(err.contains("isn't one"), "{err}");
+        assert!(at(&rig.dir.join("home/missing")).is_err());
     }
 
     fn with(options: RunOptions) -> Option<Box<Extras>> {

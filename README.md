@@ -24,9 +24,36 @@ On every machine that should be on the bus:
 
 ```sh
 cargo install --locked --git https://github.com/Skeptic-Dog-Software/tailbus --root ~/.local
-tailbus service install     # run the bus now and at every login (macOS, launchd)
-tailbus setup claude        # add the Claude Code plugin
+tailbus setup all --repo ~/Work/my-repo   # all of the below at once
 ```
+
+or a step at a time:
+
+```sh
+tailbus service install     # run the bus now and at every login: launchd, or systemd --user
+tailbus setup claude        # add the Claude Code plugin
+tailbus setup acr           # ACR on this machine: headless Claude Code as its agent
+tailbus acr add-repo ~/Work/my-repo   # let ACR review a repository here
+```
+
+`tailbus setup acr` sets up everything ACR needs on this machine, and leaves
+alone whatever's there already, so running it again is safe:
+
+- **A token** for headless Claude Code on your subscription. If there's none,
+  it runs `claude setup-token` and asks you to paste what it prints, without
+  showing it, into `~/.config/tailbus/claude-token`, readable only by you.
+- **The `claude-acr` bridge** in `config.toml`, which runs Claude Code in the
+  repository under review with only the tools a role is given, a fresh
+  config for each call, and its usage read from its transcript.
+- **ACR's bindings** in `acr.yaml`, if you have none: Haiku for the Sizer,
+  Sonnet for reviewers, Opus for the Orchestrator and Judge, all on this
+  machine and counted in tokens.
+- **The bridge's service**, started now and at every login.
+
+`tailbus acr add-repo` and `remove-repo` change which repositories ACR may
+review here, and restart the bridge. On Linux, services are systemd user
+units, which stop when you log out unless you `sudo loginctl enable-linger
+$USER`.
 
 `tailbus status` shows whether the bus is up and listening on the tailnet.
 Restart open Claude Code sessions to load the plugin, and again after

@@ -90,6 +90,13 @@ pub enum AcrCmd {
     },
     /// Print the published schema.
     Schema,
+    /// Allow ACR to review a repository on this machine.
+    AddRepo {
+        /// The repository's top folder.
+        path: PathBuf,
+    },
+    /// Stop allowing ACR to review a repository on this machine.
+    RemoveRepo { path: PathBuf },
     /// Show the tier, lenses, bindings and cost, with no model calls.
     Plan {
         #[command(flatten)]
@@ -611,10 +618,17 @@ fn describe_plan(plan: &plan::Plan) {
     }
 }
 
+/// Checks the text of a user's ACR config, as `tailbus setup acr` writes it.
+pub fn check_user_config(text: &str) -> Result<()> {
+    config::parse_user(text).map(|_| ())
+}
+
 pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<ExitCode> {
     keep::prune(paths);
     match command {
         AcrCmd::Schema => print!("{SCHEMA}"),
+        AcrCmd::AddRepo { path } => crate::setup::acr_repo(paths, &path, true)?,
+        AcrCmd::RemoveRepo { path } => crate::setup::acr_repo(paths, &path, false)?,
         AcrCmd::Validate { file, repo, base } => {
             let user = config::load_user(&user_config_path(paths))?;
             let (text, source) = repo_layer(paths, &repo, base.as_deref(), file.as_deref())?;

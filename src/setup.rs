@@ -1,5 +1,6 @@
-//! `tailbus setup claude` and `tailbus service`: wiring tailbus into Claude
-//! Code, and running the daemon and bridges under launchd.
+//! `tailbus setup` and `tailbus service`: wiring tailbus into Claude Code,
+//! setting up ACR's agent, and running the daemon and bridges as services:
+//! launchd agents on macOS, systemd user units on Linux.
 
 use std::env;
 use std::fs;
@@ -244,13 +245,135 @@ fn launchctl(args: &[&str]) -> Result<std::process::Output> {
         .output()?)
 }
 
-fn require_launchd(what: &str, instead: &str) -> Result<()> {
-    if !cfg!(target_os = "macos") {
+/// Which service manager runs tailbus here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Manager {
+    Launchd,
+    Systemd,
+}
+
+fn manager(what: &str, instead: &str) -> Result<Manager> {
+    if cfg!(target_os = "macos") {
+        return Ok(Manager::Launchd);
+    }
+    let systemd = Command::new("systemctl")
+        .args(["--user", "--version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if systemd {
+        return Ok(Manager::Systemd);
+    }
+    bail!(
+        "`{what}` needs launchd or a systemd user session; elsewhere, run `{instead}` under your service manager"
+    )
+}
+
+fn systemctl(args: &[&str]) -> Result<()> {
+    let out = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("running systemctl")?;
+    if !out.status.success() {
         bail!(
-            "`{what}` uses launchd, so it's macOS only for now; elsewhere, run `{instead}` under your service manager"
+            "systemctl --user {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(())
+}
+
+/// A systemd user unit that runs this binary and restarts it if it stops.
+struct UserUnit<'a> {
+    name: &'a str,
+    description: &'a str,
+    args: &'a [&'a str],
+    /// A unit it needs running first.
+    after: Option<&'a str>,
+}
+
+fn unit_path(name: &str) -> Result<PathBuf> {
+    let config = env::var_os("XDG_CONFIG_HOME")
+        .filter(|d| !d.is_empty())
+        .map_or_else(
+            || home().map(|h| h.join(".config")),
+            |d| Ok(PathBuf::from(d)),
+        )?;
+    Ok(config.join("systemd/user").join(format!("{name}.service")))
+}
+
+impl UserUnit<'_> {
+    fn text(&self, exe: &Path) -> String {
+        let after = match self.after {
+            Some(unit) => format!("After={unit}.service\nRequires={unit}.service\n"),
+            None => "After=network-online.target\n".to_string(),
+        };
+        let quoted = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        let command: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
+            .chain(self.args.iter().map(|a| a.to_string()))
+            .map(|a| quoted(&a))
+            .collect();
+        let tailbus_home = env::var_os("TAILBUS_HOME")
+            .map(|h| {
+                format!(
+                    "Environment={}\n",
+                    quoted(&format!("TAILBUS_HOME={}", h.to_string_lossy()))
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "[Unit]\nDescription={}\n{after}\n[Service]\nExecStart={}\n{tailbus_home}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+            self.description,
+            command.join(" ")
+        )
+    }
+
+    /// Writes the unit and starts it, replacing a running one.
+    fn start(&self) -> Result<String> {
+        write(&unit_path(self.name)?, &self.text(&this_exe()?))?;
+        let unit = format!("{}.service", self.name);
+        systemctl(&["daemon-reload"])?;
+        systemctl(&["enable", &unit])?;
+        systemctl(&["restart", &unit])?;
+        Ok(format!("systemd --user {unit}"))
+    }
+}
+
+/// Stops a systemd user unit and removes it. Returns its path.
+fn stop_unit(name: &str) -> Result<PathBuf> {
+    let _ = systemctl(&["disable", "--now", &format!("{name}.service")]);
+    let path = unit_path(name)?;
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    let _ = systemctl(&["daemon-reload"]);
+    Ok(path)
+}
+
+/// Without linger, a user's services stop when they log out.
+fn linger_hint() {
+    let user = env::var("USER").unwrap_or_default();
+    let shown = Command::new("loginctl")
+        .args(["show-user", &user, "-p", "Linger"])
+        .stdin(Stdio::null())
+        .output();
+    if shown.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "Linger=no") {
+        println!(
+            "It runs while you're logged in. To keep it running after you log out: \
+             sudo loginctl enable-linger {user}"
+        );
+    }
+}
+
+const DAEMON_UNIT: &str = "tailbus";
+
+fn bridge_unit(agent: &str) -> String {
+    format!("tailbus-bridge-{agent}")
 }
 
 /// A launchd agent that runs this binary at login and restarts it if it
@@ -363,19 +486,35 @@ fn stop_launch_agent(label: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Runs the daemon as a launchd agent that starts at login and restarts if
-/// it stops. Running it again replaces the running daemon, for upgrades.
+/// Runs the daemon as a service that starts at login and restarts if it
+/// stops. Running it again replaces the running daemon, for upgrades.
 pub fn service_install(paths: &Paths) -> Result<()> {
-    require_launchd("tailbus service", "tailbus daemon")?;
+    let manager = manager("tailbus service", "tailbus daemon")?;
     paths.make_state_dir()?;
-    let domain = LaunchAgent {
-        label: LABEL,
-        args: &["daemon"],
-        log: &paths.log(),
-        throttle: 10,
-        exit_timeout: None,
-    }
-    .start()?;
+    let job = match manager {
+        Manager::Launchd => {
+            let domain = LaunchAgent {
+                label: LABEL,
+                args: &["daemon"],
+                log: &paths.log(),
+                throttle: 10,
+                exit_timeout: None,
+            }
+            .start()?;
+            format!("launchd {domain}/{LABEL}")
+        }
+        Manager::Systemd => UserUnit {
+            name: DAEMON_UNIT,
+            description: "tailbus: direct messages between AI agents on your tailnet",
+            args: &["daemon"],
+            after: None,
+        }
+        .start()?,
+    };
+    let log = match manager {
+        Manager::Launchd => paths.log().display().to_string(),
+        Manager::Systemd => format!("journalctl --user -u {DAEMON_UNIT}"),
+    };
     let socket = paths.socket();
     let until = Instant::now() + Duration::from_secs(10);
     loop {
@@ -386,18 +525,15 @@ pub fn service_install(paths: &Paths) -> Result<()> {
                 } else {
                     format!("on {}, owned by {}", hello.machine, hello.owner)
                 };
-                println!(
-                    "tailbus {} is running {on} (launchd {domain}/{LABEL}).",
-                    hello.version
-                );
-                println!("Log: {}", paths.log().display());
+                println!("tailbus {} is running {on} ({job}).", hello.version);
+                println!("Log: {log}");
+                if manager == Manager::Systemd {
+                    linger_hint();
+                }
                 return Ok(());
             }
             Err(e) if Instant::now() >= until => {
-                bail!(
-                    "launchd started the daemon, but it isn't answering ({e:#}). See {}",
-                    paths.log().display()
-                );
+                bail!("{job} started the daemon, but it isn't answering ({e:#}). See {log}");
             }
             Err(_) => thread::sleep(Duration::from_millis(250)),
         }
@@ -405,7 +541,10 @@ pub fn service_install(paths: &Paths) -> Result<()> {
 }
 
 pub fn service_uninstall() -> Result<()> {
-    let path = stop_launch_agent(LABEL)?;
+    let path = match manager("tailbus service", "tailbus daemon")? {
+        Manager::Launchd => stop_launch_agent(LABEL)?,
+        Manager::Systemd => stop_unit(DAEMON_UNIT)?,
+    };
     println!("Stopped the tailbus daemon and removed {}.", path.display());
     Ok(())
 }
@@ -414,60 +553,513 @@ fn bridge_label(agent: &str) -> String {
     format!("{LABEL}.bridge.{agent}")
 }
 
-/// Runs a bridge as a launchd agent, the way `service_install` runs the
-/// daemon. Running it again replaces the running bridge.
+/// Runs a bridge as a service, the way `service_install` runs the daemon.
+/// Running it again replaces the running bridge.
 pub fn bridge_install(paths: &Paths, agent: &str) -> Result<()> {
-    require_launchd("tailbus bridge install", "tailbus bridge run")?;
+    let manager = manager("tailbus bridge install", "tailbus bridge run")?;
     paths.make_state_dir()?;
     let settings = bridge::load(paths, agent)?;
     let dir = bridge::state_dir(paths, agent);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join("bridge.log");
-    let label = bridge_label(agent);
     let since = crate::util::now_ms();
-    let domain = LaunchAgent {
-        label: &label,
-        args: &["bridge", "run", agent],
-        log: &log,
-        throttle: 30,
-        // Long enough for its runs' grace period and to stop what's left.
-        exit_timeout: Some(settings.shutdown_grace_secs + 10),
-    }
-    .start()?;
+    let (job, shown) = match manager {
+        Manager::Launchd => {
+            let label = bridge_label(agent);
+            let domain = LaunchAgent {
+                label: &label,
+                args: &["bridge", "run", agent],
+                log: &log,
+                throttle: 30,
+                // Long enough for its runs' grace period and to stop what's left.
+                exit_timeout: Some(settings.shutdown_grace_secs + 10),
+            }
+            .start()?;
+            (
+                format!("launchd {domain}/{label}"),
+                log.display().to_string(),
+            )
+        }
+        Manager::Systemd => {
+            let name = bridge_unit(agent);
+            let description = format!("tailbus bridge: {agent}");
+            let job = UserUnit {
+                name: &name,
+                description: &description,
+                args: &["bridge", "run", agent],
+                after: Some(DAEMON_UNIT),
+            }
+            .start()?;
+            (job, format!("journalctl --user -u {name}"))
+        }
+    };
     let until = Instant::now() + Duration::from_secs(10);
     while Instant::now() < until {
         if bridge::started_since(paths, agent, since) {
-            println!("The {agent} bridge is running (launchd {domain}/{label}).");
-            println!("Log: {}", log.display());
+            println!("The {agent} bridge is running ({job}).");
+            println!("Log: {shown}");
+            if manager == Manager::Systemd {
+                linger_hint();
+            }
             return Ok(());
         }
         thread::sleep(Duration::from_millis(250));
     }
     bail!(
-        "launchd started the {agent} bridge, but it isn't up. Is the tailbus daemon running? See {}",
-        log.display()
+        "{job} started the {agent} bridge, but it isn't up. Is the tailbus daemon running? See {shown}"
     )
 }
 
 pub fn bridge_uninstall(agent: &str) -> Result<()> {
-    let path = stop_launch_agent(&bridge_label(agent))?;
+    let path = match manager("tailbus bridge uninstall", "tailbus bridge run")? {
+        Manager::Launchd => stop_launch_agent(&bridge_label(agent))?,
+        Manager::Systemd => stop_unit(&bridge_unit(agent))?,
+    };
     println!("Stopped the {agent} bridge and removed {}.", path.display());
     Ok(())
 }
 
-/// The launchd domain a bridge's job is loaded in, if it is.
+/// Where a bridge's service is running, if it is.
 pub fn bridge_job(agent: &str) -> Option<String> {
-    let label = bridge_label(agent);
-    domains().into_iter().find_map(|domain| {
-        let job = format!("{domain}/{label}");
-        let out = launchctl(&["print", &job]).ok()?;
-        out.status.success().then_some(job)
-    })
+    if cfg!(target_os = "macos") {
+        let label = bridge_label(agent);
+        return domains().into_iter().find_map(|domain| {
+            let job = format!("{domain}/{label}");
+            let out = launchctl(&["print", &job]).ok()?;
+            out.status.success().then_some(job)
+        });
+    }
+    let unit = format!("{}.service", bridge_unit(agent));
+    systemctl(&["is-active", "--quiet", &unit])
+        .ok()
+        .map(|()| format!("systemd --user {unit}"))
+}
+
+// ACR's agent on this machine.
+
+/// The bridge `tailbus setup acr` sets up: headless Claude Code, which ACR
+/// runs every role through, on this machine.
+pub const ACR_AGENT: &str = "claude-acr";
+
+/// The bridge's table in config.toml.
+fn acr_bridge(owner: &str, claude: &Path, home: &Path, token: &Path, path: &str) -> String {
+    let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let p = |p: &Path| q(&p.to_string_lossy());
+    format!(
+        r#"
+# ACR on this machine, set up by `tailbus setup acr`: headless Claude Code,
+# on your own subscription, running in the repository under review. Allow a
+# repository with `tailbus acr add-repo <path>`.
+[bridges.{ACR_AGENT}]
+owner = {owner}
+command = {claude}
+args = ["-p", "--model", "{{MODEL}}", "--strict-mcp-config", "--output-format", "text",
+  "--add-dir", "{{ATTACHMENTS_DIR}}", "--add-dir", "{{RUN_DIR}}/tmp"]
+model = "claude-sonnet-5-5"
+working_directory = {home}
+home = {home}
+path = {path}
+timeout_secs = 900
+max_concurrent = 3
+
+[bridges.{ACR_AGENT}.env]
+# A fresh config for each run: none of your settings, plugins or MCP
+# servers, and its transcript where usage is read.
+CLAUDE_CONFIG_DIR = "{{SESSION_DIR}}"
+
+[bridges.{ACR_AGENT}.secrets]
+CLAUDE_CODE_OAUTH_TOKEN = {token}
+
+[bridges.{ACR_AGENT}.options]
+tools = ["Read", "Grep", "Glob", "Bash", "Write"]
+tools_args = ["--tools", "{{TOOLS}}", "--allowedTools", "{{TOOLS}}"]
+models = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
+efforts = ["low", "medium", "high"]
+effort_args = ["--effort", "{{EFFORT}}"]
+workdirs = []
+
+[bridges.{ACR_AGENT}.usage]
+files = "**/*.jsonl"
+when = {{ type = "assistant" }}
+dedupe = "message.id"
+input = "message.usage.input_tokens"
+output = "message.usage.output_tokens"
+cache_read = "message.usage.cache_read_input_tokens"
+cache_write = "message.usage.cache_creation_input_tokens"
+model = "message.model"
+"#,
+        owner = q(owner),
+        claude = p(claude),
+        home = p(home),
+        token = p(token),
+        path = q(path),
+    )
+}
+
+/// The ACR config `tailbus setup acr` writes, if there's none: Anthropic
+/// models sized to each role, all on this machine's agent.
+fn acr_bindings(machine: &str) -> String {
+    let agent = format!("{ACR_AGENT}@{machine}");
+    format!(
+        r#"# ACR's bindings, set up by `tailbus setup acr`: Anthropic models through
+# {agent}, headless Claude Code on your subscription, so they count in
+# tokens. ACR runs on one machine: every role works in the repository, and
+# reviewers read it in place, read-only.
+version: 1
+allowed_bindings:
+  haiku-low:       # the Sizer: one quick call to pick the tier
+    agent: {agent}
+    model: claude-haiku-5-5
+    effort: low
+    tools: [Read, Grep, Glob]
+    timeout: 600
+    subscription: true
+  sonnet-high:     # reviewers: most of the calls, and they attack
+    agent: {agent}
+    model: claude-sonnet-5-5
+    effort: high
+    tools: [Read, Grep, Glob]
+    timeout: 900
+    subscription: true
+  opus-medium:     # the Orchestrator: few calls; without writes, fixes escalate
+    agent: {agent}
+    model: claude-opus-5-5
+    effort: medium
+    tools: [Read, Grep, Glob]
+    timeout: 900
+    subscription: true
+  opus-judge:      # the Judge: checks claims, and may run scripts in its scratch space
+    agent: {agent}
+    model: claude-opus-5-5
+    effort: medium
+    tools: [Read, Grep, Glob, Bash, Write]
+    timeout: 900
+    subscription: true
+defaults:
+  bindings:
+    sizer: haiku-low
+    reviewer: sonnet-high
+    orchestrator: opus-medium
+    judge: opus-judge
+"#
+    )
+}
+
+/// Reads a line without showing it, for a secret pasted at a terminal.
+fn read_hidden(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, Write};
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    // SAFETY: reads and restores the terminal settings of this process's
+    // own stdin.
+    let saved = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        (libc::tcgetattr(0, &mut t) == 0).then_some(t)
+    };
+    if let Some(t) = saved {
+        let mut quiet = t;
+        quiet.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &quiet) };
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    if let Some(t) = saved {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
+    }
+    println!();
+    read?;
+    Ok(line.trim().to_string())
+}
+
+/// Makes the long-lived token headless Claude Code signs in with, by
+/// `claude setup-token` and the user pasting what it prints.
+fn make_token(claude: &Path, token: &Path) -> Result<()> {
+    // SAFETY: asks whether this process's stdin is a terminal.
+    if unsafe { libc::isatty(0) } != 1 {
+        bail!(
+            "ACR's agent needs a token, which takes a terminal: run `{} setup-token`, and save \
+             what it prints in {} (chmod 600)",
+            claude.display(),
+            token.display()
+        );
+    }
+    println!(
+        "ACR's reviewers run as headless Claude Code, which signs in with a long-lived token \
+         for your subscription. Making one now:"
+    );
+    let made = Command::new(claude)
+        .arg("setup-token")
+        .status()
+        .context("running claude setup-token")?;
+    if !made.success() {
+        bail!("`claude setup-token` didn't finish");
+    }
+    let text = read_hidden("Paste the token it printed (it won't show): ")?;
+    if text.is_empty() || text.contains(char::is_whitespace) {
+        bail!("that doesn't look like a token; run `tailbus setup acr` again");
+    }
+    if let Some(dir) = token.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(token)
+        .with_context(|| format!("writing {}", token.display()))?;
+    file.write_all(text.as_bytes())?;
+    println!("Saved it in {}, readable only by you.", token.display());
+    Ok(())
+}
+
+fn read_config(paths: &Paths) -> Result<toml_edit::DocumentMut> {
+    let text = match fs::read_to_string(&paths.config) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", paths.config.display())),
+    };
+    text.parse()
+        .with_context(|| format!("in {}", paths.config.display()))
+}
+
+fn write_config(paths: &Paths, doc: &toml_edit::DocumentMut) -> Result<()> {
+    // Checked before it's written, so a mistake never lands.
+    let text = doc.to_string();
+    toml::from_str::<crate::config::Config>(&text).context("the config it would write")?;
+    write(&paths.config, &text)
+}
+
+/// Repositories ACR may review here: the bridge's workdirs.
+fn acr_workdirs(doc: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Array> {
+    doc.get_mut("bridges")
+        .and_then(|b| b.get_mut(ACR_AGENT))
+        .and_then(|a| a.get_mut("options"))
+        .and_then(|o| o.get_mut("workdirs"))
+        .and_then(|w| w.as_array_mut())
+        .context("there's no ACR agent here yet: run `tailbus setup acr` first")
+}
+
+/// A repository's top folder, as ACR and the bridge name it.
+fn repo_root(repo: &Path) -> Result<PathBuf> {
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("{} isn't there", repo.display()))?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .output()
+        .context("running git")?;
+    if !out.status.success() {
+        bail!("{} isn't in a git repository", repo.display());
+    }
+    let top = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).canonicalize()?;
+    if top != repo {
+        bail!("give the repository's top folder: {}", top.display());
+    }
+    Ok(top)
+}
+
+/// Allows ACR to review a repository here, or stops allowing it, and
+/// restarts the agent if it's running.
+pub fn acr_repo(paths: &Paths, repo: &Path, allow: bool) -> Result<()> {
+    let repo = if allow {
+        repo_root(repo)?
+    } else {
+        repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf())
+    };
+    let shown = repo.to_string_lossy().into_owned();
+    let mut doc = read_config(paths)?;
+    let workdirs = acr_workdirs(&mut doc)?;
+    let there = workdirs.iter().any(|v| v.as_str() == Some(&shown));
+    match (allow, there) {
+        (true, true) => {
+            println!("ACR may already review {shown}.");
+            return Ok(());
+        }
+        (false, false) => {
+            println!("ACR wasn't allowed to review {shown}.");
+            return Ok(());
+        }
+        (true, false) => workdirs.push(shown.as_str()),
+        (false, true) => workdirs.retain(|v| v.as_str() != Some(&shown)),
+    }
+    write_config(paths, &doc)?;
+    if bridge_job(ACR_AGENT).is_some() {
+        bridge_install(paths, ACR_AGENT)?;
+    }
+    let verb = if allow {
+        "may now review"
+    } else {
+        "may no longer review"
+    };
+    println!("ACR {verb} {shown}.");
+    Ok(())
+}
+
+/// Sets up ACR on this machine: a token for headless Claude Code, the
+/// bridge it runs through, ACR's bindings, and the bridge's service. Each
+/// part is left alone if it's there already, so running it again is safe.
+pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
+    let status: crate::local::Status = local::call(&paths.socket(), &Request::Status)
+        .context("the tailbus daemon has to be running: tailbus service install")?;
+    let (Some(machine), Some(owner)) = (status.machine, status.owner) else {
+        bail!("the daemon doesn't know this machine on Tailscale yet; try again in a moment");
+    };
+    let claude = find_claude()?;
+    let dir = paths
+        .config
+        .parent()
+        .context("the config has no folder")?
+        .to_path_buf();
+    let token = dir.join("claude-token");
+    if token.exists() {
+        println!("Using the token in {}.", token.display());
+    } else {
+        make_token(&claude, &token)?;
+    }
+    let mut doc = read_config(paths)?;
+    let has_bridge = doc.get("bridges").and_then(|b| b.get(ACR_AGENT)).is_some();
+    if has_bridge {
+        println!(
+            "Kept the {ACR_AGENT} bridge already in {}.",
+            paths.config.display()
+        );
+    } else {
+        let home = paths.state.join(ACR_AGENT).join("home");
+        fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+        let claude_dir = claude.parent().map(|d| d.to_string_lossy().into_owned());
+        let path: Vec<String> = claude_dir
+            .into_iter()
+            .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(String::from))
+            .fold(Vec::new(), |mut seen, d| {
+                if !seen.contains(&d) {
+                    seen.push(d);
+                }
+                seen
+            });
+        let mut text = doc.to_string();
+        text.push_str(&acr_bridge(&owner, &claude, &home, &token, &path.join(":")));
+        doc = text.parse().context("adding the ACR agent to the config")?;
+        println!(
+            "Added the {ACR_AGENT} bridge to {}.",
+            paths.config.display()
+        );
+    }
+    let workdirs = acr_workdirs(&mut doc)?;
+    for repo in repos {
+        let root = repo_root(repo)?.to_string_lossy().into_owned();
+        if !workdirs.iter().any(|v| v.as_str() == Some(&root)) {
+            workdirs.push(root.as_str());
+            println!("ACR may review {root}.");
+        }
+    }
+    write_config(paths, &doc)?;
+    let bindings = dir.join("acr.yaml");
+    if bindings.exists() {
+        println!("Kept your ACR config, {}.", bindings.display());
+    } else {
+        let text = acr_bindings(&machine);
+        crate::acr::check_user_config(&text)?;
+        write(&bindings, &text)?;
+        fs::set_permissions(
+            &bindings,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )?;
+        println!("Wrote ACR's bindings to {}.", bindings.display());
+    }
+    bridge_install(paths, ACR_AGENT)?;
+    let empty = acr_workdirs(&mut doc)?.is_empty();
+    if empty {
+        println!("Next, allow each repository ACR reviews here: tailbus acr add-repo <path>");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("tb-setup-{name}-{}", &crate::util::new_id()[14..]));
+        fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn what_setup_acr_writes_is_a_working_config() {
+        let dir = temp("acr");
+        let token = dir.join("claude-token");
+        fs::write(&token, "sk-ant-test").unwrap();
+        fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        let claude = dir.join("claude");
+        fs::write(&claude, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let text = acr_bridge("ray@example.com", &claude, &dir, &token, "/usr/bin:/bin");
+        let cfg: crate::config::Config = toml::from_str(&text).unwrap();
+        let table = cfg.bridges[ACR_AGENT].clone();
+        let settings: bridge::Settings = table.try_into().unwrap();
+        settings.check().unwrap();
+        assert!(settings.usage.is_some());
+        crate::acr::check_user_config(&acr_bindings("box")).unwrap();
+        assert!(acr_bindings("box").contains("claude-acr@box"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_repository_is_allowed_once_and_can_be_dropped() {
+        let dir = temp("repo");
+        let repo = dir.join("project");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        let token = dir.join("claude-token");
+        fs::write(&token, "t").unwrap();
+        let paths = Paths {
+            config: dir.join("config.toml"),
+            state: dir.join("state"),
+        };
+        let start = "# mine, kept\nalerts = false\n".to_string()
+            + &acr_bridge("o", Path::new("/bin/claude"), &dir, &token, "/bin");
+        fs::write(&paths.config, &start).unwrap();
+        let workdirs = || -> Vec<String> {
+            let mut doc = read_config(&paths).unwrap();
+            acr_workdirs(&mut doc)
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        };
+        acr_repo(&paths, &repo, true).unwrap();
+        acr_repo(&paths, &repo, true).unwrap();
+        assert_eq!(workdirs(), [repo.to_string_lossy()]);
+        let text = fs::read_to_string(&paths.config).unwrap();
+        assert!(text.starts_with("# mine, kept\n"), "comments stay");
+        // Only a repository's top folder.
+        let inner = repo.join("src");
+        fs::create_dir_all(&inner).unwrap();
+        assert!(acr_repo(&paths, &inner, true).is_err());
+        acr_repo(&paths, &repo, false).unwrap();
+        assert!(workdirs().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn the_pipe_skill_is_the_command_under_its_own_name() {

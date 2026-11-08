@@ -511,6 +511,12 @@ about 8.
   come only for calls billed in them. `subscription: true` on a binding
   keeps a price or an agent's own figure from turning its tokens into
   dollars.
+- **Set up by one command.** `tailbus setup acr` writes everything ACR
+  needs on a machine, and `tailbus acr add-repo` allows each repository: a
+  token, the bridge, the bindings and the service, each left alone if it's
+  there, so it can run again. Its config edits keep your comments, and are
+  checked before they're written. Services are launchd agents on macOS and
+  systemd user units on Linux.
 - **One machine.** ACR's reviewers read the code where it is, never a
   copy, so every binding must reach an agent on the machine with the
   repository, and every call runs in it. tailbus still carries messages

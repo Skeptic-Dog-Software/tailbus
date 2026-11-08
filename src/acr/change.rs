@@ -83,11 +83,21 @@ pub fn repo_config(repo: &Path, base: &str) -> Result<String> {
 }
 
 /// The repository's name: its top directory's.
+/// The repository's name: its main checkout's folder, so a worktree of it
+/// finds the same config.
 pub fn name(repo: &Path) -> Result<String> {
-    let top = git(repo, &["rev-parse", "--show-toplevel"])?;
-    Path::new(top.trim())
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = Path::new(common.trim());
+    let main = match common.file_name() {
+        Some(n) if n == ".git" => common.parent().unwrap_or(common).to_path_buf(),
+        _ => common.to_path_buf(),
+    };
+    main.file_name()
+        .map(|n| n.to_string_lossy().trim_end_matches(".git").to_string())
+        .filter(|n| !n.is_empty())
         .context("the repository has no name")
 }
 
@@ -98,7 +108,9 @@ pub fn fingerprint(repo: &Path) -> Result<String> {
     let mut hash = Sha256::new();
     for args in [
         &["rev-parse", "HEAD"][..],
-        &["status", "--porcelain", "--untracked-files=all"],
+        // Untracked folders count once, not by what's in them, so an
+        // agent's worktrees under one don't look like a change.
+        &["status", "--porcelain", "--untracked-files=normal"],
         &["diff", "HEAD", "--binary"],
     ] {
         hash.update(git(repo, args)?.as_bytes());
@@ -449,6 +461,28 @@ pub mod tests {
         // The working tree is read the same way.
         let tree = load(&dir, "main", None, ReviewScope::WholePr, &rules).unwrap();
         assert_eq!(tree.generated.len(), 4);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_worktree_has_its_repositorys_name() {
+        let dir = repo_with(&[("a.txt", "one\n")]);
+        let tree = dir.with_file_name(format!("pr-{}", new_id()));
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["worktree", "add", "-q", "-b", "pr"])
+            .arg(&tree)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(name(&tree).unwrap(), name(&dir).unwrap());
+        assert!(name(&dir).unwrap().starts_with("tb-acr-"));
+        fs::remove_dir_all(&tree).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 

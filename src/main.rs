@@ -217,6 +217,19 @@ enum SetupApp {
         #[arg(long)]
         no_install: bool,
     },
+    /// Set up ACR on this machine: headless Claude Code as its agent, its
+    /// token, its bindings and its service. Safe to run again.
+    Acr {
+        /// A repository ACR may review here. Can be repeated.
+        #[arg(long = "repo", value_name = "PATH")]
+        repos: Vec<PathBuf>,
+    },
+    /// Everything: the daemon's service, the Claude Code plugin, and ACR.
+    All {
+        /// A repository ACR may review here. Can be repeated.
+        #[arg(long = "repo", value_name = "PATH")]
+        repos: Vec<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -313,9 +326,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 HookCmd::Subagent => hook::subagent(&socket, explicit),
             };
         }
-        Cmd::Setup {
-            app: SetupApp::Claude { no_install },
-        } => setup::claude(!no_install)?,
+        Cmd::Setup { app } => match app {
+            SetupApp::Claude { no_install } => setup::claude(!no_install)?,
+            SetupApp::Acr { repos } => setup::acr(&paths, &repos)?,
+            SetupApp::All { repos } => {
+                setup::service_install(&paths)?;
+                setup::claude(true)?;
+                setup::acr(&paths, &repos)?;
+            }
+        },
         Cmd::Service { command } => match command {
             ServiceCmd::Install => setup::service_install(&paths)?,
             ServiceCmd::Uninstall => setup::service_uninstall()?,
