@@ -540,10 +540,13 @@ about 8.
 - **Generated files are left out, never hidden.** A regenerated file can
   be most of a diff, and every reviewer would read it. So the diff a review
   sends lists each one with its line counts instead, and reviewers can open
-  it in the repository. Detection is by convention, not by language: a
-  generator's marker in a file's first lines, or `linguist-generated`, so
-  the framework still knows no file types. A lens that has to see them,
-  such as one on migrations, takes `include_generated`.
+  it in the repository. Generated is decided by path: generators' naming
+  conventions, which are the one place ACR knows any ecosystem, the
+  repository's `generated.paths`, and the base's `.gitattributes`. A lens
+  that has to see them, such as one on migrations, takes `include_generated`.
+  - *Rejected:* a marker such as "Code generated ... DO NOT EDIT" in a
+    file's first lines, and the change's own `.gitattributes`. Both are set
+    by the change, so it could have its own code left out of its review.
   - *Fixed with it:* the plan priced every Judge call as reading the whole
     diff, which it never got.
 - **No model of its own.** The framework names no binding, model or

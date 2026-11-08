@@ -5,6 +5,7 @@
 mod change;
 mod config;
 mod flow;
+mod generated;
 mod keep;
 mod plan;
 mod report;

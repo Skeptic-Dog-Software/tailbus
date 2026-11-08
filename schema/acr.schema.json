@@ -95,11 +95,10 @@
     "generated": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Generated files are left out of the diff a review sends, each listed with its line counts. Reviewers can still read them in the repository",
+      "description": "Generated files are left out of the diff a review sends, each listed with its line counts. Reviewers can still read them in the repository. Generated means by path: code generators' naming conventions, these paths, or the base's .gitattributes linguist-generated; never by a file's contents",
       "properties": {
         "exclude": {"type": "boolean", "description": "Leave generated files out. Default true"},
-        "markers": {"type": "boolean", "description": "A file whose first lines say it's generated, such as 'Code generated ... DO NOT EDIT' or '@generated', counts. Default true"},
-        "paths": {"$ref": "#/$defs/strings", "description": "More paths that are generated"},
+        "paths": {"$ref": "#/$defs/strings", "description": "More paths that are generated, besides code generators' naming conventions"},
         "keep": {"$ref": "#/$defs/strings", "description": "Paths never treated as generated"}
       }
     },

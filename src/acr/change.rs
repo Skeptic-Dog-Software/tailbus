@@ -2,17 +2,15 @@
 //! decided non-issues always come from the base, never the change, so a
 //! change can't switch off its own review.
 
-use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use regex::Regex;
 use serde::Serialize;
 
 use super::config::{Generated, REPO_CONFIG, ReviewScope};
+use super::generated::CONVENTIONS;
 
 #[derive(Debug, Clone, Default)]
 pub struct Change {
@@ -35,19 +33,6 @@ pub struct LeftOut {
     /// What says it's generated.
     pub why: String,
 }
-
-/// How generated files say so in their first lines, by the common
-/// conventions of code generators. Nothing here is any one language's.
-static MARKER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)@generated\b|\bgenerated\b.*\bdo not (edit|modify)\b|\bdo not (edit|modify)\b.*\bgenerated\b",
-    )
-    .expect("a valid pattern")
-});
-/// How far into a file its marker can be: past a licence or copyright
-/// header, which generators often put first, but still in its header.
-const MARKER_LINES: usize = 25;
-const MARKER_BYTES: usize = 4096;
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -176,7 +161,7 @@ pub fn load(
         diff: git(repo, &["diff", &range])?,
         ..Change::default()
     };
-    leave_out_generated(repo, head.as_deref(), change, generated)
+    leave_out_generated(repo, base, change, generated)
 }
 
 fn globs(paths: &[String]) -> Result<GlobSet> {
@@ -187,16 +172,14 @@ fn globs(paths: &[String]) -> Result<GlobSet> {
     Ok(set.build()?)
 }
 
-/// Files `.gitattributes` marks `linguist-generated`, as of `head`.
-fn linguist_generated(repo: &Path, head: Option<&str>, files: &[String]) -> Vec<String> {
+/// Files the base's `.gitattributes` marks `linguist-generated`: the
+/// base's, so a change can't mark its own files generated.
+fn linguist_generated(repo: &Path, base: &str, files: &[String]) -> Vec<String> {
     if files.is_empty() {
         return Vec::new();
     }
-    let mut args = vec!["check-attr"];
-    let source = head.map(|h| format!("--source={h}"));
-    if let Some(source) = &source {
-        args.push(source);
-    }
+    let source = format!("--source={base}");
+    let mut args = vec!["check-attr", source.as_str()];
     args.extend(["linguist-generated", "--"]);
     args.extend(files.iter().map(String::as_str));
     let Ok(out) = git(repo, &args) else {
@@ -207,38 +190,6 @@ fn linguist_generated(repo: &Path, head: Option<&str>, files: &[String]) -> Vec<
         .filter(|(_, v)| matches!(*v, "set" | "true"))
         .map(|(p, _)| p.to_string())
         .collect()
-}
-
-/// A file's first lines, as of `head`, or in the working tree.
-fn first_lines(repo: &Path, head: Option<&str>, path: &str) -> String {
-    let text = match head {
-        Some(head) => git(repo, &["show", &format!("{head}:{path}")]).unwrap_or_default(),
-        None => {
-            let Ok(file) = File::open(repo.join(path)) else {
-                return String::new();
-            };
-            let mut header = Vec::new();
-            let _ = std::io::Read::read_to_end(
-                &mut std::io::Read::take(file, MARKER_BYTES as u64),
-                &mut header,
-            );
-            String::from_utf8_lossy(&header).into_owned()
-        }
-    };
-    let head = &text[..floor_char(&text, MARKER_BYTES)];
-    head.lines()
-        .take(MARKER_LINES)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The largest char boundary at or before `at`.
-fn floor_char(text: &str, at: usize) -> usize {
-    let mut at = at.min(text.len());
-    while !text.is_char_boundary(at) {
-        at -= 1;
-    }
-    at
 }
 
 /// Splits a diff into each file's part, by its `diff --git` line.
@@ -276,17 +227,25 @@ fn counts(part: &str) -> (u64, u64) {
 
 /// Takes generated files out of the diff, listing each at its top. Never
 /// silently: a hand edit hidden in a generated file still shows up there.
+/// Generated means by path: a generator's naming convention, the config's
+/// `generated.paths`, or the base's `.gitattributes`. Never by what's in a
+/// file, nor anything else the change can set.
 fn leave_out_generated(
     repo: &Path,
-    head: Option<&str>,
+    base: &str,
     mut change: Change,
     rules: &Generated,
 ) -> Result<Change> {
     if !rules.exclude || change.files.is_empty() {
         return Ok(change);
     }
-    let (paths, keep) = (globs(&rules.paths)?, globs(&rules.keep)?);
-    let attributed = linguist_generated(repo, head, &change.files);
+    let conventions: Vec<String> = CONVENTIONS.iter().map(|p| p.to_string()).collect();
+    let (named, paths, keep) = (
+        globs(&conventions)?,
+        globs(&rules.paths)?,
+        globs(&rules.keep)?,
+    );
+    let attributed = linguist_generated(repo, base, &change.files);
     let why = |path: &str| -> Option<String> {
         if keep.is_match(path) {
             return None;
@@ -294,11 +253,13 @@ fn leave_out_generated(
         if paths.is_match(path) {
             return Some("generated.paths".into());
         }
-        if attributed.iter().any(|p| p == path) {
-            return Some("linguist-generated".into());
+        if named.is_match(path) {
+            return Some("named like generated code".into());
         }
-        let marked = rules.markers && MARKER.is_match(&first_lines(repo, head, path));
-        marked.then(|| "marked generated".into())
+        attributed
+            .iter()
+            .any(|p| p == path)
+            .then(|| "linguist-generated on the base".into())
     };
     let mut kept = String::new();
     for (path, part) in per_file(&change.diff) {
@@ -392,30 +353,31 @@ pub mod tests {
 
     #[test]
     fn generated_files_are_left_out_and_listed() {
-        let dir = repo_with(&[("a.txt", "one\n")]);
+        // The base says vendor/ is generated; the change can't add to that.
+        let dir = repo_with(&[
+            ("a.txt", "one\n"),
+            (".gitattributes", "vendor/** linguist-generated\n"),
+        ]);
         branch(&dir, "work");
-        // After a copyright header, as build_runner can write it.
-        let marked = format!(
-            "{}// GENERATED CODE - DO NOT MODIFY BY HAND\nline\nline\n",
-            "// Copyright, all rights reserved.\n".repeat(8)
-        );
-        let marked = marked.as_str();
-        // Far down a file isn't its header, so it doesn't count.
-        let deep = format!(
-            "{}// Code generated by x. DO NOT EDIT.\n",
-            "code\n".repeat(40)
-        );
-        let tooled = "// Code generated by some-tool. DO NOT EDIT.\n\npackage x\n";
         commit(
             &dir,
             &[
                 ("a.txt", "two\n"),
-                ("lib/db.g.dart", marked),
-                ("x/pb.txt", tooled),
+                ("lib/db.g.dart", "line\nline\nline\n"),
+                ("app/target/out.bin.txt", "built\n"),
                 ("vendor/v.txt", "plain\n"),
                 ("data/big.csv", "1,2\n"),
-                ("src/deep.txt", deep.as_str()),
-                (".gitattributes", "vendor/** linguist-generated\n"),
+                // Claims to be generated, but a file's contents never decide.
+                (
+                    "src/sneaky.txt",
+                    "// Code generated by x. DO NOT EDIT.\nhand edit\n",
+                ),
+                // Nor does the change's own .gitattributes.
+                ("mine/m.txt", "mine\n"),
+                (
+                    ".gitattributes",
+                    "vendor/** linguist-generated\nmine/** linguist-generated\n",
+                ),
             ],
             "work",
         );
@@ -432,10 +394,10 @@ pub mod tests {
         assert_eq!(
             out,
             [
+                ("app/target/out.bin.txt", "named like generated code"),
                 ("data/big.csv", "generated.paths"),
-                ("lib/db.g.dart", "marked generated"),
-                ("vendor/v.txt", "linguist-generated"),
-                ("x/pb.txt", "marked generated"),
+                ("lib/db.g.dart", "named like generated code"),
+                ("vendor/v.txt", "linguist-generated on the base"),
             ]
         );
         let db = c
@@ -443,17 +405,18 @@ pub mod tests {
             .iter()
             .find(|g| g.path == "lib/db.g.dart")
             .unwrap();
-        assert_eq!((db.added, db.removed), (11, 0));
+        assert_eq!((db.added, db.removed), (3, 0));
         // Listed at the top, never dropped silently, and still changed files.
         assert!(
             c.diff
-                .contains("#   lib/db.g.dart (+11 -0): marked generated")
+                .contains("#   lib/db.g.dart (+3 -0): named like generated code")
         );
         assert!(!c.diff.contains("+line"));
-        assert!(c.diff.contains("+two"));
+        assert!(
+            c.diff.contains("+two") && c.diff.contains("+hand edit") && c.diff.contains("+mine")
+        );
         assert!(c.full.as_ref().unwrap().contains("+line"));
-        assert_eq!(c.files.len(), 7);
-        assert!(!c.changed_lines().any(|l| l.contains("GENERATED")));
+        assert_eq!(c.files.len(), 8);
         // A repository can keep one, or turn it all off.
         let keep = Generated {
             keep: vec!["lib/**".into()],
@@ -467,19 +430,6 @@ pub mod tests {
         };
         let all = load(&dir, "main", Some("work"), ReviewScope::WholePr, &off).unwrap();
         assert!(all.generated.is_empty() && all.full.is_none());
-        let no_markers = Generated {
-            markers: false,
-            ..Generated::default()
-        };
-        let plain = load(
-            &dir,
-            "main",
-            Some("work"),
-            ReviewScope::WholePr,
-            &no_markers,
-        )
-        .unwrap();
-        assert_eq!(plain.generated.len(), 1, "only linguist-generated");
         // The working tree is read the same way.
         let tree = load(&dir, "main", None, ReviewScope::WholePr, &rules).unwrap();
         assert_eq!(tree.generated.len(), 4);

@@ -162,10 +162,8 @@ pub struct Generated {
     /// Leave generated files out. On unless a config turns it off.
     #[serde(default = "yes")]
     pub exclude: bool,
-    /// A file whose first lines carry a generated-code marker is generated.
-    #[serde(default = "yes")]
-    pub markers: bool,
-    /// More paths that are generated.
+    /// More paths that are generated, besides the naming conventions of
+    /// code generators that ACR knows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
     /// Paths never treated as generated, whatever says they are.
@@ -177,7 +175,6 @@ impl Default for Generated {
     fn default() -> Generated {
         Generated {
             exclude: true,
-            markers: true,
             paths: Vec::new(),
             keep: Vec::new(),
         }
