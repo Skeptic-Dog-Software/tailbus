@@ -27,7 +27,8 @@ use crate::local::{Awaited, Client, Request, Sent};
 use crate::proto::{Extras, MAX_BODY, RunOptions, RunStatus};
 use crate::util::new_id;
 
-/// The bus agent reviews are sent as, unless `--as` says otherwise.
+/// The bus agent reviews are sent as, always: a review's traffic is its
+/// own, and never lands in a session's inbox.
 const SENDER: &str = "acr";
 /// Seconds a call waits past its binding's timeout, or with none.
 const WAIT_MARGIN: u64 = 120;
@@ -265,11 +266,13 @@ impl Drop for BridgeCaller {
 }
 
 impl BridgeCaller {
-    fn new(paths: &Paths, agent: Option<String>) -> Result<BridgeCaller> {
+    fn new(paths: &Paths) -> Result<BridgeCaller> {
         let bus = BusConfig::load(&paths.config)?;
         Ok(BridgeCaller {
             socket: paths.socket(),
-            agent: agent.unwrap_or_else(|| SENDER.to_string()),
+            // Its own name, never a session's: what it sends and gets back
+            // is the review's, and no session should see it or act on it.
+            agent: SENDER.to_string(),
             store: Attachments::new(
                 paths.attachments(),
                 bus.max_attachment_bytes,
@@ -293,6 +296,29 @@ impl BridgeCaller {
             self.noted(&a.sha256);
         }
         Ok(a)
+    }
+
+    /// Waits for the reply to `id` again, on a new connection to the daemon,
+    /// giving it a minute to come back.
+    fn await_again(&self, id: &str, wait: u64) -> Result<Awaited> {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let tried = Client::connect(&self.socket).and_then(|mut client| {
+                client.send(&Request::Await {
+                    agent: self.agent.clone(),
+                    id: id.to_string(),
+                    wait_secs: wait,
+                })?;
+                client.reply::<Awaited>()
+            });
+            match tried {
+                Ok(awaited) => return Ok(awaited),
+                Err(e) if std::time::Instant::now() >= until => {
+                    return Err(e).context("the tailbus daemon went away mid-call");
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+            }
+        }
     }
 
     fn noted(&self, sha: &str) {
@@ -350,6 +376,7 @@ impl Caller for BridgeCaller {
             ..Extras::default()
         };
         let wait = b.timeout.unwrap_or(DEFAULT_CALL_SECS) + WAIT_MARGIN;
+        let asked = std::time::Instant::now();
         let mut client = Client::connect(&self.socket)?;
         client.send(&Request::Call {
             agent: self.agent.clone(),
@@ -361,7 +388,16 @@ impl Caller for BridgeCaller {
             wait_secs: Some(wait),
         })?;
         let sent: Sent = client.reply()?;
-        match client.reply::<Awaited>()? {
+        let awaited = match client.reply::<Awaited>() {
+            Ok(awaited) => awaited,
+            // The daemon went away mid-wait, as it does when it's updated.
+            // The reply is kept for this agent, so wait for it again.
+            Err(_) => {
+                let left = wait.saturating_sub(asked.elapsed().as_secs()).max(1);
+                self.await_again(&sent.id, left)?
+            }
+        };
+        match awaited {
             Awaited::Reply { item } => {
                 let msg = &item.msg;
                 let result = msg.result();
@@ -626,12 +662,17 @@ fn describe_plan(plan: &plan::Plan) {
     }
 }
 
+/// How many reviews are under way on this machine now.
+pub fn active_reviews(paths: &Paths) -> usize {
+    keep::active(paths).len()
+}
+
 /// Checks the text of a user's ACR config, as `tailbus setup acr` writes it.
 pub fn check_user_config(text: &str) -> Result<()> {
     config::parse_user(text).map(|_| ())
 }
 
-pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<ExitCode> {
+pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
     keep::prune(paths);
     match command {
         AcrCmd::Schema => print!("{SCHEMA}"),
@@ -683,9 +724,11 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
             let id = new_id();
             let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
             let s = setting(paths, &cfg, &id, Some(list))?;
+            // Under way until this ends, so an update to tailbus waits for it.
+            let _active = keep::active_guard(paths, &id)?;
             let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
             let change = reload(&cfg, repo, base, head)?;
-            let caller = BridgeCaller::new(paths, agent)?;
+            let caller = BridgeCaller::new(paths)?;
             let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
             // After a fix, the change is the working tree.
             let reloading = |fixed: bool| reload(&cfg, repo, base, head.filter(|_| !fixed));
@@ -705,6 +748,7 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
             let read =
                 |name: &str| fs::read(dir.join(name)).with_context(|| format!("no run {run_id}"));
             let mut run: Run = serde_json::from_slice(&read("run.json")?)?;
+            let _active = keep::active_guard(paths, &run_id)?;
             let cfg: Config = stored_config(&read("config.json")?)?;
             cfg.check_local(&this_machine(paths)?)?;
             // Until a fix, the review is of its head, which must be checked out.
@@ -720,7 +764,7 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
             flow::decide(&mut run, &decision)?;
             let s = setting(paths, &cfg, &run_id, None)?;
             let (repo, base) = (run.repo.clone(), run.base.clone());
-            let caller = BridgeCaller::new(paths, agent)?;
+            let caller = BridgeCaller::new(paths)?;
             let head = run.head.clone();
             let reloading =
                 |fixed: bool| reload(&cfg, &repo, &base, head.as_deref().filter(|_| !fixed));
@@ -744,9 +788,11 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
             let id = new_id();
             let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
             let s = setting(paths, &cfg, &id, Some(list))?;
+            // Under way until this ends, so an update to tailbus waits for it.
+            let _active = keep::active_guard(paths, &id)?;
             let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
             let change = reload(&cfg, repo, base, head)?;
-            let caller = BridgeCaller::new(paths, agent)?;
+            let caller = BridgeCaller::new(paths)?;
             let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
             for e in &mut run.escalations {
                 e.seen = true;
@@ -862,7 +908,7 @@ mod tests {
     fn a_caller_removes_only_the_attachments_it_made() {
         let paths = paths();
         let theirs = {
-            let caller = BridgeCaller::new(&paths, None).unwrap();
+            let caller = BridgeCaller::new(&paths).unwrap();
             // Someone else's, already in the store.
             let theirs = caller
                 .store
@@ -886,9 +932,15 @@ mod tests {
     }
 
     #[test]
+    fn a_review_sends_as_itself_never_a_session() {
+        let paths = paths();
+        assert_eq!(BridgeCaller::new(&paths).unwrap().agent, "acr");
+    }
+
+    #[test]
     fn a_fix_needs_somewhere_to_go() {
         let paths = paths();
-        let caller = BridgeCaller::new(&paths, None).unwrap();
+        let caller = BridgeCaller::new(&paths).unwrap();
         let binding = config::Binding {
             agent: "a@b".into(),
             ..config::Binding::default()

@@ -51,7 +51,14 @@ alone whatever's there already, so running it again is safe:
 - **The bridge's service**, started now and at every login.
 
 `tailbus acr add-repo` and `remove-repo` change which repositories ACR may
-review here, and restart the bridge. On Linux, services are systemd user
+review here, and restart the bridge; `--agent` names a bridge other than
+`claude-acr`, such as one set up by hand.
+
+**Updates wait.** `tailbus service install` and `tailbus bridge install`,
+which an update runs, first wait for bridge runs and ACR reviews under way to
+finish, up to half an hour, so an update never throws a call away. `--now`
+restarts at once. A review whose call is cut short by the daemon restarting
+anyway reconnects and picks up its reply. On Linux, services are systemd user
 units, which stop when you log out unless you `sudo loginctl enable-linger
 $USER`.
 
@@ -638,6 +645,10 @@ lenses:
     include_generated: true
     ...
 ```
+
+**A review is its own agent.** `tailbus acr` sends as `acr`, whatever session
+starts it, so its calls and their replies never land in a session's inbox,
+where the session might act on them.
 
 **One machine.** tailbus carries messages between machines, but ACR runs on
 one: every binding it uses must reach an agent on the machine with the code,

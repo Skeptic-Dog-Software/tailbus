@@ -526,6 +526,12 @@ about 8.
   a commit under review must be checked out, clean, or the run refuses.
   - *Rejected:* a snapshot of the commit sent to a reviewer elsewhere. It
     copies the code off its machine.
+- **A review is its own agent, and updates wait for it.** It sends as
+  `acr`, never as the session that started it, whose hooks would hand it the
+  review's replies to act on. An install waits for bridge runs and reviews
+  under way, known by a process ID in each review's directory, and a call cut
+  short by a daemon restart reconnects and waits for its reply again, which
+  the daemon keeps.
 - **A review leaves nothing behind.** Its files go as it finishes, with the
   attachments it sent and got back, and it asks bridges to keep no log of
   its calls. What's left is a line of history, for estimates. Its report is

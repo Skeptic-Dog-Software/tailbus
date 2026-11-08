@@ -975,6 +975,13 @@ fn read_report(paths: &Paths, agent: &str) -> Option<Report> {
 }
 
 /// Whether a bridge has come up since `since`, in Unix milliseconds.
+/// How many runs a bridge has going now: none if it isn't running.
+pub fn busy(paths: &Paths, agent: &str) -> usize {
+    read_report(paths, agent)
+        .filter(Report::alive)
+        .map_or(0, |r| r.running.len())
+}
+
 pub fn started_since(paths: &Paths, agent: &str, since: i64) -> bool {
     read_report(paths, agent).is_some_and(|r| r.alive() && r.started_at >= since)
 }

@@ -23,6 +23,51 @@ const HISTORY: &str = "history.jsonl";
 pub const HISTORY_RUNS: usize = 20;
 /// How long a review waiting for a person stays before it's taken as left.
 const UNFINISHED: Duration = Duration::from_secs(30 * 86_400);
+/// In a review's directory while a process is driving it: that process's ID.
+const ACTIVE_MARK: &str = "pid";
+
+/// Marks a review as under way in this process until it's dropped, so an
+/// update to tailbus waits for it rather than cutting it short.
+pub struct Active(PathBuf);
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+pub fn active_guard(paths: &Paths, id: &str) -> Result<Active> {
+    let review = dir(paths).join(id);
+    fs::create_dir_all(&review)?;
+    let mark = review.join(ACTIVE_MARK);
+    fs::write(&mark, std::process::id().to_string())?;
+    Ok(Active(mark))
+}
+
+/// Whether process `pid` is running.
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    let ok = unsafe { libc::kill(pid, 0) } == 0;
+    ok || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The reviews under way on this machine now.
+pub fn active(paths: &Paths) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir(paths)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            fs::read_to_string(e.path().join(ACTIVE_MARK))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+                .is_some_and(alive)
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Left in a review's directory by an earlier tailbus once it finished.
 const FINISHED_MARK: &str = "finished";
 
@@ -200,6 +245,22 @@ mod tests {
             tokens: 10,
             usd: Some(0.5),
         }
+    }
+
+    #[test]
+    fn a_review_under_way_is_known_until_it_ends() {
+        let p = paths();
+        assert!(active(&p).is_empty());
+        let guard = active_guard(&p, "r1").unwrap();
+        assert_eq!(active(&p), ["r1"]);
+        // A mark left by a process that's gone doesn't count.
+        let gone = dir(&p).join("r2");
+        fs::create_dir_all(&gone).unwrap();
+        fs::write(gone.join(ACTIVE_MARK), "999999").unwrap();
+        assert_eq!(active(&p), ["r1"]);
+        drop(guard);
+        assert!(active(&p).is_empty());
+        fs::remove_dir_all(&p.state).unwrap();
     }
 
     #[test]

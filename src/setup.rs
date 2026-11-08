@@ -486,11 +486,63 @@ fn stop_launch_agent(label: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The longest an update waits for what's under way to finish.
+const QUIET_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// What a restart would cut short now: runs on these bridges, and, if
+/// `reviews`, ACR reviews on this machine.
+fn under_way(paths: &Paths, bridges: &[String], reviews: bool) -> (usize, usize) {
+    let runs = bridges.iter().map(|b| bridge::busy(paths, b)).sum();
+    let under_way = if reviews {
+        crate::acr::active_reviews(paths)
+    } else {
+        0
+    };
+    (runs, under_way)
+}
+
+/// Waits until nothing a restart would cut short is under way: runs on
+/// these bridges, and, if `reviews`, ACR reviews on this machine. `now`
+/// doesn't wait.
+fn wait_for_quiet(paths: &Paths, bridges: &[String], reviews: bool, now: bool) -> Result<()> {
+    if now {
+        return Ok(());
+    }
+    let until = Instant::now() + QUIET_WAIT;
+    let mut told = false;
+    loop {
+        let (runs, under_way) = under_way(paths, bridges, reviews);
+        if runs + under_way == 0 {
+            return Ok(());
+        }
+        if !told {
+            println!(
+                "Waiting for {runs} bridge run(s) and {under_way} review(s) under way to finish \
+                 before restarting. --now restarts at once."
+            );
+            told = true;
+        }
+        if Instant::now() >= until {
+            bail!(
+                "still busy after {} minutes: try again later, or pass --now",
+                QUIET_WAIT.as_secs() / 60
+            );
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
 /// Runs the daemon as a service that starts at login and restarts if it
 /// stops. Running it again replaces the running daemon, for upgrades.
-pub fn service_install(paths: &Paths) -> Result<()> {
+pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
     let manager = manager("tailbus service", "tailbus daemon")?;
     paths.make_state_dir()?;
+    // A restart drops every connection to the daemon: bridges reconnect, but
+    // a run's reply or a review's call can be cut short.
+    let bridges: Vec<String> = crate::config::Config::load(&paths.config)
+        .map(|c| c.bridges.keys().cloned().collect())
+        .unwrap_or_default();
+    wait_for_quiet(paths, &bridges, true, now)?;
     let job = match manager {
         Manager::Launchd => {
             let domain = LaunchAgent {
@@ -555,10 +607,11 @@ fn bridge_label(agent: &str) -> String {
 
 /// Runs a bridge as a service, the way `service_install` runs the daemon.
 /// Running it again replaces the running bridge.
-pub fn bridge_install(paths: &Paths, agent: &str) -> Result<()> {
+pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
     let manager = manager("tailbus bridge install", "tailbus bridge run")?;
     paths.make_state_dir()?;
     let settings = bridge::load(paths, agent)?;
+    wait_for_quiet(paths, &[agent.to_string()], false, now)?;
     let dir = bridge::state_dir(paths, agent);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join("bridge.log");
@@ -906,7 +959,7 @@ pub fn acr_repo(paths: &Paths, repo: &Path, allow: bool, agent: &str) -> Result<
     }
     write_config(paths, &doc)?;
     if bridge_job(agent).is_some() {
-        bridge_install(paths, agent)?;
+        bridge_install(paths, agent, false)?;
     }
     let verb = if allow {
         "may now review"
@@ -988,7 +1041,7 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
         )?;
         println!("Wrote ACR's bindings to {}.", bindings.display());
     }
-    bridge_install(paths, ACR_AGENT)?;
+    bridge_install(paths, ACR_AGENT, false)?;
     let empty = acr_workdirs(&mut doc, ACR_AGENT)?.is_empty();
     if empty {
         println!("Next, allow each repository ACR reviews here: tailbus acr add-repo <path>");
@@ -1018,6 +1071,46 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn an_update_waits_for_runs_and_reviews_under_way() {
+        let dir = temp("quiet");
+        let paths = Paths {
+            config: dir.join("config.toml"),
+            state: dir.join("state"),
+        };
+        let bridges = ["busy".to_string(), "idle".to_string()];
+        assert_eq!(under_way(&paths, &bridges, true), (0, 0));
+        let me = std::process::id();
+        let status = |agent: &str, running: &str| {
+            let d = paths.state.join("bridge").join(agent);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(
+                d.join("status.json"),
+                format!(
+                    r#"{{"pid": {me}, "started_at": 0, "stopped_at": null, "running": {{{running}}},
+                    "answered": 0, "failed": 0, "ignored": 0, "last_failure": null}}"#
+                ),
+            )
+            .unwrap();
+        };
+        status(
+            "busy",
+            r#""r1": {"sender": "acr@here", "since": 0, "attempt": 1}"#,
+        );
+        status("idle", "");
+        let review = paths.state.join("acr").join("rv1");
+        fs::create_dir_all(&review).unwrap();
+        fs::write(review.join("pid"), me.to_string()).unwrap();
+        assert_eq!(under_way(&paths, &bridges, true), (1, 1));
+        // A bridge's own restart only waits for its own runs.
+        assert_eq!(under_way(&paths, &["idle".to_string()], false), (0, 0));
+        assert!(
+            wait_for_quiet(&paths, &bridges, true, true).is_ok(),
+            "--now doesn't wait"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

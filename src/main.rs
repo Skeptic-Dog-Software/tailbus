@@ -237,7 +237,12 @@ enum BridgeCmd {
     /// Run a bridge in the foreground.
     Run { agent: String },
     /// Start a bridge now and at every login, replacing a running one.
-    Install { agent: String },
+    Install {
+        agent: String,
+        /// Restart at once, cutting short its runs under way.
+        #[arg(long)]
+        now: bool,
+    },
     /// Stop a bridge and stop starting it at login.
     Uninstall { agent: String },
     /// Show how the bridges in the config are doing.
@@ -257,8 +262,13 @@ enum BridgeCmd {
 
 #[derive(Subcommand)]
 enum ServiceCmd {
-    /// Start the daemon now and at every login, replacing a running one.
-    Install,
+    /// Start the daemon now and at every login, replacing a running one. It
+    /// waits for bridge runs and reviews under way to finish first.
+    Install {
+        /// Restart at once, cutting short what's under way.
+        #[arg(long)]
+        now: bool,
+    },
     /// Stop the daemon and stop starting it at login.
     Uninstall,
 }
@@ -330,19 +340,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             SetupApp::Claude { no_install } => setup::claude(!no_install)?,
             SetupApp::Acr { repos } => setup::acr(&paths, &repos)?,
             SetupApp::All { repos } => {
-                setup::service_install(&paths)?;
+                setup::service_install(&paths, false)?;
                 setup::claude(true)?;
                 setup::acr(&paths, &repos)?;
             }
         },
         Cmd::Service { command } => match command {
-            ServiceCmd::Install => setup::service_install(&paths)?,
+            ServiceCmd::Install { now } => setup::service_install(&paths, now)?,
             ServiceCmd::Uninstall => setup::service_uninstall()?,
         },
-        Cmd::Acr { command } => return acr::run(&paths, cli.agent, command),
+        Cmd::Acr { command } => return acr::run(&paths, command),
         Cmd::Bridge { command } => match command {
             BridgeCmd::Run { agent } => bridge::run(&paths, &agent)?,
-            BridgeCmd::Install { agent } => setup::bridge_install(&paths, &agent)?,
+            BridgeCmd::Install { agent, now } => setup::bridge_install(&paths, &agent, now)?,
             BridgeCmd::Uninstall { agent } => setup::bridge_uninstall(&agent)?,
             BridgeCmd::Status { agent } => bridge::status(&paths, agent.as_deref())?,
             BridgeCmd::Log {
