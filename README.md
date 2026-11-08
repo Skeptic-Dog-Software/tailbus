@@ -621,7 +621,7 @@ model none of your bindings use is an error, so a misspelt one is caught.
 Each is listed at the diff's top with its lines added and removed, so a hand
 edit hidden in one still shows, and reviewers can read it in the repository.
 A file is generated if `.gitattributes` marks it `linguist-generated`, or its
-first lines carry a generator's marker, such as `Code generated ... DO NOT
+header, its first 25 lines, past any copyright notice, carries a generator's marker, such as `Code generated ... DO NOT
 EDIT`, `GENERATED CODE - DO NOT MODIFY` or `@generated`. That includes
 lockfiles that say so. A repository's `generated` can add paths, `keep`
 some, turn off `markers`, or set `exclude: false`. A lens with
