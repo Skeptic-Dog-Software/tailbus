@@ -15,6 +15,10 @@ pub const CONVENTIONS: &[&str] = &[
     "**/*.freezed.dart",
     "**/*.mocks.dart",
     "**/*.gr.dart",
+    // injectable names its output after the file it's set up in, so only
+    // the names that setups commonly use, never `*.config.dart`.
+    "**/injectable.config.dart",
+    "**/injection.config.dart",
     // Protocol buffers and gRPC, in each language's output names.
     "**/*.pb.go",
     "**/*_grpc.pb.go",
@@ -50,3 +54,35 @@ pub const CONVENTIONS: &[&str] = &[
     "**/composer.lock",
     "**/Podfile.lock",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use globset::{Glob, GlobSetBuilder};
+
+    #[test]
+    fn conventions_name_generators_output_and_nothing_hand_written() {
+        let mut set = GlobSetBuilder::new();
+        for p in CONVENTIONS {
+            set.add(Glob::new(p).unwrap());
+        }
+        let set = set.build().unwrap();
+        for generated in [
+            "lib/database/database.g.dart",
+            "lib/configuration/injectable.config.dart",
+            "lib/di/injection.config.dart",
+            "crates/x/target/debug/out.rs",
+            "Cargo.lock",
+        ] {
+            assert!(set.is_match(generated), "{generated}");
+        }
+        for written in [
+            "lib/app.config.dart",
+            "lib/main.dart",
+            "src/target.rs",
+            "docs/build.md",
+        ] {
+            assert!(!set.is_match(written), "{written}");
+        }
+    }
+}
