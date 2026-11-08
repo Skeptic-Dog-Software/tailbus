@@ -832,14 +832,30 @@ fn write_config(paths: &Paths, doc: &toml_edit::DocumentMut) -> Result<()> {
     write(&paths.config, &text)
 }
 
-/// Repositories ACR may review here: the bridge's workdirs.
-fn acr_workdirs(doc: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Array> {
-    doc.get_mut("bridges")
-        .and_then(|b| b.get_mut(ACR_AGENT))
-        .and_then(|a| a.get_mut("options"))
-        .and_then(|o| o.get_mut("workdirs"))
-        .and_then(|w| w.as_array_mut())
-        .context("there's no ACR agent here yet: run `tailbus setup acr` first")
+/// Repositories ACR may review here: a bridge's workdirs, made if it has
+/// none yet.
+fn acr_workdirs<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    agent: &str,
+) -> Result<&'a mut toml_edit::Array> {
+    let bridge = doc
+        .get_mut("bridges")
+        .and_then(|b| b.get_mut(agent))
+        .and_then(|a| a.as_table_like_mut())
+        .with_context(|| match agent {
+            ACR_AGENT => "there's no ACR agent here yet: run `tailbus setup acr` first".to_string(),
+            _ => format!("there's no {agent} bridge in this machine's config"),
+        })?;
+    let options = bridge
+        .entry("options")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_like_mut()
+        .context("its options aren't a table")?;
+    options
+        .entry("workdirs")
+        .or_insert(toml_edit::value(toml_edit::Array::new()))
+        .as_array_mut()
+        .context("its workdirs aren't a list")
 }
 
 /// A repository's top folder, as ACR and the bridge name it.
@@ -864,9 +880,9 @@ fn repo_root(repo: &Path) -> Result<PathBuf> {
     Ok(top)
 }
 
-/// Allows ACR to review a repository here, or stops allowing it, and
-/// restarts the agent if it's running.
-pub fn acr_repo(paths: &Paths, repo: &Path, allow: bool) -> Result<()> {
+/// Allows ACR to review a repository here through `agent`'s bridge, or
+/// stops allowing it, and restarts the bridge if it's running.
+pub fn acr_repo(paths: &Paths, repo: &Path, allow: bool, agent: &str) -> Result<()> {
     let repo = if allow {
         repo_root(repo)?
     } else {
@@ -874,7 +890,7 @@ pub fn acr_repo(paths: &Paths, repo: &Path, allow: bool) -> Result<()> {
     };
     let shown = repo.to_string_lossy().into_owned();
     let mut doc = read_config(paths)?;
-    let workdirs = acr_workdirs(&mut doc)?;
+    let workdirs = acr_workdirs(&mut doc, agent)?;
     let there = workdirs.iter().any(|v| v.as_str() == Some(&shown));
     match (allow, there) {
         (true, true) => {
@@ -889,15 +905,15 @@ pub fn acr_repo(paths: &Paths, repo: &Path, allow: bool) -> Result<()> {
         (false, true) => workdirs.retain(|v| v.as_str() != Some(&shown)),
     }
     write_config(paths, &doc)?;
-    if bridge_job(ACR_AGENT).is_some() {
-        bridge_install(paths, ACR_AGENT)?;
+    if bridge_job(agent).is_some() {
+        bridge_install(paths, agent)?;
     }
     let verb = if allow {
         "may now review"
     } else {
         "may no longer review"
     };
-    println!("ACR {verb} {shown}.");
+    println!("ACR {verb} {shown}, through {agent}.");
     Ok(())
 }
 
@@ -950,7 +966,7 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
             paths.config.display()
         );
     }
-    let workdirs = acr_workdirs(&mut doc)?;
+    let workdirs = acr_workdirs(&mut doc, ACR_AGENT)?;
     for repo in repos {
         let root = repo_root(repo)?.to_string_lossy().into_owned();
         if !workdirs.iter().any(|v| v.as_str() == Some(&root)) {
@@ -973,7 +989,7 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
         println!("Wrote ACR's bindings to {}.", bindings.display());
     }
     bridge_install(paths, ACR_AGENT)?;
-    let empty = acr_workdirs(&mut doc)?.is_empty();
+    let empty = acr_workdirs(&mut doc, ACR_AGENT)?.is_empty();
     if empty {
         println!("Next, allow each repository ACR reviews here: tailbus acr add-repo <path>");
     }
@@ -1041,23 +1057,37 @@ mod tests {
         fs::write(&paths.config, &start).unwrap();
         let workdirs = || -> Vec<String> {
             let mut doc = read_config(&paths).unwrap();
-            acr_workdirs(&mut doc)
+            acr_workdirs(&mut doc, ACR_AGENT)
                 .unwrap()
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
         };
-        acr_repo(&paths, &repo, true).unwrap();
-        acr_repo(&paths, &repo, true).unwrap();
+        acr_repo(&paths, &repo, true, ACR_AGENT).unwrap();
+        acr_repo(&paths, &repo, true, ACR_AGENT).unwrap();
         assert_eq!(workdirs(), [repo.to_string_lossy()]);
         let text = fs::read_to_string(&paths.config).unwrap();
         assert!(text.starts_with("# mine, kept\n"), "comments stay");
         // Only a repository's top folder.
         let inner = repo.join("src");
         fs::create_dir_all(&inner).unwrap();
-        assert!(acr_repo(&paths, &inner, true).is_err());
-        acr_repo(&paths, &repo, false).unwrap();
+        assert!(acr_repo(&paths, &inner, true, ACR_AGENT).is_err());
+        acr_repo(&paths, &repo, false, ACR_AGENT).unwrap();
         assert!(workdirs().is_empty());
+        // Another bridge, such as one set up by hand, with no workdirs yet.
+        let mut text = fs::read_to_string(&paths.config).unwrap();
+        text.push_str("\n[bridges.other]\nowner = \"o\"\ncommand = \"/bin/sh\"\nworking_directory = \"/\"\nhome = \"/tmp\"\npath = \"/bin\"\n");
+        fs::write(&paths.config, text).unwrap();
+        acr_repo(&paths, &repo, true, "other").unwrap();
+        let doc = read_config(&paths).unwrap();
+        assert_eq!(
+            doc["bridges"]["other"]["options"]["workdirs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(acr_repo(&paths, &repo, true, "nobody").is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 

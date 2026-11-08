@@ -95,9 +95,16 @@ pub enum AcrCmd {
     AddRepo {
         /// The repository's top folder.
         path: PathBuf,
+        /// The bridge ACR reaches its models through here.
+        #[arg(long, default_value = crate::setup::ACR_AGENT)]
+        agent: String,
     },
     /// Stop allowing ACR to review a repository on this machine.
-    RemoveRepo { path: PathBuf },
+    RemoveRepo {
+        path: PathBuf,
+        #[arg(long, default_value = crate::setup::ACR_AGENT)]
+        agent: String,
+    },
     /// Show the tier, lenses, bindings and cost, with no model calls.
     Plan {
         #[command(flatten)]
@@ -628,8 +635,8 @@ pub fn run(paths: &Paths, agent: Option<String>, command: AcrCmd) -> Result<Exit
     keep::prune(paths);
     match command {
         AcrCmd::Schema => print!("{SCHEMA}"),
-        AcrCmd::AddRepo { path } => crate::setup::acr_repo(paths, &path, true)?,
-        AcrCmd::RemoveRepo { path } => crate::setup::acr_repo(paths, &path, false)?,
+        AcrCmd::AddRepo { path, agent } => crate::setup::acr_repo(paths, &path, true, &agent)?,
+        AcrCmd::RemoveRepo { path, agent } => crate::setup::acr_repo(paths, &path, false, &agent)?,
         AcrCmd::Validate { file, repo, base } => {
             let user = config::load_user(&user_config_path(paths))?;
             let (text, source) = repo_layer(paths, &repo, base.as_deref(), file.as_deref())?;
