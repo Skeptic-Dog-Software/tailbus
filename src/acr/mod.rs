@@ -10,6 +10,7 @@ mod keep;
 mod plan;
 mod report;
 mod roles;
+mod trial;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -92,6 +93,20 @@ pub enum AcrCmd {
     },
     /// Print the published schema.
     Schema,
+    /// Measure review designs on a change whose findings are known: blind,
+    /// with nobody in the loop, leaving nothing behind. Prints each design's
+    /// result as a line of JSON.
+    Trial {
+        /// The answer key: the change, what it's for, and what an earlier
+        /// review found.
+        key: PathBuf,
+        /// One design. Left out, all three, one after another.
+        #[arg(long, value_enum)]
+        arm: Option<trial::Arm>,
+        /// Add each result, as a line of JSON, to this file too.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
     /// Allow ACR to review a repository on this machine.
     AddRepo {
         /// The repository's top folder.
@@ -772,43 +787,152 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             return finish(paths, &run, &cfg, post_pr);
         }
         AcrCmd::Benchmark { target, known } => {
-            let mut flags = flags(&target);
-            // One round, as it first comes out, with nobody fixing anything.
-            flags.max_rounds = Some(1);
-            flags.human_gate = Some(HumanGate::Exception);
-            let (cfg, source) = load_config(paths, &target, &flags)?;
-            cfg.check_bindings()?;
-            cfg.check_local(&this_machine(paths)?)?;
-            change::checked_out(&target.repo, target.head.as_deref())?;
             let known: Vec<Known> = serde_yaml_ng::from_str(
                 &fs::read_to_string(&known)
                     .with_context(|| format!("reading {}", known.display()))?,
             )
             .context("in the known blockers")?;
-            let id = new_id();
-            let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
-            let s = setting(paths, &cfg, &id, Some(list))?;
-            // Under way until this ends, so an update to tailbus waits for it.
-            let _active = keep::active_guard(paths, &id)?;
-            let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
-            let change = reload(&cfg, repo, base, head)?;
-            let caller = BridgeCaller::new(paths)?;
-            let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
-            for e in &mut run.escalations {
-                e.seen = true;
-            }
-            flow::drive(&mut run, &s, &caller, &|_| reload(&cfg, repo, base, head))?;
-            for e in &mut run.escalations {
-                e.seen = true;
-            }
-            save(paths, &run, &cfg)?;
-            // One round, forced, says nothing about how many reviews take.
-            keep::finished(paths, &run, false)?;
+            let run = one_round(paths, &target)?;
             let score = flow::score(&run, &known)?;
             println!("{}", serde_json::to_string_pretty(&score)?);
         }
+        AcrCmd::Trial { key, arm, out } => {
+            let arms = match arm {
+                Some(arm) => vec![arm],
+                None => vec![
+                    trial::Arm::OneSize,
+                    trial::Arm::Sized,
+                    trial::Arm::Separated,
+                ],
+            };
+            let separated = |tree: &Path, key: &trial::Key| separated(paths, tree, key);
+            for arm in arms {
+                let outcome = trial::run(paths, &key, arm, &separated)?;
+                let line = serde_json::to_string(&outcome)?;
+                println!("{line}");
+                if let Some(out) = &out {
+                    let mut file = fs::OpenOptions::new().create(true).append(true).open(out)?;
+                    std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())?;
+                }
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One round of the pipeline, as a change first comes out, with nobody
+/// fixing anything and escalations taken as seen. Leaves nothing behind.
+fn one_round(paths: &Paths, target: &Target) -> Result<Run> {
+    let mut flags = flags(target);
+    flags.max_rounds = Some(1);
+    flags.human_gate = Some(HumanGate::Exception);
+    let (cfg, source) = load_config(paths, target, &flags)?;
+    cfg.check_bindings()?;
+    cfg.check_local(&this_machine(paths)?)?;
+    change::checked_out(&target.repo, target.head.as_deref())?;
+    let id = new_id();
+    let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
+    let s = setting(paths, &cfg, &id, Some(list))?;
+    // Under way until this ends, so an update to tailbus waits for it.
+    let _active = keep::active_guard(paths, &id)?;
+    let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
+    let change = reload(&cfg, repo, base, head)?;
+    let caller = BridgeCaller::new(paths)?;
+    let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
+    for e in &mut run.escalations {
+        e.seen = true;
+    }
+    flow::drive(&mut run, &s, &caller, &|_| reload(&cfg, repo, base, head))?;
+    for e in &mut run.escalations {
+        e.seen = true;
+    }
+    save(paths, &run, &cfg)?;
+    // One round, forced, says nothing about how many reviews take.
+    keep::finished(paths, &run, false)?;
+    Ok(run)
+}
+
+/// Allows a trial's worktree through every local bridge its bindings use,
+/// for as long as it lives.
+struct AllowedFor<'a> {
+    paths: &'a Paths,
+    tree: PathBuf,
+    bridges: Vec<String>,
+}
+
+impl Drop for AllowedFor<'_> {
+    fn drop(&mut self) {
+        for bridge in &self.bridges {
+            let _ = crate::setup::acr_repo(self.paths, &self.tree, false, bridge);
+        }
+    }
+}
+
+/// The separate-roles design on a trial's worktree.
+fn separated(
+    paths: &Paths,
+    tree: &Path,
+    key: &trial::Key,
+) -> Result<(Vec<trial::Found>, trial::Counts, Vec<String>)> {
+    let target = Target {
+        repo: tree.to_path_buf(),
+        base: key.base.clone(),
+        config: None,
+        head: Some(key.head.clone()),
+        human_gate: None,
+        max_rounds: None,
+        review_scope: None,
+        bindings: Vec::new(),
+    };
+    let (cfg, _) = load_config(paths, &target, &flags(&target))?;
+    let mut bridges: Vec<String> = cfg
+        .bindings
+        .values()
+        .filter_map(|name| cfg.allowed_bindings.get(name))
+        .map(|b| b.agent.split('@').next().unwrap_or(&b.agent).to_string())
+        .collect();
+    bridges.sort();
+    bridges.dedup();
+    let mut allowed = AllowedFor {
+        paths,
+        tree: tree.to_path_buf(),
+        bridges: Vec::new(),
+    };
+    for bridge in &bridges {
+        crate::setup::acr_repo(paths, tree, true, bridge)?;
+        allowed.bridges.push(bridge.clone());
+    }
+    let run = one_round(paths, &target)?;
+    drop(allowed);
+    let mut found = Vec::new();
+    for lens in run.lenses.values() {
+        for round in &lens.rounds {
+            for f in &round.findings {
+                found.push(trial::Found {
+                    dimension: lens.id.clone(),
+                    title: f.title.clone(),
+                    detail: f.detail.clone(),
+                    file: f.file.clone().unwrap_or_default(),
+                    blocker: f.blocks(),
+                });
+            }
+        }
+    }
+    let mut counts = trial::Counts::default();
+    let mut models = Vec::new();
+    for u in &run.usage {
+        counts.input += u.tokens_in;
+        counts.cache_read += u.cache_read;
+        counts.cache_write += u.cache_write;
+        counts.output += u.tokens_out;
+        if let Some(m) = &u.model
+            && !models.contains(m)
+        {
+            models.push(m.clone());
+        }
+    }
+    counts.total = counts.input + counts.output + counts.cache_read + counts.cache_write;
+    Ok((found, counts, models))
 }
 
 /// A run's config, as it was when it started: resuming can't pick up a

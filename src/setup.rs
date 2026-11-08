@@ -210,7 +210,7 @@ fn install_pipe_skill() -> Result<()> {
     Ok(())
 }
 
-fn find_claude() -> Result<PathBuf> {
+pub fn find_claude() -> Result<PathBuf> {
     if let Some(path) = env::var_os("PATH") {
         for dir in env::split_paths(&path) {
             let candidate = dir.join("claude");
@@ -222,6 +222,11 @@ fn find_claude() -> Result<PathBuf> {
     let local = home()?.join(".local/bin/claude");
     if local.is_file() {
         return Ok(local);
+    }
+    // Homebrew's, which a shell started without a login PATH misses.
+    let brew = PathBuf::from("/opt/homebrew/bin/claude");
+    if brew.is_file() {
+        return Ok(brew);
     }
     bail!("can't find the `claude` command; install Claude Code, or use --no-install")
 }
