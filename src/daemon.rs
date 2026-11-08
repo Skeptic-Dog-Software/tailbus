@@ -574,6 +574,11 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
             }
             conn.write(&serde_json::json!({ "added": added }))?;
         }
+        Request::AgentRemove { name } => {
+            check_name(&name)?;
+            let stale = bus.remove_agent(&name)?;
+            conn.write(&serde_json::json!({ "stale": stale }))?;
+        }
         Request::Agents => conn.write(&bus.agent_list()?)?,
         Request::Peers => conn.write(&bus.peers()?)?,
         Request::Status => conn.write(&status(bus)?)?,

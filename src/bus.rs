@@ -419,6 +419,33 @@ impl Bus {
     /// Claims `agent` for a session, unless another live session holds it.
     /// The same session may claim it again. (Matching on the app's process
     /// is only for hooks: one Codex server can host many sessions.)
+    /// Removes an agent nobody holds. What was waiting for it goes stale, and
+    /// its senders hear. Returns how many messages that was.
+    pub fn remove_agent(&self, name: &str) -> Result<usize> {
+        if let Some(h) = lock(&self.live).holders.get(name) {
+            bail!(
+                "a live session holds {name} ({}, process {}): end it first",
+                h.app.as_deref().unwrap_or("unknown app"),
+                h.client_pid
+            );
+        }
+        // Bound first, so the database isn't still held while receipts go.
+        let removed = self.db().remove_agent(name, now_ms())?;
+        let Some(waiting) = removed else {
+            bail!("there's no agent {name} on this machine");
+        };
+        for (id, sender) in &waiting {
+            if let Err(e) = self.receipt(sender, id, SendState::Stale) {
+                self.event(format!("couldn't tell {sender} that {id} is stale: {e:#}"));
+            }
+        }
+        self.event(format!(
+            "{name}: removed; {} waiting message(s) went stale",
+            waiting.len()
+        ));
+        Ok(waiting.len())
+    }
+
     pub fn hold(&self, agent: &str, claim: &Claim) -> Result<Result<u64, String>> {
         let Claim {
             session,
@@ -2342,6 +2369,33 @@ pub(crate) mod tests {
             ipv4: None,
         });
         bus
+    }
+
+    #[test]
+    fn a_removed_agent_takes_nothing_and_its_senders_hear() {
+        let bus = bus_on("here", 1, "");
+        bus.db().add_agent("sim", 1).unwrap();
+        bus.db().add_agent("gone", 1).unwrap();
+        let sent = bus
+            .send("sim", "gone", "still there?".into(), None, Some(true), None)
+            .unwrap();
+        assert_eq!(bus.remove_agent("gone").unwrap(), 1);
+        assert!(!bus.db().has_agent("gone").unwrap());
+        let out = bus.db().outgoing(&sent.id).unwrap().unwrap();
+        assert_eq!(out.state, SendState::Stale);
+        assert!(bus.remove_agent("gone").is_err(), "it's gone");
+        // A name a live session holds isn't removed.
+        bus.db().add_agent("busy", 1).unwrap();
+        let claim = Claim {
+            session: "s1",
+            app: Some("claude-code"),
+            client_pid: 100,
+            ..Claim::default()
+        };
+        bus.hold("busy", &claim).unwrap().unwrap();
+        let err = format!("{:#}", bus.remove_agent("busy").unwrap_err());
+        assert!(err.contains("live session"), "{err}");
+        assert!(bus.db().has_agent("busy").unwrap());
     }
 
     #[test]

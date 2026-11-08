@@ -295,6 +295,30 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Removes an agent. Its waiting messages go stale at once, and each
+    /// one's ID and sender come back, so they can be told. None if there's
+    /// no such agent. Its other rows go by the usual retention.
+    pub fn remove_agent(&self, name: &str, now: i64) -> Result<Option<Vec<(String, String)>>> {
+        if !self.has_agent(name)? {
+            return Ok(None);
+        }
+        let mut stmt = self.db.prepare(
+            "SELECT id, sender FROM inbox
+             WHERE agent = ?1 AND acked_at IS NULL AND stale_at IS NULL",
+        )?;
+        let waiting = stmt
+            .query_map([name], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        self.db.execute(
+            "UPDATE inbox SET stale_at = ?2, acked_at = ?2
+             WHERE agent = ?1 AND acked_at IS NULL AND stale_at IS NULL",
+            params![name, now],
+        )?;
+        self.db
+            .execute("DELETE FROM agents WHERE name = ?1", [name])?;
+        Ok(Some(waiting))
+    }
+
     pub fn has_agent(&self, name: &str) -> Result<bool> {
         Ok(self
             .db

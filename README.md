@@ -62,7 +62,8 @@ anyway reconnects and picks up its reply. On Linux, services are systemd user
 units, which stop when you log out unless you `sudo loginctl enable-linger
 $USER`.
 
-`tailbus status` shows whether the bus is up and listening on the tailnet.
+`tailbus status` shows whether the bus is up and listening on the tailnet. `tailbus agent rm <name>` removes an agent nobody uses any more: messages
+waiting for it go stale, and their senders are told.
 Restart open Claude Code sessions to load the plugin, and again after
 updating tailbus. `/reload-plugins` isn't enough after an update: it
 rereads the plugin's files, but keeps a session's tailbus server running

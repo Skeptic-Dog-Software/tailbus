@@ -197,6 +197,10 @@ enum AgentCmd {
     Add { name: String },
     /// List the agents subscribed on this machine.
     List,
+    /// Remove an agent nobody's using any more. Messages waiting for it go
+    /// stale, and their senders hear.
+    #[command(alias = "remove")]
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -513,6 +517,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 } else {
                     println!("{name} was already subscribed.");
                 }
+            }
+            AgentCmd::Rm { name } => {
+                let removed = call(&Request::AgentRemove { name: name.clone() })?;
+                let stale = removed["stale"].as_u64().unwrap_or(0);
+                println!("Removed {name}; {stale} message(s) waiting for it went stale.");
             }
             AgentCmd::List => {
                 let list: AgentList = local::call(&socket, &Request::Agents)?;

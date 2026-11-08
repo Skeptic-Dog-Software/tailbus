@@ -154,6 +154,11 @@ pub enum Request {
     AgentAdd {
         name: String,
     },
+    /// Removes an agent nobody holds; what was waiting for it goes stale.
+    /// The reply is `{"stale": n}`.
+    AgentRemove {
+        name: String,
+    },
     Agents,
     Peers,
     Status,
