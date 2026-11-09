@@ -187,6 +187,40 @@ impl Drop for Scratch {
 /// no remote, and no later commit, so nothing in a trial can see how the
 /// change turned out. It's named after the repository, so its review config
 /// is found.
+/// The key with its base and head as full commit names, since the trial's
+/// copy can fetch a commit only by its full name. The base has to be in the
+/// head's history: nothing else is in the copy, and a branch that has moved
+/// past the change would bring its fixes in.
+fn resolved(mut key: Key) -> Result<Key> {
+    let commit = |rev: &str| -> Result<String> {
+        let full = super::change::git(
+            &key.repo,
+            &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+        )
+        .with_context(|| format!("{rev} isn't a commit in {}", key.repo.display()))?;
+        Ok(full.trim().to_owned())
+    };
+    let head = commit(&key.head)?;
+    let base = commit(&key.base)?;
+    let ancestor = Command::new("git")
+        .arg("-C")
+        .arg(&key.repo)
+        .args(["merge-base", "--is-ancestor", &base, &head])
+        .stdin(Stdio::null())
+        .status()
+        .context("running git")?;
+    if !ancestor.success() {
+        bail!(
+            "the key's base {} isn't in the history of its head {}: give the commit the change was made on",
+            key.base,
+            key.head
+        );
+    }
+    key.base = base;
+    key.head = head;
+    Ok(key)
+}
+
 fn scratch(paths: &Paths, key: &Key) -> Result<Scratch> {
     let dir = paths.state.join("acr-trials").join(new_id());
     fs::create_dir_all(&dir)?;
@@ -596,7 +630,7 @@ fn key_name(key_path: &Path) -> String {
 }
 
 pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Result<Outcome> {
-    let key = read_key(key_path)?;
+    let key = resolved(read_key(key_path)?)?;
     let s = scratch(paths, &key)?;
     let started = Instant::now();
     let ran = match arm {
@@ -691,17 +725,27 @@ mod tests {
             state: dir.join("state"),
             config: dir.join("config.toml"),
         };
+        // Keys name commits the way people write them: short, or by branch.
         let key = Key {
             repo: repo.clone(),
             pr: None,
             base: "main".into(),
-            head: head.clone(),
+            head: head[..8].into(),
             context: "c".into(),
             dimensions: vec!["correctness".into()],
             findings: Vec::new(),
         };
+        let past = Key {
+            base: fixed.clone(),
+            ..key.clone()
+        };
+        let err = resolved(past).unwrap_err().to_string();
+        assert!(err.contains("isn't in the history"), "{err}");
+        let key = resolved(key).unwrap();
+        assert_eq!(key.head, head);
         let s = scratch(&paths, &key).unwrap();
         assert_eq!(rev(&s.tree, "HEAD"), head);
+        assert_eq!(rev(&s.tree, &key.base), rev(&repo, "main"));
         assert_eq!(fs::read_to_string(s.tree.join("a.txt")).unwrap(), "two\n");
         // Named after the repository, so its review config is found.
         assert_eq!(
