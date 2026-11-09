@@ -16,11 +16,15 @@ This method comes from Ray Karnes's essay "The Adversarial Agent Fleet: Trust, b
 
 ## The method
 
-1. **Dimensions.** Use the ones your user chose, and skip any the change can't affect. For each, write what "wrong" means for this change in that dimension.
+1. **Dimensions.** Use the ones your user chose, and skip any the change can't affect. For each, write what "wrong" means for this change in that dimension. Start from the repository's own criteria for it, where it has them, and keep their bar: a reviewer judges by the criteria you give it, and so do you.
 
 2. **Build the strongest version first.** Make the work the version its most capable advocate would stand behind. An attack that survives a strong version tells you something.
 
-3. **Size each reviewer.** Choose its model and effort by what the dimension needs and what a miss would cost. Not one size for all:
+3. **Size the change, then each reviewer.** First size the change as a whole: what it touches, and whether it changes logic.
+   - A **small or mechanical change**, such as a dependency bump, a config or docs edit, a rename, or generated code, gets a light review. Review only the dimensions it can really affect, and say why you skip the rest. Combine its pattern checks into one reviewer. Size down a step from the table below. Tell each reviewer the change is small, so it should attack in proportion: read the change and what it touches, and run something only to settle a claim. Size a dimension up only where the small change touches something costly, such as a trust root, a key or money, and keep that brief narrow.
+   - **Any other change** is sized by the table, dimension by dimension.
+
+   Then choose each reviewer's model and effort by what the dimension needs and what a miss would cost. Not one size for all:
 
    | The dimension needs | Model | Effort |
    | --- | --- | --- |
@@ -42,7 +46,10 @@ This method comes from Ray Karnes's essay "The Adversarial Agent Fleet: Trust, b
 5. **Run a round.** Start one reviewer per open dimension with the Agent tool, passing the model and effort you chose for each. Run at most 5 at once, and start more as slots free up.
 
 6. **Judge.** You rule on every finding, because you know what the change is for:
-   - **Severity:** decide whether it blocks, by what a failure would do in use. A guard whose failure would be silent in production blocks.
+   - **Severity:** decide whether it blocks by what it would cost, in use or to the next person who relies on the work. Judge by the dimension's criteria, which can set a stricter bar.
+     - A guard whose failure would be silent in production blocks.
+     - So does a **false claim the work makes about itself**, when someone would rely on it: a comment, test name, doc or ledger entry, or a guard's stated coverage that says more than the code and tests show. A false "this is tested", "this is demonstrated" or "this stops startup" leaves a gap that nobody will look for.
+     - A reviewer's blocker stands unless you can show it's wrong. "Minor", "pre-existing" and "only a comment" are not reasons. If you think it's real but shouldn't block, record that as a disagreement for your user, with both sides, and leave it a blocker until they rule.
    - **Fold** each blocker into the work, making it stronger.
    - **Reject** with a recorded reason. A rejection is a disagreement, not a resolution.
    - Merge findings that are the same defect.

@@ -872,6 +872,33 @@ impl Drop for AllowedFor<'_> {
     }
 }
 
+/// What each lens means in the repository at `tree`, from its review config,
+/// for a trial's builder, which is otherwise told only the dimensions. Empty
+/// if the repository has none.
+fn lens_criteria(paths: &Paths, tree: &Path, key: &trial::Key) -> Vec<(String, String)> {
+    let target = Target {
+        repo: tree.to_path_buf(),
+        base: key.base.clone(),
+        config: None,
+        head: Some(key.head.clone()),
+        human_gate: None,
+        max_rounds: None,
+        review_scope: None,
+        bindings: Vec::new(),
+    };
+    match load_config(paths, &target, &flags(&target)) {
+        Ok((cfg, _)) => cfg
+            .lenses
+            .iter()
+            .map(|l| (l.id.clone(), l.criteria.clone()))
+            .collect(),
+        Err(e) => {
+            eprintln!("tailbus: no review criteria for the builder: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 /// The separate-roles design on a trial's worktree.
 fn separated(paths: &Paths, tree: &Path, key: &trial::Key) -> Result<trial::Ran> {
     let target = Target {

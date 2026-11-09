@@ -332,7 +332,20 @@ pub fn last_json(text: &str) -> Option<Value> {
     found
 }
 
-fn builder_prompt(key: &Key, arm: Arm, result: &Path) -> String {
+/// The dimensions, each with what wrong means for it in this repository,
+/// where its review config says.
+fn dimensions_text(key: &Key, criteria: &[(String, String)]) -> String {
+    key.dimensions
+        .iter()
+        .map(|d| match criteria.iter().find(|(id, _)| id == d) {
+            Some((_, c)) => format!("- {d}: {}", c.trim()),
+            None => format!("- {d}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn builder_prompt(key: &Key, arm: Arm, result: &Path, criteria: &[(String, String)]) -> String {
     let sizing = match arm {
         Arm::OneSize => {
             "Run every reviewer on opus at xhigh effort, whatever its dimension: this trial \
@@ -345,7 +358,8 @@ fn builder_prompt(key: &Key, arm: Arm, result: &Path) -> String {
          HEAD is {head}.\n\n\
          What it's for:\n{context}\n\n\
          Review it with the acr skill: load it with the Skill tool and follow it. The \
-         dimensions are: {dimensions}. {sizing}\n\n\
+         dimensions, each with this repository's criteria for it where it has them, which \
+         set its bar:\n{dimensions}\n\n{sizing}\n\n\
          Run round 1 only: brief the reviewers, run them, and judge what they find. Fix \
          nothing, and change nothing in this working directory.\n\n\
          Then write your judged findings as JSON to {result}, in this shape:\n\
@@ -356,7 +370,7 @@ fn builder_prompt(key: &Key, arm: Arm, result: &Path) -> String {
         base = key.base,
         head = key.head,
         context = key.context.trim(),
-        dimensions = key.dimensions.join(", "),
+        dimensions = dimensions_text(key, criteria),
         result = result.display(),
     )
 }
@@ -369,7 +383,8 @@ fn builder_led(paths: &Paths, s: &Scratch, key: &Key, arm: Arm) -> Result<Ran> {
     fs::create_dir_all(&skill)?;
     fs::write(skill.join("SKILL.md"), SKILL)?;
     let result = s.dir.join("result.json");
-    let prompt = builder_prompt(key, arm, &result);
+    let criteria = super::lens_criteria(paths, &s.tree, key);
+    let prompt = builder_prompt(key, arm, &result, &criteria);
     claude(
         paths,
         &config,
@@ -586,9 +601,16 @@ mod tests {
             dimensions: vec!["correctness".into(), "regression-safety".into()],
             findings: Vec::new(),
         };
-        let one = builder_prompt(&key, Arm::OneSize, Path::new("/s/result.json"));
-        assert!(one.contains("opus at xhigh") && one.contains("correctness, regression-safety"));
-        let sized = builder_prompt(&key, Arm::Sized, Path::new("/s/result.json"));
+        let criteria = [(
+            "correctness".to_string(),
+            "Comments claim only what the code does.".to_string(),
+        )];
+        let one = builder_prompt(&key, Arm::OneSize, Path::new("/s/result.json"), &criteria);
+        assert!(one.contains("opus at xhigh"));
+        assert!(one.contains(
+            "- correctness: Comments claim only what the code does.\n- regression-safety"
+        ));
+        let sized = builder_prompt(&key, Arm::Sized, Path::new("/s/result.json"), &[]);
         assert!(sized.contains("Size each reviewer") && !sized.contains("xhigh"));
         assert!(sized.contains("b..HEAD") && sized.contains("/s/result.json"));
         assert!(sized.contains("Sends a welcome email once."));
