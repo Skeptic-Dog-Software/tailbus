@@ -94,9 +94,6 @@ pub enum AcrCmd {
     },
     /// Print the published schema.
     Schema,
-    /// Measure review designs on a change whose findings are known: blind,
-    /// with nobody in the loop, leaving nothing behind. Prints each design's
-    /// result as a line of JSON.
     /// Score saved trials of new work, once its own review has filled in the
     /// key's findings.
     Rescore {
@@ -105,6 +102,9 @@ pub enum AcrCmd {
         #[arg(long)]
         results: PathBuf,
     },
+    /// Measure review designs on a change, blind, with nobody in the loop,
+    /// leaving nothing behind. Prints each design's result as a line of
+    /// JSON, scored against the key's findings when it has them.
     Trial {
         /// The answer key: the change, what it's for, and what an earlier
         /// review found. For new work, leave the findings out: the trials
