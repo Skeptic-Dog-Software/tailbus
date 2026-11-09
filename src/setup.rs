@@ -723,6 +723,8 @@ const TOOLCHAINS: &[&str] = &[
     ".cargo",
     ".rustup",
     ".npm",
+    "Library/Android/sdk",
+    "Android/Sdk",
 ];
 
 /// The confinement settings for this home folder:
@@ -731,12 +733,16 @@ const TOOLCHAINS: &[&str] = &[
 /// - the toolchains that exist here stay usable;
 /// - commands reach only package registries.
 fn confine_settings(home: &Path) -> String {
-    let toolchains: Vec<String> = TOOLCHAINS
+    let mut toolchains: Vec<String> = TOOLCHAINS
         .iter()
         .map(|t| home.join(t))
+        .chain(go_caches(home))
+        .chain(flutter_sdks(home))
         .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
+    toolchains.sort();
+    toolchains.dedup();
     let settings = serde_json::json!({
         "permissions": {
             "blockReadsOutsideWorkingDirectories": true,
@@ -752,6 +758,10 @@ fn confine_settings(home: &Path) -> String {
                 "allowWrite": toolchains
             },
             "network": {
+                // Test runners, such as Flutter's, listen on localhost.
+                "allowLocalBinding": true,
+                // Certificate checks, so a download that's allowed works.
+                "allowMachLookup": ["com.apple.trustd*", "com.apple.SecurityServer"],
                 "allowedDomains": [
                     "pub.dev", "*.pub.dev", "storage.googleapis.com",
                     "proxy.golang.org", "sum.golang.org",
@@ -831,6 +841,58 @@ model = "message.model"
         confine = p(confine),
         path = q(path),
     )
+}
+
+/// Where Go keeps its modules and build cache, and the file of settings that
+/// can move them, if Go is installed and they're under home: Go says, since
+/// GOPATH can be anywhere. Without its settings file, Go would look for its
+/// modules in the default place and try to download them.
+fn go_caches(home: &Path) -> Vec<PathBuf> {
+    let go = [
+        "/opt/homebrew/bin/go",
+        "/usr/local/go/bin/go",
+        "/usr/local/bin/go",
+        "/usr/bin/go",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|p| p.is_file());
+    let Some(out) = go.and_then(|go| {
+        Command::new(go)
+            .args(["env", "GOMODCACHE", "GOCACHE", "GOPATH", "GOENV"])
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+    }) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(PathBuf::from)
+        // GOENV is a file: its folder is what to open.
+        .map(|p| match p.file_name() {
+            Some(n) if n == "env" => p.parent().map(Path::to_path_buf).unwrap_or(p),
+            _ => p,
+        })
+        .filter(|p| p.starts_with(home))
+        .collect()
+}
+
+/// The SDKs Flutter's own settings point it at, under home: it lists the
+/// Android SDK's folders when it starts, even to run host tests.
+fn flutter_sdks(home: &Path) -> Vec<PathBuf> {
+    let Ok(text) = fs::read_to_string(home.join(".config/flutter/settings")) else {
+        return Vec::new();
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    ["android-sdk", "jdk-dir"]
+        .iter()
+        .filter_map(|k| settings[*k].as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.starts_with(home))
+        .collect()
 }
 
 /// Adds `--settings <confine>` to an existing ACR bridge's arguments, if it
