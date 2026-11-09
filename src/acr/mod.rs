@@ -111,15 +111,16 @@ pub enum AcrCmd {
     AddRepo {
         /// The repository's top folder.
         path: PathBuf,
-        /// The bridge ACR reaches its models through here.
+        /// The bridge ACR reaches its models through here. Not `agent`, which
+        /// the global `--as` and `TAILBUS_AGENT` would fill.
         #[arg(long, default_value = crate::setup::ACR_AGENT)]
-        agent: String,
+        bridge: String,
     },
     /// Stop allowing ACR to review a repository on this machine.
     RemoveRepo {
         path: PathBuf,
         #[arg(long, default_value = crate::setup::ACR_AGENT)]
-        agent: String,
+        bridge: String,
     },
     /// Show the tier, lenses, bindings and cost, with no model calls.
     Plan {
@@ -691,8 +692,10 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
     keep::prune(paths);
     match command {
         AcrCmd::Schema => print!("{SCHEMA}"),
-        AcrCmd::AddRepo { path, agent } => crate::setup::acr_repo(paths, &path, true, &agent)?,
-        AcrCmd::RemoveRepo { path, agent } => crate::setup::acr_repo(paths, &path, false, &agent)?,
+        AcrCmd::AddRepo { path, bridge } => crate::setup::acr_repo(paths, &path, true, &bridge)?,
+        AcrCmd::RemoveRepo { path, bridge } => {
+            crate::setup::acr_repo(paths, &path, false, &bridge)?
+        }
         AcrCmd::Validate { file, repo, base } => {
             let user = config::load_user(&user_config_path(paths))?;
             let (text, source) = repo_layer(paths, &repo, base.as_deref(), file.as_deref())?;

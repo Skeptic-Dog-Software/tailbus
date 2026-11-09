@@ -51,7 +51,7 @@ alone whatever's there already, so running it again is safe:
 - **The bridge's service**, started now and at every login.
 
 `tailbus acr add-repo` and `remove-repo` change which repositories ACR may
-review here, and restart the bridge; `--agent` names a bridge other than
+review here, and restart the bridge; `--bridge` names a bridge other than
 `claude-acr`, such as one set up by hand.
 
 **Updates wait.** `tailbus service install` and `tailbus bridge install`,

@@ -40,12 +40,28 @@ pub struct Key {
     pub repo: PathBuf,
     #[serde(default)]
     pub pr: Option<u64>,
+    #[serde(deserialize_with = "commit")]
     pub base: String,
+    #[serde(deserialize_with = "commit")]
     pub head: String,
     /// What the change is for: all a trial's builder is told.
     pub context: String,
     pub dimensions: Vec<String>,
     pub findings: Vec<KeyFinding>,
+}
+
+/// A commit, which YAML reads as a number when it's all digits.
+fn commit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Text(String),
+        Number(u64),
+    }
+    Ok(match Either::deserialize(d)? {
+        Either::Text(s) => s,
+        Either::Number(n) => n.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,10 +115,16 @@ pub struct Counts {
 pub struct Matched {
     pub id: String,
     pub blocker: bool,
+    /// The earlier review found it only after round 1.
+    pub found_later: bool,
     pub caught: bool,
     pub as_blocker: bool,
 }
 
+/// What a design caught of the key. The main counts are against what the
+/// earlier review found in its own round 1; `later_` counts are for defects
+/// already there that it found only in later rounds, which a round-1 trial
+/// may or may not catch.
 #[derive(Debug, Clone, Serialize)]
 pub struct Score {
     pub blockers: usize,
@@ -111,6 +133,11 @@ pub struct Score {
     pub blockers_held: usize,
     pub non_blockers: usize,
     pub non_blockers_caught: usize,
+    pub later_blockers: usize,
+    pub later_blockers_caught: usize,
+    pub later_blockers_held: usize,
+    pub later_non_blockers: usize,
+    pub later_non_blockers_caught: usize,
     /// Findings that match nothing in the key, which the scorer thought real.
     pub extra_plausible: usize,
     /// And those it thought noise.
@@ -427,6 +454,7 @@ fn score(paths: &Paths, s: &Scratch, key: &Key, found: &[Found]) -> Result<Score
         per_finding.push(Matched {
             id: f.id.clone(),
             blocker: f.blocker,
+            found_later: f.found_later,
             caught,
             as_blocker,
         });
@@ -436,18 +464,23 @@ fn score(paths: &Paths, s: &Scratch, key: &Key, found: &[Found]) -> Result<Score
         .iter()
         .filter(|e| e["plausible"].as_bool() == Some(true))
         .count();
-    let count = |blocker: bool, test: &dyn Fn(&Matched) -> bool| {
+    let count = |blocker: bool, later: bool, test: &dyn Fn(&Matched) -> bool| {
         per_finding
             .iter()
-            .filter(|m| m.blocker == blocker && test(m))
+            .filter(|m| m.blocker == blocker && m.found_later == later && test(m))
             .count()
     };
     Ok(Score {
-        blockers: count(true, &|_| true),
-        blockers_caught: count(true, &|m| m.caught),
-        blockers_held: count(true, &|m| m.as_blocker),
-        non_blockers: count(false, &|_| true),
-        non_blockers_caught: count(false, &|m| m.caught),
+        blockers: count(true, false, &|_| true),
+        blockers_caught: count(true, false, &|m| m.caught),
+        blockers_held: count(true, false, &|m| m.as_blocker),
+        non_blockers: count(false, false, &|_| true),
+        non_blockers_caught: count(false, false, &|m| m.caught),
+        later_blockers: count(true, true, &|_| true),
+        later_blockers_caught: count(true, true, &|m| m.caught),
+        later_blockers_held: count(true, true, &|m| m.as_blocker),
+        later_non_blockers: count(false, true, &|_| true),
+        later_non_blockers_caught: count(false, true, &|m| m.caught),
         extra_plausible: plausible,
         extra_noise: extra.len() - plausible,
         per_finding,
@@ -498,6 +531,31 @@ mod tests {
         let v = last_json(text).unwrap();
         assert_eq!(v["key"][0]["id"], "x");
         assert!(last_json("no json here").is_none());
+    }
+
+    #[test]
+    fn a_key_takes_commits_quoted_or_not() {
+        let text = [
+            "repo: /r",
+            "base: 3055453",
+            "head: \"5ad8c13\"",
+            "context: c",
+            "dimensions: [correctness]",
+            "findings:",
+            "  - id: a",
+            "    blocker: true",
+            "    dimension: correctness",
+            "    what: w",
+            "    found_later: true",
+        ]
+        .join("\n");
+        let text = text.as_str();
+        let key: Key = serde_yaml_ng::from_str(text).unwrap();
+        assert_eq!(
+            (key.base.as_str(), key.head.as_str()),
+            ("3055453", "5ad8c13")
+        );
+        assert!(key.findings[0].found_later);
     }
 
     #[test]
