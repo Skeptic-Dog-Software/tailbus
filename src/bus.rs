@@ -15,7 +15,7 @@ use crate::ask::{self, Asks, Prompt};
 use crate::attach::Attachments;
 use crate::config::Config;
 use crate::format;
-use crate::local::{Awaited, Event, Inbox, Item, PeerMachine, Peers, Sent};
+use crate::local::{Awaited, Event, Inbox, Item, Moved, PeerMachine, Peers, Sent};
 use crate::net;
 use crate::proto::{
     AgentInfo, AgentList, Billing, Estimate, Extras, MAX_BATCH, MAX_BODY, Message, MessageBatch,
@@ -416,9 +416,6 @@ impl Bus {
 
     // Sessions.
 
-    /// Claims `agent` for a session, unless another live session holds it.
-    /// The same session may claim it again. (Matching on the app's process
-    /// is only for hooks: one Codex server can host many sessions.)
     /// Removes an agent nobody holds. What was waiting for it goes stale, and
     /// its senders hear. Returns how many messages that was.
     pub fn remove_agent(&self, name: &str) -> Result<usize> {
@@ -446,6 +443,57 @@ impl Bus {
         Ok(waiting.len())
     }
 
+    /// Moves agent `from`, which nobody holds, to the name `to`: its queue,
+    /// its history and the requests it's awaiting answers to go with it, and
+    /// `from` leaves every machine's peer list. Nothing goes stale, and what
+    /// still comes for `from` reaches `to`. Says how many messages were
+    /// waiting, and what config still names `from`.
+    pub fn move_agent(&self, from: &str, to: &str) -> Result<Moved> {
+        for name in [from, to] {
+            if !valid_name(name) {
+                bail!("{name:?} isn't a valid agent name");
+            }
+        }
+        if from == to {
+            bail!("{from} already has that name");
+        }
+        if let Some(h) = lock(&self.live).holders.get(from) {
+            bail!(
+                "a live session holds {from} ({}, process {}). End it, then start it as {to}: \
+                 a conversation resumed under a new name moves on its own",
+                h.app.as_deref().unwrap_or("unknown app"),
+                h.client_pid
+            );
+        }
+        let moved = self.db().move_agent(from, to, now_ms())?;
+        let Some(waiting) = moved else {
+            bail!("there's no agent {from} on this machine");
+        };
+        self.notify();
+        self.event(format!(
+            "{from}: moved to {to}, with {waiting} waiting message(s)"
+        ));
+        let mut notes = Vec::new();
+        if let Some(client) = self.cfg.clients.get(from) {
+            notes.push(format!(
+                "config.toml's [clients] still makes {from} {client}'s worker; \
+                 move that line to {to}"
+            ));
+        }
+        if self.cfg.bridges.contains_key(from) {
+            notes.push(format!(
+                "config.toml still has [bridges.{from}], which takes the name back \
+                 when that bridge starts; rename the table and reinstall the bridge"
+            ));
+        }
+        Ok(Moved { waiting, notes })
+    }
+
+    /// Claims `agent` for a session, unless another live session holds it.
+    /// The same session may claim it again. (Matching on the app's process
+    /// is only for hooks: one Codex server can host many sessions.) A name
+    /// the session held before, such as when a conversation is resumed
+    /// under a new one, moves to `agent` if nobody holds it now.
     pub fn hold(&self, agent: &str, claim: &Claim) -> Result<Result<u64, String>> {
         let Claim {
             session,
@@ -491,7 +539,17 @@ impl Bus {
         }
         drop(live);
         self.notify();
-        self.db().agent_live(agent, app, now_ms())?;
+        self.db().agent_held(agent, app, Some(session), now_ms())?;
+        // Bound first, so the database isn't still held while names move.
+        let before = self.db().names_of_session(session, agent)?;
+        for old in before {
+            if lock(&self.live).holders.contains_key(&old) {
+                continue;
+            }
+            if let Err(e) = self.move_agent(&old, agent) {
+                self.event(format!("{old}: couldn't move to {agent}: {e:#}"));
+            }
+        }
         let mut about = app.unwrap_or("unknown app").to_string();
         if let Some(billing) = claim.billing {
             about.push_str(&format!(", billed to {billing}"));
@@ -2396,6 +2454,144 @@ pub(crate) mod tests {
         let err = format!("{:#}", bus.remove_agent("busy").unwrap_err());
         assert!(err.contains("live session"), "{err}");
         assert!(bus.db().has_agent("busy").unwrap());
+    }
+
+    #[test]
+    fn a_moved_agent_keeps_its_messages_and_its_old_name_leads_to_it() {
+        let bus = bus_on("here", 1, "");
+        bus.db().add_agent("sim", 1).unwrap();
+        bus.db().add_agent("old", 1).unwrap();
+        let asked = bus
+            .send("sim", "old", "still there?".into(), None, Some(true), None)
+            .unwrap();
+        let asking = bus
+            .send("old", "sim", "what's next?".into(), None, Some(true), None)
+            .unwrap();
+        let moved = bus.move_agent("old", "new").unwrap();
+        assert_eq!(moved.waiting, 1);
+        assert!(moved.notes.is_empty());
+        assert!(!bus.db().has_agent("old").unwrap());
+        let names: Vec<String> = bus
+            .agent_list()
+            .unwrap()
+            .agents
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert!(names.contains(&"new".to_string()), "{names:?}");
+        assert!(!names.contains(&"old".to_string()), "{names:?}");
+        // What waited for it is the new name's, addressed to it, and nothing
+        // went stale.
+        let open = bus.db().open_incoming("new").unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].msg.id, asked.id);
+        assert_eq!(open[0].msg.to, "new@here");
+        let out = bus.db().outgoing(&asked.id).unwrap().unwrap();
+        assert_ne!(out.state, SendState::Stale);
+        // The new name can answer it by reply_to alone.
+        bus.send("new", "", "yes".into(), Some(asked.id.clone()), None, None)
+            .unwrap();
+        assert!(bus.db().reply_for("sim", &asked.id).unwrap().is_some());
+        // A reply to what it asked under its old name reaches it.
+        bus.send(
+            "sim",
+            "",
+            "this".into(),
+            Some(asking.id.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+        let reply = bus.db().reply_for("new", &asking.id).unwrap().unwrap();
+        assert_eq!(reply.msg.to, "new@here");
+        // So does a new message to the old name. (Answering the first
+        // acknowledged it.)
+        bus.send("sim", "old", "and this?".into(), None, Some(true), None)
+            .unwrap();
+        let open: Vec<String> = bus
+            .db()
+            .open_incoming("new")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.msg.body)
+            .collect();
+        assert_eq!(open, ["this", "and this?"]);
+        // Moving again takes the old name along, and moving back frees it.
+        bus.move_agent("new", "newer").unwrap();
+        assert_eq!(
+            bus.db().now_called("old").unwrap().as_deref(),
+            Some("newer")
+        );
+        bus.move_agent("newer", "old").unwrap();
+        assert_eq!(bus.db().now_called("old").unwrap(), None);
+        assert!(bus.db().has_agent("old").unwrap());
+        // Once the old name is used again, it's its own.
+        bus.move_agent("old", "new").unwrap();
+        bus.db().add_agent("old", 2).unwrap();
+        bus.send("sim", "old", "you again?".into(), None, Some(true), None)
+            .unwrap();
+        assert_eq!(bus.db().open_incoming("old").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn moving_an_agent_needs_one_nobody_holds() {
+        let bus = bus_on("here", 1, "");
+        bus.db().add_agent("busy", 1).unwrap();
+        let claim = Claim {
+            session: "s1",
+            app: Some("claude-code"),
+            client_pid: 100,
+            ..Claim::default()
+        };
+        bus.hold("busy", &claim).unwrap().unwrap();
+        let err = format!("{:#}", bus.move_agent("busy", "other").unwrap_err());
+        assert!(err.contains("live session"), "{err}");
+        assert!(bus.db().has_agent("busy").unwrap());
+        assert!(bus.move_agent("nobody", "other").is_err());
+        assert!(bus.move_agent("busy", "busy").is_err());
+        assert!(bus.move_agent("busy", "Not A Name").is_err());
+    }
+
+    #[test]
+    fn a_session_resumed_under_a_new_name_moves_its_old_one() {
+        let bus = bus_on("here", 1, "");
+        bus.db().add_agent("sim", 1).unwrap();
+        let claim = |session| Claim {
+            session,
+            app: Some("claude-code"),
+            client_pid: 100,
+            ..Claim::default()
+        };
+        let token = bus.hold("old", &claim("s1")).unwrap().unwrap();
+        bus.release("old", token);
+        bus.send("sim", "old", "still there?".into(), None, Some(true), None)
+            .unwrap();
+        // Another session's name stays put.
+        let other = bus.hold("other", &claim("s2")).unwrap().unwrap();
+        bus.release("other", other);
+        bus.hold("new", &claim("s1")).unwrap().unwrap();
+        assert!(!bus.db().has_agent("old").unwrap());
+        assert_eq!(bus.db().open_incoming("new").unwrap().len(), 1);
+        assert!(bus.db().has_agent("other").unwrap());
+        // A name the session still holds isn't moved.
+        bus.hold("both", &claim("s3")).unwrap().unwrap();
+        bus.hold("also", &claim("s3")).unwrap().unwrap();
+        assert!(bus.db().has_agent("both").unwrap());
+    }
+
+    #[test]
+    fn an_old_name_stops_leading_anywhere_after_the_retention() {
+        let bus = bus_on("here", 1, "retention_days = 0");
+        bus.db().add_agent("sim", 1).unwrap();
+        bus.db().add_agent("old", 1).unwrap();
+        bus.move_agent("old", "new").unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        bus.prune();
+        assert_eq!(bus.db().now_called("old").unwrap(), None);
+        assert!(
+            bus.send("sim", "old", "hello?".into(), None, Some(true), None)
+                .is_err()
+        );
     }
 
     #[test]

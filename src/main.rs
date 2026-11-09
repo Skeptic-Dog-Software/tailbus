@@ -34,7 +34,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::Paths;
 use crate::format::Tools;
-use crate::local::{Client, Events, Inbox, Peers, Request, Sent, Status, Thread};
+use crate::local::{Client, Events, Inbox, Moved, Peers, Request, Sent, Status, Thread};
 use crate::proto::{AgentList, RunOptions};
 use crate::util::{derive_agent_name, normalize_name, rfc3339, valid_name};
 
@@ -201,6 +201,18 @@ enum AgentCmd {
     /// stale, and their senders hear.
     #[command(alias = "remove")]
     Rm { name: String },
+    /// Move an agent to a new name, such as after starting its session
+    /// again as another. Its messages, history and open requests go with it,
+    /// nothing goes stale, and the old name leaves every peer list. Replies
+    /// and messages still sent to the old name reach the new one.
+    #[command(alias = "migrate")]
+    Mv {
+        /// The name it had.
+        from: String,
+        /// The name it has now. Left out, the agent you act as (`--as` or
+        /// TAILBUS_AGENT), as in that agent's own session.
+        to: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -522,6 +534,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 let removed = call(&Request::AgentRemove { name: name.clone() })?;
                 let stale = removed["stale"].as_u64().unwrap_or(0);
                 println!("Removed {name}; {stale} message(s) waiting for it went stale.");
+            }
+            AgentCmd::Mv { from, to } => {
+                let Some(to) = to.or_else(|| cli.agent.clone()) else {
+                    bail!(
+                        "say what {from} is called now: tailbus agent mv {from} <name>, \
+                         or run it in that agent's session"
+                    );
+                };
+                let to = agent_name(Some(to))?;
+                let moved: Moved = local::call(
+                    &socket,
+                    &Request::AgentMove {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                )?;
+                println!(
+                    "Moved {from} to {to}, with {} waiting message(s). {from} is gone from \
+                     every peer list, and what's still sent to it reaches {to}.",
+                    moved.waiting
+                );
+                for note in moved.notes {
+                    println!("Note: {note}");
+                }
             }
             AgentCmd::List => {
                 let list: AgentList = local::call(&socket, &Request::Agents)?;

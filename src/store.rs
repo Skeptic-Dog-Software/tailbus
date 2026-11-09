@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS receipts (
     attempts INTEGER NOT NULL DEFAULT 0,
     next_try INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS formerly (
+    name TEXT PRIMARY KEY,
+    now  TEXT NOT NULL,
+    at   INTEGER NOT NULL
+);
 ";
 
 pub struct Store {
@@ -214,6 +219,14 @@ pub fn machine_part(addr: &str) -> &str {
 }
 
 /// The name part of `name@machine`.
+/// `addr` with its name part replaced by `name`.
+fn readdressed(addr: &str, name: &str) -> String {
+    match addr.find('@') {
+        Some(i) => format!("{name}{}", &addr[i..]),
+        None => name.to_string(),
+    }
+}
+
 pub fn name_part(addr: &str) -> &str {
     addr.split_once('@').map_or(addr, |(n, _)| n)
 }
@@ -271,6 +284,7 @@ impl Store {
             ("inbox", "ext", "TEXT"),
             ("sent", "ext", "TEXT"),
             ("inbox", "stale_at", "INTEGER"),
+            ("agents", "session", "TEXT"),
         ] {
             let has = db
                 .prepare(&format!(
@@ -288,6 +302,7 @@ impl Store {
 
     /// Subscribes `name`. Returns whether it's new.
     pub fn add_agent(&self, name: &str, now: i64) -> Result<bool> {
+        self.reclaim(name)?;
         let n = self.db.execute(
             "INSERT OR IGNORE INTO agents (name, created_at) VALUES (?1, ?2)",
             params![name, now],
@@ -327,15 +342,111 @@ impl Store {
             .is_some())
     }
 
-    /// Records that a session holds `name` now, subscribing it if needed.
+    /// Records that `name` is in use now, subscribing it if needed.
     pub fn agent_live(&self, name: &str, app: Option<&str>, now: i64) -> Result<()> {
+        self.agent_held(name, app, None, now)
+    }
+
+    /// Records that a session holds `name` now, subscribing it if needed,
+    /// and which session, when that's known.
+    pub fn agent_held(
+        &self,
+        name: &str,
+        app: Option<&str>,
+        session: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        self.reclaim(name)?;
         self.db.execute(
-            "INSERT INTO agents (name, created_at, app, last_live) VALUES (?1, ?2, ?3, ?2)
+            "INSERT INTO agents (name, created_at, app, last_live, session)
+             VALUES (?1, ?2, ?3, ?2, ?4)
              ON CONFLICT (name) DO UPDATE
-             SET app = coalesce(excluded.app, app), last_live = excluded.last_live",
-            params![name, now, app],
+             SET app = coalesce(excluded.app, app), last_live = excluded.last_live,
+                 session = coalesce(excluded.session, session)",
+            params![name, now, app, session],
         )?;
         Ok(())
+    }
+
+    /// A name an agent moved away from is free again once it's used.
+    fn reclaim(&self, name: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM formerly WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    /// The other names a session held before `name`.
+    pub fn names_of_session(&self, session: &str, name: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT name FROM agents WHERE session = ?1 AND name != ?2 ORDER BY name")?;
+        let rows = stmt.query_map([session, name], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// What the agent once called `name` is called now, if it moved.
+    pub fn now_called(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row("SELECT now FROM formerly WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Moves agent `from` to the name `to`, subscribing `to` if needed. Its
+    /// queue, its history and the requests it's awaiting answers to go with
+    /// it, readdressed, and `from` is no longer an agent here. Messages that
+    /// still come for `from`, such as replies, go to `to` until the name is
+    /// used again or the retention passes. Returns how many messages were
+    /// waiting, or None if there's no agent `from`.
+    pub fn move_agent(&mut self, from: &str, to: &str, now: i64) -> Result<Option<usize>> {
+        let tx = self.db.transaction()?;
+        let has = tx
+            .query_row("SELECT 1 FROM agents WHERE name = ?1", [from], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !has {
+            return Ok(None);
+        }
+        let waiting: i64 = tx.query_row(
+            "SELECT count(*) FROM inbox WHERE agent = ?1 AND acked_at IS NULL",
+            [from],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO agents (name, created_at, app, last_live, session)
+             SELECT ?2, created_at, app, last_live, session FROM agents WHERE name = ?1",
+            params![from, to],
+        )?;
+        // An address keeps its machine and takes the new name.
+        tx.execute(
+            "UPDATE inbox SET agent = ?2, recipient = CASE
+                 WHEN instr(recipient, '@') > 0 THEN ?2 || substr(recipient, instr(recipient, '@'))
+                 ELSE ?2 END
+             WHERE agent = ?1",
+            params![from, to],
+        )?;
+        tx.execute(
+            "UPDATE sent SET agent = ?2, sender = CASE
+                 WHEN instr(sender, '@') > 0 THEN ?2 || substr(sender, instr(sender, '@'))
+                 ELSE ?2 END
+             WHERE agent = ?1",
+            params![from, to],
+        )?;
+        tx.execute("DELETE FROM agents WHERE name = ?1", [from])?;
+        // Older names follow, and a name moved back to is its own again.
+        tx.execute(
+            "UPDATE formerly SET now = ?2 WHERE now = ?1",
+            params![from, to],
+        )?;
+        tx.execute("DELETE FROM formerly WHERE name = ?1", [to])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO formerly (name, now, at) VALUES (?1, ?2, ?3)",
+            params![from, to, now],
+        )?;
+        tx.commit()?;
+        Ok(Some(waiting as usize))
     }
 
     pub fn agents(&self) -> Result<Vec<AgentRow>> {
@@ -357,9 +468,16 @@ impl Store {
     /// Appends a message to `agent`'s queue. A message seen before is
     /// left as it is.
     pub fn store_incoming(&self, msg: &Message, owner: &str, now: i64) -> Result<Stored> {
-        let agent = name_part(&msg.to);
-        if !self.has_agent(agent)? {
-            return Ok(Stored::UnknownAgent);
+        let mut agent = name_part(&msg.to).to_string();
+        let mut recipient = msg.to.clone();
+        if !self.has_agent(&agent)? {
+            // Its agent may have moved to another name.
+            let current = match self.now_called(&agent)? {
+                Some(current) if self.has_agent(&current)? => current,
+                _ => return Ok(Stored::UnknownAgent),
+            };
+            recipient = readdressed(&msg.to, &current);
+            agent = current;
         }
         // The recipient's own messages are in this machine's sent history,
         // so whether a reply answers one of its requests is known here.
@@ -380,7 +498,7 @@ impl Store {
                 msg.id,
                 agent,
                 msg.from,
-                msg.to,
+                recipient,
                 owner,
                 msg.body,
                 msg.reply_to,
@@ -911,10 +1029,10 @@ impl Store {
         Ok(out)
     }
 
-    /// Deletes acknowledged and failed messages, and stuck receipts, older
-    /// than `before`. Messages that aren't acknowledged are kept however old.
-    /// Deletes finished messages from before `before`, and stale ones that
-    /// went stale before `stale_before`.
+    /// Deletes acknowledged and failed messages, stuck receipts and moved
+    /// agents' old names from before `before`, and stale messages that went
+    /// stale before `stale_before`. Messages that aren't acknowledged are
+    /// kept however old, until they go stale.
     pub fn prune(&self, before: i64, stale_before: i64) -> Result<usize> {
         let mut n = self.db.execute(
             "DELETE FROM inbox WHERE acked_at IS NOT NULL AND acked_at < ?1",
@@ -935,6 +1053,11 @@ impl Store {
         n += self
             .db
             .execute("DELETE FROM receipts WHERE at < ?1", [before])?;
+        // A moved agent's old name stops leading to it once nothing could
+        // still be answering it.
+        n += self
+            .db
+            .execute("DELETE FROM formerly WHERE at < ?1", [before])?;
         if n > 0 {
             // It frees a page each step, so it's stepped to the end.
             let mut vacuum = self.db.prepare("PRAGMA incremental_vacuum")?;

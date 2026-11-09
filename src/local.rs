@@ -159,6 +159,12 @@ pub enum Request {
     AgentRemove {
         name: String,
     },
+    /// Moves an agent nobody holds to a new name, taking its messages with
+    /// it. The reply is a `Moved`.
+    AgentMove {
+        from: String,
+        to: String,
+    },
     Agents,
     Peers,
     Status,
@@ -166,6 +172,15 @@ pub enum Request {
     Tail {
         after: u64,
     },
+}
+
+/// What moving an agent did: how many messages were waiting, and what in
+/// config still names the old name.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Moved {
+    pub waiting: usize,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// The daemon's answer was no, as opposed to there being no answer.

@@ -62,7 +62,8 @@ anyway reconnects and picks up its reply. On Linux, services are systemd user
 units, which stop when you log out unless you `sudo loginctl enable-linger
 $USER`.
 
-`tailbus status` shows whether the bus is up and listening on the tailnet. `tailbus agent rm <name>` removes an agent nobody uses any more: messages
+`tailbus status` shows whether the bus is up and listening on the tailnet.
+`tailbus agent rm <name>` removes an agent nobody uses any more: messages
 waiting for it go stale, and their senders are told.
 Restart open Claude Code sessions to load the plugin, and again after
 updating tailbus. `/reload-plugins` isn't enough after an update: it
@@ -94,6 +95,22 @@ Only one live session can hold a name at a time. A second session with the
 same name is refused, and has to choose a name of its own. An agent's
 messages wait in its queue between sessions. `tailbus agent add <name>`
 creates a queue before the agent's first session.
+
+**Renaming an agent.** Resume a conversation under a new name, with
+`TAILBUS_AGENT=new claude --resume <session>`, and the old name moves to the
+new one on its own: the session keeps its ID, which is how tailbus knows it's
+the same agent. `--continue` gives a conversation a new ID, so after that, or
+for a new session, run `tailbus agent mv <old>` in the session, or
+`tailbus agent mv <old> <new>` anywhere on that machine. Either way:
+
+- The agent's waiting messages, its history and the requests it's awaiting
+  answers to go to the new name, so nothing goes stale.
+- The old name leaves every machine's peer list.
+- Replies and messages still sent to the old name reach the new one until the
+  name is used again, or for `retention_days`.
+- A session that still holds the old name has to end first.
+- Another machine's `/pipe` worker still knows the task's sender by the old
+  name, so approve or cancel a task in flight before renaming.
 
 ## In Claude Code
 
