@@ -48,6 +48,9 @@ pub struct Key {
     /// What the change is for: all a trial's builder is told.
     pub context: String,
     pub dimensions: Vec<String>,
+    /// What review found. Left out for new work, whose trials run before
+    /// its own review, and which is scored once that review is done.
+    #[serde(default)]
     pub findings: Vec<KeyFinding>,
 }
 
@@ -77,7 +80,7 @@ pub struct KeyFinding {
     pub found_later: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Arm {
     /// Builder-led, every reviewer at one size.
@@ -103,7 +106,7 @@ pub struct Found {
     pub blocker: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Counts {
     pub input: u64,
     pub output: u64,
@@ -112,7 +115,7 @@ pub struct Counts {
     pub total: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Matched {
     pub id: String,
     pub blocker: bool,
@@ -126,7 +129,7 @@ pub struct Matched {
 /// earlier review found in its own round 1; `later_` counts are for defects
 /// already there that it found only in later rounds, which a round-1 trial
 /// may or may not catch.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Score {
     pub blockers: usize,
     pub blockers_caught: usize,
@@ -146,7 +149,7 @@ pub struct Score {
     pub per_finding: Vec<Matched>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outcome {
     pub key: String,
     pub pr: Option<u64>,
@@ -155,7 +158,11 @@ pub struct Outcome {
     pub tokens: Counts,
     /// The models the design's calls ran on.
     pub models: Vec<String>,
-    pub score: Score,
+    /// Against the key. None until the key has findings: a change reviewed
+    /// before anyone knew what was wrong with it is scored later, with
+    /// `tailbus acr rescore`.
+    #[serde(default)]
+    pub score: Option<Score>,
     pub findings: Vec<Found>,
     /// What went wrong in the design's run, such as a Judge whose answer
     /// couldn't be read. A score beside failures says less than it seems.
@@ -163,58 +170,105 @@ pub struct Outcome {
     pub failures: Vec<String>,
 }
 
-/// A trial's scratch folder and worktree, removed however it ends.
+/// A trial's scratch folder and its copy of the change, removed however it
+/// ends.
 struct Scratch {
     dir: PathBuf,
-    repo: PathBuf,
     tree: PathBuf,
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.tree)
-            .stdin(Stdio::null())
-            .output();
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["worktree", "prune"])
-            .stdin(Stdio::null())
-            .output();
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
+/// A fresh repository holding the head and only what it reaches: no branches,
+/// no remote, and no later commit, so nothing in a trial can see how the
+/// change turned out. It's named after the repository, so its review config
+/// is found.
 fn scratch(paths: &Paths, key: &Key) -> Result<Scratch> {
     let dir = paths.state.join("acr-trials").join(new_id());
     fs::create_dir_all(&dir)?;
     let dir = dir.canonicalize()?;
+    let name = super::change::name(&key.repo)?;
     let s = Scratch {
-        tree: dir.join("tree"),
-        repo: key.repo.clone(),
+        tree: dir.join(&name),
         dir,
     };
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&key.repo)
-        .args(["worktree", "add", "--detach", "--quiet"])
-        .arg(&s.tree)
-        .arg(&key.head)
+    let git = |args: &[&str], env: &[(&str, &str)]| -> Result<()> {
+        let out = Command::new("git")
+            .args(args)
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .output()
+            .context("running git")?;
+        if !out.status.success() {
+            bail!(
+                "making the trial's copy of {} at {}: git {}: {}",
+                key.repo.display(),
+                key.head,
+                args.first().copied().unwrap_or_default(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    };
+    let tree = s.tree.to_string_lossy().into_owned();
+    let repo = key.repo.to_string_lossy().into_owned();
+    git(&["init", "--quiet", &tree], &[])?;
+    // A local fetch runs the repository's upload-pack, which this lets give
+    // one commit by name without a branch that points at it.
+    git(
+        &[
+            "-C",
+            &tree,
+            "-c",
+            "uploadpack.allowAnySHA1InWant=true",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            &repo,
+            &key.head,
+        ],
+        &[],
+    )?;
+    git(
+        &["-C", &tree, "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        &[("GIT_LFS_SKIP_SMUDGE", "1")],
+    )?;
+    // Large files come from the repository's own store, which the copy
+    // doesn't keep a link to.
+    let lfs = Command::new("git")
+        .args(["-C", &tree, "lfs", "ls-files", "--name-only"])
         .stdin(Stdio::null())
-        .output()
-        .context("running git")?;
-    if !out.status.success() {
-        bail!(
-            "checking out {} for the trial: {}",
-            key.head,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        .output();
+    if lfs.is_ok_and(|o| o.status.success() && !o.stdout.is_empty()) {
+        let common = super::change::git(
+            &key.repo,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let storage = format!("lfs.storage={}/lfs", common.trim());
+        git(&["-C", &tree, "-c", &storage, "lfs", "checkout"], &[])?;
     }
     Ok(s)
+}
+
+/// The settings that keep a trial's Claude Code, its subagents and their
+/// commands to the trial's copy, its scratch space and the toolchains they
+/// need. A trial won't run without them.
+fn confine_settings(paths: &Paths) -> Result<PathBuf> {
+    let path = paths
+        .config
+        .with_file_name("acr")
+        .join(crate::setup::CONFINE_FILE);
+    if !path.is_file() {
+        bail!(
+            "{} is missing, which keeps reviewers to the code under review: run `tailbus setup acr`",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 /// One headless Claude Code run.
@@ -237,6 +291,7 @@ fn claude(paths: &Paths, config: &Path, workdir: &Path, ask: &Ask) -> Result<Str
         prompt,
         limit,
     } = *ask;
+    let confine = confine_settings(paths)?;
     let token_file = paths.config.with_file_name("claude-token");
     let token = fs::read_to_string(&token_file)
         .with_context(|| format!("reading {}: run `tailbus setup acr`", token_file.display()))?;
@@ -250,6 +305,8 @@ fn claude(paths: &Paths, config: &Path, workdir: &Path, ask: &Ask) -> Result<Str
         .args(["-p", "--model", model, "--effort", effort])
         .args(["--strict-mcp-config", "--output-format", "text"])
         .args(["--allowedTools", tools, "--tools", tools])
+        .arg("--settings")
+        .arg(&confine)
         .arg("--add-dir")
         .arg(config.parent().unwrap_or(config))
         .current_dir(workdir)
@@ -417,8 +474,8 @@ fn builder_led(paths: &Paths, s: &Scratch, key: &Key, arm: Arm) -> Result<Ran> {
     })
 }
 
-fn score(paths: &Paths, s: &Scratch, key: &Key, found: &[Found]) -> Result<Score> {
-    let config = s.dir.join("scorer");
+fn score(paths: &Paths, dir: &Path, key: &Key, found: &[Found]) -> Result<Score> {
+    let config = dir.join("scorer");
     fs::create_dir_all(&config)?;
     let keyed: Vec<Value> = key
         .findings
@@ -454,7 +511,7 @@ fn score(paths: &Paths, s: &Scratch, key: &Key, found: &[Found]) -> Result<Score
     let answer = claude(
         paths,
         &config,
-        &s.dir,
+        dir,
         &Ask {
             model: SCORER_MODEL,
             effort: "high",
@@ -523,11 +580,23 @@ pub struct Ran {
 pub type Separated<'a> = &'a dyn Fn(&Path, &Key) -> Result<Ran>;
 
 /// Runs one design on one change, and scores it.
-pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Result<Outcome> {
-    let key: Key = serde_yaml_ng::from_str(
+fn read_key(key_path: &Path) -> Result<Key> {
+    serde_yaml_ng::from_str(
         &fs::read_to_string(key_path).with_context(|| format!("reading {}", key_path.display()))?,
     )
-    .with_context(|| format!("in {}", key_path.display()))?;
+    .with_context(|| format!("in {}", key_path.display()))
+}
+
+/// What a key is called in results: its file's name.
+fn key_name(key_path: &Path) -> String {
+    key_path
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Result<Outcome> {
+    let key = read_key(key_path)?;
     let s = scratch(paths, &key)?;
     let started = Instant::now();
     let ran = match arm {
@@ -535,12 +604,14 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Re
         Arm::Separated => separated(&s.tree, &key)?,
     };
     let seconds = started.elapsed().as_secs();
-    let score = score(paths, &s, &key, &ran.findings)?;
+    // New work has no findings yet: it's scored once its own review is done.
+    let score = if key.findings.is_empty() {
+        None
+    } else {
+        Some(score(paths, &s.dir, &key, &ran.findings)?)
+    };
     Ok(Outcome {
-        key: key_path
-            .file_stem()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        key: key_name(key_path),
         pr: key.pr,
         arm,
         seconds,
@@ -552,9 +623,139 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Re
     })
 }
 
+/// Scores the saved runs on a key that aren't scored yet, now that the key
+/// has findings, and rewrites `results` with them in place. Other lines stay
+/// as they are. Returns how many it scored.
+pub fn rescore(paths: &Paths, key_path: &Path, results: &Path) -> Result<usize> {
+    let key = read_key(key_path)?;
+    if key.findings.is_empty() {
+        bail!(
+            "{} has no findings yet: add them from the change's own review first",
+            key_path.display()
+        );
+    }
+    let name = key_name(key_path);
+    let text =
+        fs::read_to_string(results).with_context(|| format!("reading {}", results.display()))?;
+    let dir = paths.state.join("acr-trials").join(new_id());
+    fs::create_dir_all(&dir)?;
+    let s = Scratch {
+        tree: dir.clone(),
+        dir: dir.canonicalize()?,
+    };
+    let mut out = String::new();
+    let mut scored = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let value: Value = serde_json::from_str(line).context("reading a results line")?;
+        if value["key"] == name.as_str() && value["score"].is_null() {
+            let mut outcome: Outcome = serde_json::from_value(value)?;
+            outcome.score = Some(score(paths, &s.dir, &key, &outcome.findings)?);
+            out.push_str(&serde_json::to_string(&outcome)?);
+            scored += 1;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    let tmp = results.with_extension("jsonl.rescore");
+    fs::write(&tmp, out)?;
+    fs::rename(&tmp, results)?;
+    Ok(scored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rev(dir: &Path, what: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", what])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn a_trials_copy_holds_the_head_and_nothing_after_it() {
+        use super::super::change::tests::{branch, commit, repo_with};
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        branch(&repo, "work");
+        commit(&repo, &[("a.txt", "two\n")], "the change");
+        let head = rev(&repo, "HEAD");
+        commit(&repo, &[("a.txt", "fixed\n")], "the fix");
+        let fixed = rev(&repo, "HEAD");
+        let dir = std::env::temp_dir().join(format!("tb-trial-paths-{}", new_id()));
+        let paths = Paths {
+            state: dir.join("state"),
+            config: dir.join("config.toml"),
+        };
+        let key = Key {
+            repo: repo.clone(),
+            pr: None,
+            base: "main".into(),
+            head: head.clone(),
+            context: "c".into(),
+            dimensions: vec!["correctness".into()],
+            findings: Vec::new(),
+        };
+        let s = scratch(&paths, &key).unwrap();
+        assert_eq!(rev(&s.tree, "HEAD"), head);
+        assert_eq!(fs::read_to_string(s.tree.join("a.txt")).unwrap(), "two\n");
+        // Named after the repository, so its review config is found.
+        assert_eq!(
+            super::super::change::name(&s.tree).unwrap(),
+            super::super::change::name(&repo).unwrap()
+        );
+        // No branch, no remote, and the fix isn't there at all.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&s.tree)
+            .args(["for-each-ref"])
+            .output()
+            .unwrap();
+        assert!(
+            out.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&s.tree)
+            .args(["cat-file", "-e", &fixed])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "the later commit is in the copy");
+        let tree = s.tree.clone();
+        drop(s);
+        assert!(!tree.exists(), "the copy goes when the trial ends");
+    }
+
+    #[test]
+    fn new_work_needs_no_findings_and_is_saved_unscored() {
+        let key: Key = serde_yaml_ng::from_str(
+            "repo: /r\nbase: \"b\"\nhead: \"h\"\ncontext: c\ndimensions: [correctness]\n",
+        )
+        .unwrap();
+        assert!(key.findings.is_empty());
+        let outcome = Outcome {
+            key: "k".into(),
+            pr: None,
+            arm: Arm::Sized,
+            seconds: 1,
+            tokens: Counts::default(),
+            models: Vec::new(),
+            score: None,
+            findings: Vec::new(),
+            failures: Vec::new(),
+        };
+        let line = serde_json::to_string(&outcome).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert!(value["score"].is_null());
+        let back: Outcome = serde_json::from_str(&line).unwrap();
+        assert!(back.score.is_none());
+    }
 
     #[test]
     fn finds_the_last_json_object_in_an_answer() {

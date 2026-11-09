@@ -97,9 +97,18 @@ pub enum AcrCmd {
     /// Measure review designs on a change whose findings are known: blind,
     /// with nobody in the loop, leaving nothing behind. Prints each design's
     /// result as a line of JSON.
+    /// Score saved trials of new work, once its own review has filled in the
+    /// key's findings.
+    Rescore {
+        key: PathBuf,
+        /// The results file the trials were written to.
+        #[arg(long)]
+        results: PathBuf,
+    },
     Trial {
         /// The answer key: the change, what it's for, and what an earlier
-        /// review found.
+        /// review found. For new work, leave the findings out: the trials
+        /// are saved unscored, for `rescore` once its own review is done.
         key: PathBuf,
         /// One design. Left out, all three, one after another.
         #[arg(long, value_enum)]
@@ -799,6 +808,14 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let run = one_round(paths, &target)?;
             let score = flow::score(&run, &known)?;
             println!("{}", serde_json::to_string_pretty(&score)?);
+        }
+        AcrCmd::Rescore { key, results } => {
+            let n = trial::rescore(paths, &key, &results)?;
+            println!(
+                "Scored {n} trial(s) of {} in {}.",
+                key.display(),
+                results.display()
+            );
         }
         AcrCmd::Trial { key, arm, out } => {
             let arms = match arm {

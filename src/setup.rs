@@ -699,8 +699,83 @@ pub fn bridge_job(agent: &str) -> Option<String> {
 /// runs every role through, on this machine.
 pub const ACR_AGENT: &str = "claude-acr";
 
+/// Settings, in `~/.config/tailbus/acr/`, that keep a review's Claude Code to
+/// the code under review: its file tools and its commands, subagents too.
+pub const CONFINE_FILE: &str = "confine.json";
+
+/// Toolchains a reviewer may need to build and test, under the home folder,
+/// which the read block closes: they're opened again where they exist.
+const TOOLCHAINS: &[&str] = &[
+    "Tools/flutter",
+    "flutter",
+    "development/flutter",
+    "fvm",
+    ".fvm",
+    ".pub-cache",
+    ".dart-tool",
+    ".dartServer",
+    ".flutter",
+    ".flutter-devtools",
+    ".config/flutter",
+    "go",
+    "Library/Caches/go-build",
+    ".cache/go-build",
+    ".cargo",
+    ".rustup",
+    ".npm",
+];
+
+/// The confinement settings for this home folder:
+/// - Claude's file tools refuse paths outside the working directories;
+/// - its commands run in the sandbox, with no way out;
+/// - the toolchains that exist here stay usable;
+/// - commands reach only package registries.
+fn confine_settings(home: &Path) -> String {
+    let toolchains: Vec<String> = TOOLCHAINS
+        .iter()
+        .map(|t| home.join(t))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let settings = serde_json::json!({
+        "permissions": {
+            "blockReadsOutsideWorkingDirectories": true,
+            "blockWritesOutsideWorkingDirectories": true
+        },
+        "sandbox": {
+            "enabled": true,
+            "failIfUnavailable": true,
+            "allowUnsandboxedCommands": false,
+            "autoAllowBashIfSandboxed": true,
+            "filesystem": {
+                "allowRead": toolchains,
+                "allowWrite": toolchains
+            },
+            "network": {
+                "allowedDomains": [
+                    "pub.dev", "*.pub.dev", "storage.googleapis.com",
+                    "proxy.golang.org", "sum.golang.org",
+                    "crates.io", "*.crates.io",
+                    "registry.npmjs.org",
+                    "github.com", "*.githubusercontent.com"
+                ]
+            }
+        }
+    });
+    let mut text = serde_json::to_string_pretty(&settings).unwrap_or_default();
+    text.push('\n');
+    text
+}
+
 /// The bridge's table in config.toml.
-fn acr_bridge(owner: &str, claude: &Path, home: &Path, token: &Path, path: &str) -> String {
+fn acr_bridge(
+    owner: &str,
+    claude: &Path,
+    home: &Path,
+    token: &Path,
+    confine: &Path,
+    path: &str,
+) -> String {
     let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
     let p = |p: &Path| q(&p.to_string_lossy());
     format!(
@@ -712,6 +787,7 @@ fn acr_bridge(owner: &str, claude: &Path, home: &Path, token: &Path, path: &str)
 owner = {owner}
 command = {claude}
 args = ["-p", "--model", "{{MODEL}}", "--strict-mcp-config", "--output-format", "text",
+  "--settings", {confine},
   "--add-dir", "{{ATTACHMENTS_DIR}}", "--add-dir", "{{RUN_DIR}}/tmp"]
 model = "claude-sonnet-5-5"
 working_directory = {home}
@@ -752,8 +828,26 @@ model = "message.model"
         claude = p(claude),
         home = p(home),
         token = p(token),
+        confine = p(confine),
         path = q(path),
     )
+}
+
+/// Adds `--settings <confine>` to an existing ACR bridge's arguments, if it
+/// isn't there. Returns whether it added it.
+fn confine_bridge(doc: &mut toml_edit::DocumentMut, confine: &Path) -> Result<bool> {
+    let args = doc
+        .get_mut("bridges")
+        .and_then(|b| b.get_mut(ACR_AGENT))
+        .and_then(|a| a.get_mut("args"))
+        .and_then(|a| a.as_array_mut())
+        .context("the ACR bridge has no args")?;
+    if args.iter().any(|a| a.as_str() == Some("--settings")) {
+        return Ok(false);
+    }
+    args.push("--settings");
+    args.push(confine.to_string_lossy().as_ref());
+    Ok(true)
 }
 
 /// The ACR config `tailbus setup acr` writes, if there's none: Anthropic
@@ -999,6 +1093,18 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
     } else {
         make_token(&claude, &token)?;
     }
+    let confine = dir.join("acr").join(CONFINE_FILE);
+    if confine.exists() {
+        println!("Kept the reviewers' confinement, {}.", confine.display());
+    } else {
+        let home = home()?;
+        fs::create_dir_all(dir.join("acr"))?;
+        write(&confine, &confine_settings(&home))?;
+        println!(
+            "Wrote {}, which keeps reviewers to the code under review.",
+            confine.display()
+        );
+    }
     let mut doc = read_config(paths)?;
     let has_bridge = doc.get("bridges").and_then(|b| b.get(ACR_AGENT)).is_some();
     if has_bridge {
@@ -1006,6 +1112,9 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
             "Kept the {ACR_AGENT} bridge already in {}.",
             paths.config.display()
         );
+        if confine_bridge(&mut doc, &confine)? {
+            println!("Its reviewers now run confined to the code under review.");
+        }
     } else {
         let home = paths.state.join(ACR_AGENT).join("home");
         fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
@@ -1020,7 +1129,14 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
                 seen
             });
         let mut text = doc.to_string();
-        text.push_str(&acr_bridge(&owner, &claude, &home, &token, &path.join(":")));
+        text.push_str(&acr_bridge(
+            &owner,
+            &claude,
+            &home,
+            &token,
+            &confine,
+            &path.join(":"),
+        ));
         doc = text.parse().context("adding the ACR agent to the config")?;
         println!(
             "Added the {ACR_AGENT} bridge to {}.",
@@ -1060,6 +1176,39 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confinement_blocks_outside_reads_and_keeps_toolchains_that_exist() {
+        let home = temp("confine-home");
+        fs::create_dir_all(home.join(".pub-cache")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&confine_settings(&home)).unwrap();
+        assert_eq!(
+            v["permissions"]["blockReadsOutsideWorkingDirectories"],
+            true
+        );
+        assert_eq!(v["sandbox"]["enabled"], true);
+        assert_eq!(v["sandbox"]["allowUnsandboxedCommands"], false);
+        assert_eq!(v["sandbox"]["failIfUnavailable"], true);
+        let read: Vec<&str> = v["sandbox"]["filesystem"]["allowRead"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect();
+        assert_eq!(read, [home.join(".pub-cache").to_string_lossy()]);
+    }
+
+    #[test]
+    fn an_existing_acr_bridge_is_confined_once() {
+        let mut doc: toml_edit::DocumentMut =
+            "[bridges.claude-acr]\nargs = [\"-p\"]\n".parse().unwrap();
+        let confine = Path::new("/c/confine.json");
+        assert!(confine_bridge(&mut doc, confine).unwrap());
+        assert!(!confine_bridge(&mut doc, confine).unwrap());
+        let args = doc["bridges"]["claude-acr"]["args"].as_array().unwrap();
+        let args: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
+        assert_eq!(args, ["-p", "--settings", "/c/confine.json"]);
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("tb-setup-{name}-{}", &crate::util::new_id()[14..]));
@@ -1130,7 +1279,14 @@ mod tests {
         let claude = dir.join("claude");
         fs::write(&claude, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        let text = acr_bridge("ray@example.com", &claude, &dir, &token, "/usr/bin:/bin");
+        let text = acr_bridge(
+            "ray@example.com",
+            &claude,
+            &dir,
+            &token,
+            &dir.join("confine.json"),
+            "/usr/bin:/bin",
+        );
         let cfg: crate::config::Config = toml::from_str(&text).unwrap();
         let table = cfg.bridges[ACR_AGENT].clone();
         let settings: bridge::Settings = table.try_into().unwrap();
@@ -1154,7 +1310,14 @@ mod tests {
             state: dir.join("state"),
         };
         let start = "# mine, kept\nalerts = false\n".to_string()
-            + &acr_bridge("o", Path::new("/bin/claude"), &dir, &token, "/bin");
+            + &acr_bridge(
+                "o",
+                Path::new("/bin/claude"),
+                &dir,
+                &token,
+                &dir.join("confine.json"),
+                "/bin",
+            );
         fs::write(&paths.config, &start).unwrap();
         let workdirs = || -> Vec<String> {
             let mut doc = read_config(&paths).unwrap();

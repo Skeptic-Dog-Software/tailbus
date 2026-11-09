@@ -34,7 +34,7 @@ pub struct LeftOut {
     pub why: String,
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<String> {
+pub(super) fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
