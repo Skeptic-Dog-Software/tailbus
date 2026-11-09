@@ -88,7 +88,8 @@ pub struct Store {
 #[derive(Debug, Clone)]
 pub struct Incoming {
     pub msg: Message,
-    /// The Tailscale login that owns the sending machine.
+    /// Who owns the sending machine: a Tailscale login, or a local bus's
+    /// `owner`.
     pub owner: String,
     pub delivered_at: Option<i64>,
     /// The session it was last handed to.

@@ -1,5 +1,5 @@
-//! What the bus needs from Tailscale: this machine's name and address, its
-//! peers, and who is on the other end of a connection.
+//! The bus on a tailnet: Tailscale names this machine and its owner, lists
+//! its peers, and says who is on the other end of a connection.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -10,6 +10,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::network::{Network, Peer, Status, Whois};
+
 /// The macOS app's own binary. The `tailscale` symlinks Homebrew and the app
 /// install crash with a bundle identifier error, so this goes first.
 const MAC_APP_CLI: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
@@ -18,28 +20,18 @@ pub struct Tailscale {
     bin: PathBuf,
 }
 
-#[derive(Debug, Clone)]
-pub struct Status {
-    pub machine: String,
-    pub ipv4: Option<Ipv4Addr>,
-    /// The Tailscale login that owns this machine.
-    pub owner: String,
-    pub peers: Vec<Peer>,
-}
+impl Network for Tailscale {
+    fn status(&self) -> Result<Status> {
+        Tailscale::status(self)
+    }
 
-#[derive(Debug, Clone)]
-pub struct Peer {
-    pub machine: String,
-    pub ipv4: Option<Ipv4Addr>,
-    pub online: bool,
-    /// The Tailscale login that owns it.
-    pub owner: String,
-}
+    fn whois(&self, ip: IpAddr) -> Result<Whois> {
+        Tailscale::whois(self, ip)
+    }
 
-#[derive(Debug, Clone)]
-pub struct Whois {
-    pub machine: String,
-    pub owner: String,
+    fn remote(&self) -> bool {
+        true
+    }
 }
 
 impl Tailscale {

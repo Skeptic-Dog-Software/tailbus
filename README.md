@@ -92,6 +92,20 @@ showing tailbus's dialogs. A `[clients]` table tags
 `max_subagents = 5` caps the subagents a `/pipe` task runs at once.
 `[bridges.<agent>]` tables set up [headless agents](#headless-agents).
 
+**A local bus** needs no Tailscale. It reaches only agents on its own machine,
+and other machines can't reach it, which is all [ACR](#adversarial-review) and
+the [bridges](#headless-agents) it calls need:
+
+```toml
+network = "local"
+owner = "you@example.com"   # who every message here comes from
+machine = "build-box"       # optional: the hostname by default
+```
+
+Each bridge's `owner` must match `owner`. A local bus opens no network port,
+and only your own user can reach its socket. `allow`, `port` and `tailscale`
+have no effect on it.
+
 ## Agents and addresses
 
 An agent's address is `name@machine`, such as `api@laptop`. The name
@@ -295,7 +309,7 @@ path = "/Users/you/.local/bin:/usr/bin:/bin"
 
 | Setting | Means |
 | --- | --- |
-| `owner` | The Tailscale login a message must come from. Required. |
+| `owner` | The Tailscale login a message must come from, or on a [local bus](#install), its `owner`. Required. |
 | `command`, `args` | What to run. `args` can use the placeholders below. |
 | `working_directory` | Where it runs. Required. Every run shares it, in either session mode. |
 | `home`, `path` | Its `HOME` and `PATH`. Required. `home` can't be your own. |

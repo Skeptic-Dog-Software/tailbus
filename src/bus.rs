@@ -17,13 +17,13 @@ use crate::config::Config;
 use crate::format;
 use crate::local::{Awaited, Event, Inbox, Item, Moved, PeerMachine, Peers, Sent};
 use crate::net;
+use crate::network::{Network, Status, Whois};
 use crate::proto::{
     AgentInfo, AgentList, Billing, Estimate, Extras, MAX_BATCH, MAX_BODY, Message, MessageBatch,
     Pipe, PipeStage, Plan, Receipt, ReceiptBatch, SendState, StoreResult, StoreResults,
     StoreStatus,
 };
 use crate::store::{Acked, Due, Incoming, Store, Stored, machine_part, name_part};
-use crate::tailscale::{Status, Tailscale, Whois};
 use crate::usage;
 use crate::util::{Address, is_id, new_id, now_ms, valid_name};
 
@@ -47,7 +47,7 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 /// How long the dialog about a paused session stays up.
 const PAUSE_DIALOG: Duration = Duration::from_secs(86_400);
 
-/// This machine as Tailscale names it.
+/// This machine as its network names it.
 #[derive(Debug, Clone)]
 pub struct Me {
     pub machine: String,
@@ -59,7 +59,7 @@ pub struct Bus {
     pub cfg: Config,
     /// This bus, for work that outlives a call.
     this: Weak<Bus>,
-    ts: Tailscale,
+    net: Box<dyn Network>,
     store: Mutex<Store>,
     live: Mutex<Live>,
     changed: Condvar,
@@ -217,10 +217,15 @@ fn preview(body: &str) -> String {
 }
 
 impl Bus {
-    pub fn start(cfg: Config, store: Store, attachments: PathBuf) -> Arc<Bus> {
+    pub fn start(
+        cfg: Config,
+        net: Box<dyn Network>,
+        store: Store,
+        attachments: PathBuf,
+    ) -> Arc<Bus> {
         Arc::new_cyclic(|this| Bus {
             this: this.clone(),
-            ts: Tailscale::find(cfg.tailscale.as_deref()),
+            net,
             attachments: Attachments::new(
                 attachments,
                 cfg.max_attachment_bytes,
@@ -245,7 +250,7 @@ impl Bus {
     #[cfg(test)]
     pub fn pretend_peer(&self, machine: &str, ip: Ipv4Addr) {
         let me = self.me().expect("set up by the test");
-        let peer = crate::tailscale::Peer {
+        let peer = crate::network::Peer {
             machine: machine.to_string(),
             ipv4: Some(ip),
             online: true,
@@ -274,7 +279,12 @@ impl Bus {
         lock(&self.store)
     }
 
-    // Tailscale.
+    // The network.
+
+    /// Whether other machines are in reach. A local bus has none.
+    pub fn remote(&self) -> bool {
+        self.net.remote()
+    }
 
     pub fn me(&self) -> Result<Me> {
         if let Some(me) = self.me.read().unwrap_or_else(|e| e.into_inner()).clone() {
@@ -290,7 +300,8 @@ impl Bus {
             .expect("set by refresh_status"))
     }
 
-    /// Tailscale's view of the tailnet, at most a few seconds old.
+    /// The network's view of this machine and its peers, at most a few
+    /// seconds old.
     pub fn status(&self) -> Result<Status> {
         if let Some((at, status)) = &*lock(&self.status)
             && at.elapsed() < STATUS_TTL
@@ -301,7 +312,7 @@ impl Bus {
     }
 
     pub fn refresh_status(&self) -> Result<Status> {
-        let status = self.ts.status()?;
+        let status = self.net.status()?;
         *self.me.write().unwrap_or_else(|e| e.into_inner()) = Some(Me {
             machine: status.machine.clone(),
             owner: status.owner.clone(),
@@ -334,7 +345,7 @@ impl Bus {
         {
             return Ok(who.clone());
         }
-        let who = self.ts.whois(ip)?;
+        let who = self.net.whois(ip)?;
         lock(&self.whois).insert(ip, (Instant::now(), who.clone()));
         Ok(who)
     }
@@ -1330,6 +1341,13 @@ impl Bus {
                 .find(|a| a.name == to.agent)
                 .and_then(|a| staleness(&to.to_string(), a.live, a.last_live, now));
             return Ok((SendState::Stored, warning));
+        }
+        if !self.remote() {
+            bail!(
+                "this bus is local, so it reaches only agents on {}, not {}. peer_list shows the agents you can reach.",
+                me.machine,
+                to.machine
+            );
         }
         let status = self.status()?;
         let Some(peer) = status.peers.iter().find(|p| p.machine == to.machine) else {
@@ -2395,6 +2413,12 @@ pub(crate) mod tests {
         assert_eq!(preview("hello\nworld"), "hello…");
     }
 
+    /// The tailnet, which these tests never ask: each sets the bus's view
+    /// of it itself.
+    pub fn tailnet() -> Box<dyn Network> {
+        Box::new(crate::tailscale::Tailscale::find(None))
+    }
+
     /// A bus on machine `here` with no Tailscale, no dialogs, and `api`
     /// subscribed.
     pub fn bus() -> Arc<Bus> {
@@ -2402,6 +2426,7 @@ pub(crate) mod tests {
         cfg.handoff_limit = 3;
         let bus = Bus::start(
             cfg,
+            tailnet(),
             Store::memory(),
             std::env::temp_dir().join(format!("tb-att-{}", new_id())),
         );
@@ -2420,13 +2445,44 @@ pub(crate) mod tests {
         let cfg: Config =
             toml::from_str(&format!("alerts = false\nport = {port}\n{extra}")).unwrap();
         let dir = std::env::temp_dir().join(format!("tb-att-{}", new_id()));
-        let bus = Bus::start(cfg, Store::memory(), dir);
+        let bus = Bus::start(cfg, tailnet(), Store::memory(), dir);
         *bus.me.write().unwrap() = Some(Me {
             machine: machine.into(),
             owner: "o".into(),
             ipv4: None,
         });
         bus
+    }
+
+    #[test]
+    fn a_local_bus_needs_no_tailscale_and_reaches_only_this_machine() {
+        let cfg: Config = toml::from_str(
+            "alerts = false\nnetwork = \"local\"\nmachine = \"box\"\nowner = \"me@example.com\"",
+        )
+        .unwrap();
+        let net = crate::network::open(&cfg).unwrap();
+        let dir = std::env::temp_dir().join(format!("tb-att-{}", new_id()));
+        let bus = Bus::start(cfg, net, Store::memory(), dir);
+        assert!(!bus.remote());
+        let me = bus.me().unwrap();
+        assert_eq!(
+            (me.machine.as_str(), me.owner.as_str()),
+            ("box", "me@example.com")
+        );
+        assert!(bus.status().unwrap().peers.is_empty());
+
+        bus.db().add_agent("api", 1).unwrap();
+        bus.db().add_agent("reviewer", 1).unwrap();
+        bus.send("api", "reviewer@box", "look".into(), None, None, None)
+            .unwrap();
+        let inbox = bus.db().open_incoming("reviewer").unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].owner, "me@example.com");
+
+        let e = bus
+            .send("api", "reviewer@elsewhere", "look".into(), None, None, None)
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("this bus is local"), "{e:#}");
     }
 
     #[test]
@@ -2836,6 +2892,7 @@ pub(crate) mod tests {
         cfg.clients.insert("work".into(), "acme".into());
         let bus = Bus::start(
             cfg,
+            tailnet(),
             Store::memory(),
             std::env::temp_dir().join(format!("tb-att-{}", new_id())),
         );
@@ -2931,6 +2988,7 @@ pub(crate) mod tests {
         let cfg: Config = toml::from_str(cfg).unwrap();
         let bus = Bus::start(
             cfg,
+            tailnet(),
             Store::memory(),
             std::env::temp_dir().join(format!("tb-att-{}", new_id())),
         );

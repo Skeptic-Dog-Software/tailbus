@@ -86,6 +86,15 @@ fn env_path(var: &str) -> Option<PathBuf> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// `tailscale`, the default, carries messages between the tailnet's
+    /// machines. `local` keeps the bus to this machine, with no Tailscale.
+    #[serde(default)]
+    pub network: crate::network::Kind,
+    /// On a local bus, this machine's name on it. The hostname by default.
+    pub machine: Option<String>,
+    /// On a local bus, who every message here comes from, which each
+    /// bridge's `owner` must match. A local bus needs it.
+    pub owner: Option<String>,
     /// The port every machine's bus listens on, on its tailnet address.
     #[serde(default = "default_port")]
     pub port: u16,
@@ -211,6 +220,8 @@ mod tests {
         assert!(cfg.clients.is_empty());
         assert_eq!(cfg.max_subagents, 5);
         assert!(cfg.bridges.is_empty());
+        assert_eq!(cfg.network, crate::network::Kind::Tailscale);
+        assert!(cfg.machine.is_none() && cfg.owner.is_none());
         assert_eq!(cfg.max_attachment_bytes, 1 << 30);
         assert_eq!(cfg.attachment_retention_days, 7);
         let cfg: Config = toml::from_str("[bridges.omp]\nnot_a_setting = 1").unwrap();

@@ -15,6 +15,7 @@ mod hook;
 mod local;
 mod mcp;
 mod net;
+mod network;
 mod permission;
 mod proto;
 mod run_usage;

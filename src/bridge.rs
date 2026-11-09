@@ -79,8 +79,8 @@ const RESERVED: [&str; 3] = ["HOME", "PATH", "TMPDIR"];
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// The Tailscale login a message must come from. Anything else is
-    /// acknowledged without an answer.
+    /// Who a message must come from: a Tailscale login, or a local bus's
+    /// `owner`. Anything else is acknowledged without an answer.
     pub owner: String,
     /// The agent's program.
     pub command: PathBuf,

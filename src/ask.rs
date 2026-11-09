@@ -17,8 +17,8 @@ use anyhow::Result;
 use crate::alert::{self, Dialog, MAX_BUTTONS};
 use crate::bus::Bus;
 use crate::net;
+use crate::network::Whois;
 use crate::proto::{AskAnswer, AskClose, AskShow};
-use crate::tailscale::Whois;
 use crate::util::{is_id, new_id};
 
 /// How long an ask's dialogs stay up.

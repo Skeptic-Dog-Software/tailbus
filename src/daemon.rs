@@ -51,9 +51,11 @@ pub fn run(paths: &Paths) -> Result<()> {
             socket.display()
         );
     }
+    // Before anything is opened: a local bus with no owner can't start.
+    let network = crate::network::open(&cfg)?;
     let _ = fs::remove_file(&socket);
     let store = Store::open(&paths.db())?;
-    let bus = Bus::start(cfg, store, paths.attachments());
+    let bus = Bus::start(cfg, network, store, paths.attachments());
     {
         // launchd's log for the daemon, which nothing else cuts back.
         let (bus, log) = (bus.clone(), paths.log());
@@ -73,20 +75,26 @@ pub fn run(paths: &Paths) -> Result<()> {
         .with_context(|| format!("listening on {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
 
+    let local = if bus.remote() { "" } else { ", local only" };
     match bus.refresh_status() {
         Ok(s) => bus.event(format!(
-            "tailbus {VERSION} up on {} ({})",
+            "tailbus {VERSION} up on {} ({}){local}",
             s.machine, s.owner
         )),
         Err(e) => bus.event(format!(
             "tailbus {VERSION} up; waiting for Tailscale: {e:#}"
         )),
     }
-    {
+    if bus.remote() {
         let bus = bus.clone();
         thread::spawn(move || net::serve(bus));
+    } else {
+        *bus.listening.lock().unwrap_or_else(|e| e.into_inner()) =
+            Err("this bus is local, so it doesn't listen for other machines".into());
     }
     {
+        // Also what prunes old messages, so a local bus runs it too, with
+        // nothing to forward.
         let bus = bus.clone();
         thread::spawn(move || net::forward(bus));
     }

@@ -1033,7 +1033,7 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
     let status: crate::local::Status = local::call(&paths.socket(), &Request::Status)
         .context("the tailbus daemon has to be running: tailbus service install")?;
     let (Some(machine), Some(owner)) = (status.machine, status.owner) else {
-        bail!("the daemon doesn't know this machine on Tailscale yet; try again in a moment");
+        bail!("the daemon doesn't know this machine's name yet; try again in a moment");
     };
     let claude = find_claude()?;
     let dir = paths

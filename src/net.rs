@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn a_message_naming_a_file_that_never_came_is_refused() {
         let (_here, there) = two_machines("");
-        let who = crate::tailscale::Whois {
+        let who = crate::network::Whois {
             machine: "here".into(),
             owner: "o".into(),
         };
@@ -495,7 +495,7 @@ mod tests {
             .attachments
             .add("a.txt", &mut &b"words"[..], 5)
             .unwrap();
-        let who = crate::tailscale::Whois {
+        let who = crate::network::Whois {
             machine: "here".into(),
             owner: "o".into(),
         };
