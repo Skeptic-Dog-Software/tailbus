@@ -100,7 +100,9 @@ enum Cmd {
         /// A file to attach. Can be given more than once.
         #[arg(long, value_name = "FILE")]
         attach: Vec<PathBuf>,
-        /// How long this command waits for the reply, and then cancels.
+        /// How long this command waits for the reply, and then cancels. It
+        /// counts time spent queued behind the agent's other runs. To limit
+        /// only the run, use --run-timeout and leave this out.
         #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
         /// Leave the run going if this command is interrupted or times out.

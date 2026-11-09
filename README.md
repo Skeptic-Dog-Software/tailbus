@@ -457,8 +457,15 @@ as they like at once: each gets the reply to its own request.
 
 ```sh
 tailbus call omp@server "Review this" --attach change.diff \
-  --tools read,grep --model some/other-model --run-timeout 900 --timeout 1000
+  --tools read,grep --model some/other-model --run-timeout 900
 ```
+
+A bridge runs `max_concurrent` requests at once and queues the rest.
+`--run-timeout` limits a run once it starts. `--timeout` limits how long the
+call waits, **queue included**, and then cancels. So with more calls than the
+bridge runs at once, a short `--timeout` can expire before the run even
+starts. To bound only the work, use `--run-timeout` and leave `--timeout`
+out.
 
 | Exit | Means |
 | --- | --- |
