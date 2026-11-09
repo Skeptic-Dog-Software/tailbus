@@ -11,6 +11,23 @@ use serde::Deserialize;
 
 pub const DEFAULT_PORT: u16 = 4747;
 
+/// Which program this is: where it keeps things and what its services are
+/// called. The only thing that will tell acrbus and tailbus apart.
+pub struct App {
+    /// Its folders under XDG's, and its systemd units.
+    pub name: &'static str,
+    /// The variable that puts everything in one folder instead.
+    pub home_var: &'static str,
+    /// Its launchd labels.
+    pub label: &'static str,
+}
+
+pub const APP: App = App {
+    name: "tailbus",
+    home_var: "TAILBUS_HOME",
+    label: "com.skepticdogsoftware.tailbus",
+};
+
 pub struct Paths {
     /// Database, socket and log. Kept `0700`.
     pub state: PathBuf,
@@ -22,19 +39,32 @@ impl Paths {
     /// `$XDG_STATE_HOME/tailbus` and the config in
     /// `$XDG_CONFIG_HOME/tailbus/config.toml`.
     pub fn find() -> Result<Paths> {
-        if let Some(home) = env_path("TAILBUS_HOME") {
+        if let Some(home) = env_path(APP.home_var) {
             return Ok(Paths {
                 config: home.join("config.toml"),
                 state: home,
             });
         }
-        let home = env_path("HOME").context("HOME is not set")?;
-        let state = env_path("XDG_STATE_HOME").unwrap_or_else(|| home.join(".local/state"));
-        let config = env_path("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+        let config = match env_path("XDG_CONFIG_HOME") {
+            Some(dir) => dir,
+            None => env_path("HOME").context("HOME is not set")?.join(".config"),
+        };
         Ok(Paths {
-            state: state.join("tailbus"),
-            config: config.join("tailbus").join("config.toml"),
+            state: Paths::default_state()?,
+            config: config.join(APP.name).join("config.toml"),
         })
+    }
+
+    /// Where state goes when `$TAILBUS_HOME` doesn't say: the default home,
+    /// whose services keep the plain names.
+    pub fn default_state() -> Result<PathBuf> {
+        let state = match env_path("XDG_STATE_HOME") {
+            Some(dir) => dir,
+            None => env_path("HOME")
+                .context("HOME is not set")?
+                .join(".local/state"),
+        };
+        Ok(state.join(APP.name))
     }
 
     pub fn socket(&self) -> PathBuf {
@@ -46,8 +76,9 @@ impl Paths {
         let socket = self.socket();
         if socket.as_os_str().len() >= 104 {
             anyhow::bail!(
-                "the socket path {} is too long for a Unix socket; set TAILBUS_HOME to a shorter directory",
-                socket.display()
+                "the socket path {} is too long for a Unix socket; set {} to a shorter directory",
+                socket.display(),
+                APP.home_var
             );
         }
         Ok(())

@@ -13,10 +13,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::bridge;
-use crate::config::Paths;
+use crate::config::{APP, Paths};
 use crate::local::{self, Hello, Request};
 
-const LABEL: &str = "com.skepticdogsoftware.tailbus";
 /// The wait hook's timeout. Claude Code enforces it on `asyncRewake` hooks,
 /// and once it passes an idle session can't be woken until its next turn.
 const WAIT_HOOK_TIMEOUT_SECS: u64 = 7 * 86_400;
@@ -323,11 +322,11 @@ impl UserUnit<'_> {
             .chain(self.args.iter().map(|a| a.to_string()))
             .map(|a| quoted(&a))
             .collect();
-        let tailbus_home = env::var_os("TAILBUS_HOME")
+        let tailbus_home = env::var_os(APP.home_var)
             .map(|h| {
                 format!(
                     "Environment={}\n",
-                    quoted(&format!("TAILBUS_HOME={}", h.to_string_lossy()))
+                    quoted(&format!("{}={}", APP.home_var, h.to_string_lossy()))
                 )
             })
             .unwrap_or_default();
@@ -375,10 +374,39 @@ fn linger_hint() {
     }
 }
 
-const DAEMON_UNIT: &str = "tailbus";
+/// What tells this home's services from the default home's: nothing for
+/// the default, or a short hash of this home's folder, so a second home on
+/// the same machine, such as a test's, never replaces the first one's
+/// daemon or bridges.
+fn instance(paths: &Paths) -> Option<String> {
+    if Paths::default_state().ok().as_deref() == Some(paths.state.as_path()) {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(paths.state.as_os_str().as_encoded_bytes());
+    Some(digest.iter().take(4).map(|b| format!("{b:02x}")).collect())
+}
 
-fn bridge_unit(agent: &str) -> String {
-    format!("tailbus-bridge-{agent}")
+fn daemon_label(paths: &Paths) -> String {
+    match instance(paths) {
+        Some(i) => format!("{}.{i}", APP.label),
+        None => APP.label.to_string(),
+    }
+}
+
+fn bridge_label(paths: &Paths, agent: &str) -> String {
+    format!("{}.bridge.{agent}", daemon_label(paths))
+}
+
+fn daemon_unit(paths: &Paths) -> String {
+    match instance(paths) {
+        Some(i) => format!("{}-{i}", APP.name),
+        None => APP.name.to_string(),
+    }
+}
+
+fn bridge_unit(paths: &Paths, agent: &str) -> String {
+    format!("{}-bridge-{agent}", daemon_unit(paths))
 }
 
 /// A launchd agent that runs this binary at login and restarts it if it
@@ -399,9 +427,10 @@ impl LaunchAgent<'_> {
         let mut env_vars = String::from(
             "        <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>\n",
         );
-        if let Some(home) = env::var_os("TAILBUS_HOME") {
+        if let Some(home) = env::var_os(APP.home_var) {
             env_vars.push_str(&format!(
-                "        <key>TAILBUS_HOME</key><string>{}</string>\n",
+                "        <key>{}</key><string>{}</string>\n",
+                APP.home_var,
                 xml(&home.to_string_lossy())
             ));
         }
@@ -548,20 +577,21 @@ pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
         .map(|c| c.bridges.keys().cloned().collect())
         .unwrap_or_default();
     wait_for_quiet(paths, &bridges, true, now)?;
+    let (label, unit) = (daemon_label(paths), daemon_unit(paths));
     let job = match manager {
         Manager::Launchd => {
             let domain = LaunchAgent {
-                label: LABEL,
+                label: &label,
                 args: &["daemon"],
                 log: &paths.log(),
                 throttle: 10,
                 exit_timeout: None,
             }
             .start()?;
-            format!("launchd {domain}/{LABEL}")
+            format!("launchd {domain}/{label}")
         }
         Manager::Systemd => UserUnit {
-            name: DAEMON_UNIT,
+            name: &unit,
             description: "tailbus: direct messages between AI agents on your tailnet",
             args: &["daemon"],
             after: None,
@@ -570,7 +600,7 @@ pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
     };
     let log = match manager {
         Manager::Launchd => paths.log().display().to_string(),
-        Manager::Systemd => format!("journalctl --user -u {DAEMON_UNIT}"),
+        Manager::Systemd => format!("journalctl --user -u {unit}"),
     };
     let socket = paths.socket();
     let until = Instant::now() + Duration::from_secs(10);
@@ -597,17 +627,13 @@ pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
     }
 }
 
-pub fn service_uninstall() -> Result<()> {
+pub fn service_uninstall(paths: &Paths) -> Result<()> {
     let path = match manager("tailbus service", "tailbus daemon")? {
-        Manager::Launchd => stop_launch_agent(LABEL)?,
-        Manager::Systemd => stop_unit(DAEMON_UNIT)?,
+        Manager::Launchd => stop_launch_agent(&daemon_label(paths))?,
+        Manager::Systemd => stop_unit(&daemon_unit(paths))?,
     };
     println!("Stopped the tailbus daemon and removed {}.", path.display());
     Ok(())
-}
-
-fn bridge_label(agent: &str) -> String {
-    format!("{LABEL}.bridge.{agent}")
 }
 
 /// Runs a bridge as a service, the way `service_install` runs the daemon.
@@ -623,7 +649,7 @@ pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
     let since = crate::util::now_ms();
     let (job, shown) = match manager {
         Manager::Launchd => {
-            let label = bridge_label(agent);
+            let label = bridge_label(paths, agent);
             let domain = LaunchAgent {
                 label: &label,
                 args: &["bridge", "run", agent],
@@ -639,13 +665,14 @@ pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
             )
         }
         Manager::Systemd => {
-            let name = bridge_unit(agent);
+            let name = bridge_unit(paths, agent);
+            let daemon = daemon_unit(paths);
             let description = format!("tailbus bridge: {agent}");
             let job = UserUnit {
                 name: &name,
                 description: &description,
                 args: &["bridge", "run", agent],
-                after: Some(DAEMON_UNIT),
+                after: Some(&daemon),
             }
             .start()?;
             (job, format!("journalctl --user -u {name}"))
@@ -668,26 +695,26 @@ pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
     )
 }
 
-pub fn bridge_uninstall(agent: &str) -> Result<()> {
+pub fn bridge_uninstall(paths: &Paths, agent: &str) -> Result<()> {
     let path = match manager("tailbus bridge uninstall", "tailbus bridge run")? {
-        Manager::Launchd => stop_launch_agent(&bridge_label(agent))?,
-        Manager::Systemd => stop_unit(&bridge_unit(agent))?,
+        Manager::Launchd => stop_launch_agent(&bridge_label(paths, agent))?,
+        Manager::Systemd => stop_unit(&bridge_unit(paths, agent))?,
     };
     println!("Stopped the {agent} bridge and removed {}.", path.display());
     Ok(())
 }
 
 /// Where a bridge's service is running, if it is.
-pub fn bridge_job(agent: &str) -> Option<String> {
+pub fn bridge_job(paths: &Paths, agent: &str) -> Option<String> {
     if cfg!(target_os = "macos") {
-        let label = bridge_label(agent);
+        let label = bridge_label(paths, agent);
         return domains().into_iter().find_map(|domain| {
             let job = format!("{domain}/{label}");
             let out = launchctl(&["print", &job]).ok()?;
             out.status.success().then_some(job)
         });
     }
-    let unit = format!("{}.service", bridge_unit(agent));
+    let unit = format!("{}.service", bridge_unit(paths, agent));
     systemctl(&["is-active", "--quiet", &unit])
         .ok()
         .map(|()| format!("systemd --user {unit}"))
@@ -1014,7 +1041,7 @@ pub fn acr_repo(paths: &Paths, repo: &Path, allow: bool, agent: &str) -> Result<
         (false, true) => workdirs.retain(|v| v.as_str() != Some(&shown)),
     }
     write_config(paths, &doc)?;
-    if bridge_job(agent).is_some() {
+    if bridge_job(paths, agent).is_some() {
         bridge_install(paths, agent, false)?;
     }
     let verb = if allow {
@@ -1134,6 +1161,38 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_home_names_its_services_apart_from_the_default() {
+        let default = Paths {
+            state: Paths::default_state().unwrap(),
+            config: PathBuf::from("/c/config.toml"),
+        };
+        assert_eq!(daemon_label(&default), "com.skepticdogsoftware.tailbus");
+        assert_eq!(
+            bridge_label(&default, "claude-acr"),
+            "com.skepticdogsoftware.tailbus.bridge.claude-acr"
+        );
+        assert_eq!(daemon_unit(&default), "tailbus");
+        assert_eq!(bridge_unit(&default, "omp"), "tailbus-bridge-omp");
+
+        let other = Paths {
+            state: PathBuf::from("/tmp/a-test-home"),
+            config: PathBuf::from("/tmp/a-test-home/config.toml"),
+        };
+        let label = bridge_label(&other, "claude-acr");
+        assert!(
+            label.starts_with("com.skepticdogsoftware.tailbus."),
+            "{label}"
+        );
+        assert!(label.ends_with(".bridge.claude-acr"), "{label}");
+        assert_ne!(label, bridge_label(&default, "claude-acr"));
+        assert_ne!(daemon_label(&other), daemon_label(&default));
+        assert!(bridge_unit(&other, "omp").starts_with("tailbus-"));
+        assert_ne!(bridge_unit(&other, "omp"), bridge_unit(&default, "omp"));
+        // The same home always gets the same names.
+        assert_eq!(label, bridge_label(&other, "claude-acr"));
+    }
 
     #[test]
     fn confinement_blocks_reads_and_writes_outside_and_nothing_else() {

@@ -366,13 +366,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         },
         Cmd::Service { command } => match command {
             ServiceCmd::Install { now } => setup::service_install(&paths, now)?,
-            ServiceCmd::Uninstall => setup::service_uninstall()?,
+            ServiceCmd::Uninstall => setup::service_uninstall(&paths)?,
         },
         Cmd::Acr { command } => return acr::run(&paths, command),
         Cmd::Bridge { command } => match command {
             BridgeCmd::Run { agent } => bridge::run(&paths, &agent)?,
             BridgeCmd::Install { agent, now } => setup::bridge_install(&paths, &agent, now)?,
-            BridgeCmd::Uninstall { agent } => setup::bridge_uninstall(&agent)?,
+            BridgeCmd::Uninstall { agent } => setup::bridge_uninstall(&paths, &agent)?,
             BridgeCmd::Status { agent } => bridge::status(&paths, agent.as_deref())?,
             BridgeCmd::Log {
                 agent,

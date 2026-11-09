@@ -2284,7 +2284,7 @@ fn describe(paths: &Paths, agent: &str, bus: Option<&Status>) -> String {
         Err(e) => out.push_str(&format!("  Config problem: {e:#}\n")),
     }
     if cfg!(target_os = "macos") {
-        match setup::bridge_job(agent) {
+        match setup::bridge_job(paths, agent) {
             Some(job) => out.push_str(&format!("  launchd: {job}\n")),
             None => out.push_str("  launchd: not installed\n"),
         }
