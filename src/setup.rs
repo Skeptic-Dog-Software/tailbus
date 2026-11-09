@@ -699,77 +699,21 @@ pub fn bridge_job(agent: &str) -> Option<String> {
 /// runs every role through, on this machine.
 pub const ACR_AGENT: &str = "claude-acr";
 
-/// Settings, in `~/.config/tailbus/acr/`, that keep a review's Claude Code to
-/// the code under review: its file tools and its commands, subagents too.
+/// Settings, in `~/.config/tailbus/acr/`, that keep a review's Claude Code
+/// file tools to the code under review, subagents' too.
 pub const CONFINE_FILE: &str = "confine.json";
 
-/// Toolchains a reviewer may need to build and test, under the home folder,
-/// which the read block closes: they're opened again where they exist.
-const TOOLCHAINS: &[&str] = &[
-    "Tools/flutter",
-    "flutter",
-    "development/flutter",
-    "fvm",
-    ".fvm",
-    ".pub-cache",
-    ".dart-tool",
-    ".dartServer",
-    ".flutter",
-    ".flutter-devtools",
-    ".config/flutter",
-    "go",
-    "Library/Caches/go-build",
-    ".cache/go-build",
-    ".cargo",
-    ".rustup",
-    ".npm",
-    "Library/Android/sdk",
-    "Android/Sdk",
-];
-
-/// The confinement settings for this home folder:
-/// - Claude's file tools refuse paths outside the working directories;
-/// - its commands run in the sandbox, with no way out;
-/// - the toolchains that exist here stay usable;
-/// - commands reach only package registries.
-fn confine_settings(home: &Path) -> String {
-    let mut toolchains: Vec<String> = TOOLCHAINS
-        .iter()
-        .map(|t| home.join(t))
-        .chain(go_caches(home))
-        .chain(flutter_sdks(home))
-        .filter(|p| p.exists())
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    toolchains.sort();
-    toolchains.dedup();
+/// The confinement settings: Claude's file tools, a subagent's too, refuse
+/// paths outside the working directories.
+///
+/// Its commands aren't confined. Claude Code's sandbox would do that, but
+/// with the read block it stops a session that signs in with a token, as
+/// every reviewer here does, before its first request.
+fn confine_settings() -> String {
     let settings = serde_json::json!({
         "permissions": {
             "blockReadsOutsideWorkingDirectories": true,
             "blockWritesOutsideWorkingDirectories": true
-        },
-        "sandbox": {
-            "enabled": true,
-            "failIfUnavailable": true,
-            "allowUnsandboxedCommands": false,
-            "autoAllowBashIfSandboxed": true,
-            "filesystem": {
-                "allowRead": toolchains,
-                "allowWrite": toolchains
-            },
-            "network": {
-                // Test runners, such as Flutter's, listen on localhost.
-                "allowLocalBinding": true,
-                // Certificate checks, so a download that's allowed works.
-                "allowMachLookup": ["com.apple.trustd*", "com.apple.SecurityServer"],
-                "allowedDomains": [
-                    "pub.dev", "*.pub.dev", "storage.googleapis.com",
-                    "proxy.golang.org", "sum.golang.org",
-                    "crates.io", "*.crates.io",
-                    "registry.npmjs.org",
-                    "github.com", "*.githubusercontent.com"
-                ]
-            }
         }
     });
     let mut text = serde_json::to_string_pretty(&settings).unwrap_or_default();
@@ -841,58 +785,6 @@ model = "message.model"
         confine = p(confine),
         path = q(path),
     )
-}
-
-/// Where Go keeps its modules and build cache, and the file of settings that
-/// can move them, if Go is installed and they're under home: Go says, since
-/// GOPATH can be anywhere. Without its settings file, Go would look for its
-/// modules in the default place and try to download them.
-fn go_caches(home: &Path) -> Vec<PathBuf> {
-    let go = [
-        "/opt/homebrew/bin/go",
-        "/usr/local/go/bin/go",
-        "/usr/local/bin/go",
-        "/usr/bin/go",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_file());
-    let Some(out) = go.and_then(|go| {
-        Command::new(go)
-            .args(["env", "GOMODCACHE", "GOCACHE", "GOPATH", "GOENV"])
-            .stdin(Stdio::null())
-            .output()
-            .ok()
-    }) else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(PathBuf::from)
-        // GOENV is a file: its folder is what to open.
-        .map(|p| match p.file_name() {
-            Some(n) if n == "env" => p.parent().map(Path::to_path_buf).unwrap_or(p),
-            _ => p,
-        })
-        .filter(|p| p.starts_with(home))
-        .collect()
-}
-
-/// The SDKs Flutter's own settings point it at, under home: it lists the
-/// Android SDK's folders when it starts, even to run host tests.
-fn flutter_sdks(home: &Path) -> Vec<PathBuf> {
-    let Ok(text) = fs::read_to_string(home.join(".config/flutter/settings")) else {
-        return Vec::new();
-    };
-    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    ["android-sdk", "jdk-dir"]
-        .iter()
-        .filter_map(|k| settings[*k].as_str())
-        .map(PathBuf::from)
-        .filter(|p| p.starts_with(home))
-        .collect()
 }
 
 /// Adds `--settings <confine>` to an existing ACR bridge's arguments, if it
@@ -1156,16 +1048,20 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
         make_token(&claude, &token)?;
     }
     let confine = dir.join("acr").join(CONFINE_FILE);
-    if confine.exists() {
-        println!("Kept the reviewers' confinement, {}.", confine.display());
-    } else {
-        let home = home()?;
-        fs::create_dir_all(dir.join("acr"))?;
-        write(&confine, &confine_settings(&home))?;
-        println!(
-            "Wrote {}, which keeps reviewers to the code under review.",
-            confine.display()
-        );
+    let settings = confine_settings();
+    match fs::read_to_string(&confine) {
+        Ok(text) if text == settings => {
+            println!("Kept the reviewers' confinement, {}.", confine.display());
+        }
+        was => {
+            fs::create_dir_all(dir.join("acr"))?;
+            write(&confine, &settings)?;
+            let done = if was.is_ok() { "Updated" } else { "Wrote" };
+            println!(
+                "{done} {}, which keeps reviewers' file tools to the code under review.",
+                confine.display()
+            );
+        }
     }
     let mut doc = read_config(paths)?;
     let has_bridge = doc.get("bridges").and_then(|b| b.get(ACR_AGENT)).is_some();
@@ -1240,24 +1136,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn confinement_blocks_outside_reads_and_keeps_toolchains_that_exist() {
-        let home = temp("confine-home");
-        fs::create_dir_all(home.join(".pub-cache")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&confine_settings(&home)).unwrap();
+    fn confinement_blocks_reads_and_writes_outside_and_nothing_else() {
+        let v: serde_json::Value = serde_json::from_str(&confine_settings()).unwrap();
         assert_eq!(
             v["permissions"]["blockReadsOutsideWorkingDirectories"],
             true
         );
-        assert_eq!(v["sandbox"]["enabled"], true);
-        assert_eq!(v["sandbox"]["allowUnsandboxedCommands"], false);
-        assert_eq!(v["sandbox"]["failIfUnavailable"], true);
-        let read: Vec<&str> = v["sandbox"]["filesystem"]["allowRead"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|p| p.as_str())
-            .collect();
-        assert_eq!(read, [home.join(".pub-cache").to_string_lossy()]);
+        assert_eq!(
+            v["permissions"]["blockWritesOutsideWorkingDirectories"],
+            true
+        );
+        // The sandbox stops token sessions at startup when reads are blocked.
+        assert!(v.get("sandbox").is_none());
     }
 
     #[test]

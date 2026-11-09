@@ -172,9 +172,9 @@ pub struct Outcome {
 
 /// A trial's scratch folder and its copy of the change, removed however it
 /// ends.
-struct Scratch {
-    dir: PathBuf,
-    tree: PathBuf,
+pub(super) struct Scratch {
+    pub dir: PathBuf,
+    pub tree: PathBuf,
 }
 
 impl Drop for Scratch {
@@ -183,15 +183,100 @@ impl Drop for Scratch {
     }
 }
 
-/// A fresh repository holding the head and only what it reaches: no branches,
-/// no remote, and no later commit, so nothing in a trial can see how the
-/// change turned out. It's named after the repository, so its review config
-/// is found.
+/// How long what a failed trial left is kept, to find out why.
+const KEPT_DAYS: u64 = 7;
+/// A trial folder older than this was left by one that was killed: none runs
+/// this long.
+const STALE_DAYS: u64 = 3;
+
+impl Scratch {
+    /// Keeps what the trial's sessions left, its transcripts and debug logs,
+    /// but not the copy, for `KEPT_DAYS`. Returns where, if any of it moved.
+    pub(super) fn keep(&self, paths: &Paths) -> Option<PathBuf> {
+        let kept = kept_dir(paths).join(self.dir.file_name()?);
+        fs::create_dir_all(&kept).ok()?;
+        let mut moved = false;
+        for entry in fs::read_dir(&self.dir).ok()?.flatten() {
+            let path = entry.path();
+            if path != self.tree && fs::rename(&path, kept.join(entry.file_name())).is_ok() {
+                moved = true;
+            }
+        }
+        moved.then_some(kept)
+    }
+
+    /// The error, saying where what the trial left is kept.
+    pub(super) fn failed(&self, paths: &Paths, e: anyhow::Error) -> anyhow::Error {
+        match self.keep(paths) {
+            Some(kept) => anyhow::anyhow!(
+                "{e:#}\nWhat its sessions left is kept in {} for {KEPT_DAYS} days.",
+                kept.display()
+            ),
+            None => e,
+        }
+    }
+}
+
+fn kept_dir(paths: &Paths) -> PathBuf {
+    paths.state.join("acr-trials-kept")
+}
+
+/// Removes what failed trials left once it's past keeping, and the folders
+/// and canaries of trials that were killed.
+fn prune(paths: &Paths) {
+    let day = Duration::from_secs(24 * 3600);
+    let old = |path: &Path, days: u64| {
+        fs::symlink_metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day * days as u32))
+    };
+    let places = [
+        (kept_dir(paths), KEPT_DAYS),
+        (paths.state.join("acr-trials"), STALE_DAYS),
+    ];
+    for (dir, days) in places {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if old(&path, days) {
+                let _ = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+            }
+        }
+    }
+}
+
+/// A file outside every folder a trial's sessions may read, holding a secret
+/// no session could guess: one that says it is has read outside them.
+pub(super) struct Canary {
+    pub path: PathBuf,
+    pub secret: String,
+}
+
+impl Canary {
+    pub(super) fn new(paths: &Paths) -> Result<Canary> {
+        let dir = paths.state.join("acr-trials");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("canary-{}.txt", new_id()));
+        let secret = format!("canary-{}", new_id());
+        fs::write(&path, format!("{secret}\n"))?;
+        Ok(Canary { path, secret })
+    }
+}
+
+impl Drop for Canary {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// The key with its base and head as full commit names, since the trial's
 /// copy can fetch a commit only by its full name. The base has to be in the
 /// head's history: nothing else is in the copy, and a branch that has moved
 /// past the change would bring its fixes in.
-fn resolved(mut key: Key) -> Result<Key> {
+pub(super) fn resolved(mut key: Key) -> Result<Key> {
     let commit = |rev: &str| -> Result<String> {
         let full = super::change::git(
             &key.repo,
@@ -221,7 +306,12 @@ fn resolved(mut key: Key) -> Result<Key> {
     Ok(key)
 }
 
-fn scratch(paths: &Paths, key: &Key) -> Result<Scratch> {
+/// A fresh repository holding the head and only what it reaches: no branches,
+/// no remote, and no later commit, so nothing in a trial can see how the
+/// change turned out. It's named after the repository, so its review config
+/// is found.
+pub(super) fn scratch(paths: &Paths, key: &Key) -> Result<Scratch> {
+    prune(paths);
     let dir = paths.state.join("acr-trials").join(new_id());
     fs::create_dir_all(&dir)?;
     let dir = dir.canonicalize()?;
@@ -288,9 +378,9 @@ fn scratch(paths: &Paths, key: &Key) -> Result<Scratch> {
     Ok(s)
 }
 
-/// The settings that keep a trial's Claude Code, its subagents and their
-/// commands to the trial's copy, its scratch space and the toolchains they
-/// need. A trial won't run without them.
+/// The settings that keep a trial's Claude Code file tools, and its
+/// subagents', to the trial's copy and its scratch space. A trial won't run
+/// without them.
 fn confine_settings(paths: &Paths) -> Result<PathBuf> {
     let path = paths
         .config
@@ -341,6 +431,9 @@ fn claude(paths: &Paths, config: &Path, workdir: &Path, ask: &Ask) -> Result<Str
         .args(["--allowedTools", tools, "--tools", tools])
         .arg("--settings")
         .arg(&confine)
+        // Kept with the rest if the trial fails, to show where it stopped.
+        .arg("--debug-file")
+        .arg(config.join("debug.txt"))
         .arg("--add-dir")
         .arg(config.parent().unwrap_or(config))
         .current_dir(workdir)
@@ -359,19 +452,45 @@ fn claude(paths: &Paths, config: &Path, workdir: &Path, ask: &Ask) -> Result<Str
         .context("claude's stdin")?
         .write_all(prompt.as_bytes())?;
     let until = Instant::now() + limit;
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         if Instant::now() >= until {
             // SAFETY: signals the process group it leads, which this started.
             unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.wait();
-            bail!("it ran past {} minutes", limit.as_secs() / 60);
+            bail!(
+                "it ran past {} s, and ended: {}",
+                limit.as_secs(),
+                last_words(&out)
+            );
         }
         std::thread::sleep(Duration::from_secs(1));
+    };
+    if !status.success() {
+        bail!("claude {status}, and ended: {}", last_words(&out));
     }
     Ok(fs::read_to_string(&out).unwrap_or_default())
+}
+
+/// The end of what a session said, to show in an error.
+fn last_words(out: &Path) -> String {
+    let text = fs::read_to_string(out).unwrap_or_default();
+    let text = text.trim();
+    if text.is_empty() {
+        return "(it said nothing)".into();
+    }
+    let mut start = text.len().saturating_sub(800);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &text[start..];
+    if start > 0 {
+        format!("…{tail}")
+    } else {
+        tail.to_owned()
+    }
 }
 
 /// The tokens every session in a Claude config folder used, subagents too.
@@ -489,8 +608,13 @@ fn builder_led(paths: &Paths, s: &Scratch, key: &Key, arm: Arm) -> Result<Ran> {
         },
     )?;
     let (counts, models) = measured(&config);
-    let text = fs::read_to_string(&result)
-        .with_context(|| format!("the builder wrote no {}", result.display()))?;
+    let Ok(text) = fs::read_to_string(&result) else {
+        bail!(
+            "the builder wrote no {}, and ended: {}",
+            result.display(),
+            last_words(&config.join("out.txt"))
+        );
+    };
     let value = last_json(&text).context("the builder's result isn't JSON")?;
     let findings = value["findings"]
         .as_array()
@@ -613,8 +737,118 @@ pub struct Ran {
 
 pub type Separated<'a> = &'a dyn Fn(&Path, &Key) -> Result<Ran>;
 
+/// A check's session: the smallest model, since all it does is a few reads.
+const CHECK_MODEL: &str = "claude-haiku-5-5";
+/// Long enough for a few reads; a session that hasn't answered by then has
+/// stopped.
+pub(super) const CHECK_SECS: u64 = 180;
+
+/// What a check asks a session: read in the copy and outside it, run a
+/// command in it if it has a shell, and write its answer where a builder
+/// writes its result if `result` is given.
+pub(super) fn check_prompt(
+    tree: &Path,
+    canary: &Path,
+    bash: bool,
+    result: Option<&Path>,
+) -> String {
+    let mut steps = vec![
+        format!(
+            "With the Read tool, read {}. Put its first line in \"inside\".",
+            tree.join(".git/HEAD").display()
+        ),
+        format!(
+            "With the Read tool, read {}. Put its first line in \"outside\", or \"refused\" if you can't read it.",
+            canary.display()
+        ),
+    ];
+    if bash {
+        steps.push(
+            "In Bash, run `git rev-parse HEAD`. Put what it prints in \"bash_inside\".".into(),
+        );
+    }
+    if let Some(result) = result {
+        steps.push(format!(
+            "With the Write tool, write your JSON object to {}.",
+            result.display()
+        ));
+    }
+    let steps: Vec<String> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {s}", i + 1))
+        .collect();
+    format!(
+        "This is a check of your setup, not a review. Do each step in order, and then answer with only a JSON object holding what the steps say.\n\n{}\n",
+        steps.join("\n")
+    )
+}
+
+/// What's wrong with a check's answer: empty if the session read the copy,
+/// ran its command there, and didn't read the canary.
+pub(super) fn check_answer(text: &str, head: &str, secret: &str, bash: bool) -> Vec<String> {
+    let mut wrong = Vec::new();
+    if text.contains(secret) {
+        wrong.push("it read a file outside its folders".to_owned());
+    }
+    let Some(v) = last_json(text) else {
+        wrong.push(format!("its answer has no JSON: {}", text.trim()));
+        return wrong;
+    };
+    let got = |k: &str| v[k].as_str().unwrap_or_default().trim().to_owned();
+    if got("inside") != head {
+        wrong.push(format!(
+            "it didn't read the copy's HEAD with the Read tool: it got {:?}",
+            got("inside")
+        ));
+    }
+    if bash && got("bash_inside") != head {
+        wrong.push(format!(
+            "its Bash didn't run in the copy: it got {:?}",
+            got("bash_inside")
+        ));
+    }
+    wrong
+}
+
+/// Checks a session started as a trial's builder is: it starts, reads in the
+/// copy and not outside it, runs a command, and writes its result. Returns
+/// what's wrong.
+pub(super) fn check_session(
+    paths: &Paths,
+    s: &Scratch,
+    key: &Key,
+    canary: &Canary,
+) -> Result<Vec<String>> {
+    let config = s.dir.join("check");
+    fs::create_dir_all(&config)?;
+    let result = s.dir.join("check.json");
+    let prompt = check_prompt(&s.tree, &canary.path, true, Some(&result));
+    let text = claude(
+        paths,
+        &config,
+        &s.tree,
+        &Ask {
+            model: CHECK_MODEL,
+            effort: "low",
+            tools: "Bash,Read,Write",
+            prompt: &prompt,
+            limit: Duration::from_secs(CHECK_SECS),
+        },
+    )?;
+    let mut wrong = check_answer(&text, &key.head, &canary.secret, true);
+    let written = fs::read_to_string(&result).unwrap_or_default();
+    if last_json(&written).is_none() {
+        wrong.push(format!(
+            "it didn't write its answer to {}, where a builder writes its result",
+            result.display()
+        ));
+    }
+    Ok(wrong)
+}
+
 /// Runs one design on one change, and scores it.
-fn read_key(key_path: &Path) -> Result<Key> {
+pub(super) fn read_key(key_path: &Path) -> Result<Key> {
     serde_yaml_ng::from_str(
         &fs::read_to_string(key_path).with_context(|| format!("reading {}", key_path.display()))?,
     )
@@ -634,15 +868,16 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Re
     let s = scratch(paths, &key)?;
     let started = Instant::now();
     let ran = match arm {
-        Arm::OneSize | Arm::Sized => builder_led(paths, &s, &key, arm)?,
-        Arm::Separated => separated(&s.tree, &key)?,
-    };
+        Arm::OneSize | Arm::Sized => builder_led(paths, &s, &key, arm),
+        Arm::Separated => separated(&s.tree, &key),
+    }
+    .map_err(|e| s.failed(paths, e))?;
     let seconds = started.elapsed().as_secs();
     // New work has no findings yet: it's scored once its own review is done.
     let score = if key.findings.is_empty() {
         None
     } else {
-        Some(score(paths, &s.dir, &key, &ran.findings)?)
+        Some(score(paths, &s.dir, &key, &ran.findings).map_err(|e| s.failed(paths, e))?)
     };
     Ok(Outcome {
         key: key_name(key_path),
@@ -774,6 +1009,80 @@ mod tests {
         let tree = s.tree.clone();
         drop(s);
         assert!(!tree.exists(), "the copy goes when the trial ends");
+    }
+
+    #[test]
+    fn a_check_catches_a_read_outside_and_a_session_outside_the_copy() {
+        let head = "a".repeat(40);
+        let good = format!(
+            "Done.\n{{\"inside\": \"{head}\", \"outside\": \"refused\", \"bash_inside\": \"{head}\"}}"
+        );
+        assert!(check_answer(&good, &head, "canary-x", true).is_empty());
+        let leaked = format!(
+            "{{\"inside\": \"{head}\", \"outside\": \"canary-x\", \"bash_inside\": \"{head}\"}}"
+        );
+        let wrong = check_answer(&leaked, &head, "canary-x", true);
+        assert!(wrong[0].contains("outside its folders"), "{wrong:?}");
+        let elsewhere = "{\"inside\": \"ref: refs/heads/main\", \"outside\": \"refused\"}";
+        let wrong = check_answer(elsewhere, &head, "canary-x", true);
+        assert_eq!(wrong.len(), 2, "{wrong:?}");
+        assert!(!check_answer("I can't.", &head, "canary-x", true).is_empty());
+        // Without a shell, no command is asked for or expected.
+        let read_only = format!("{{\"inside\": \"{head}\", \"outside\": \"refused\"}}");
+        assert!(check_answer(&read_only, &head, "canary-x", false).is_empty());
+        let prompt = check_prompt(Path::new("/t"), Path::new("/c"), false, None);
+        assert!(!prompt.contains("Bash") && !prompt.contains("Write"));
+        let prompt = check_prompt(
+            Path::new("/t"),
+            Path::new("/c"),
+            true,
+            Some(Path::new("/r")),
+        );
+        assert!(
+            prompt.contains("/t/.git/HEAD") && prompt.contains("Bash") && prompt.contains("/r")
+        );
+    }
+
+    #[test]
+    fn a_failed_trial_keeps_what_its_sessions_left_but_not_the_copy() {
+        let dir = std::env::temp_dir().join(format!("tb-trial-kept-{}", new_id()));
+        let paths = Paths {
+            state: dir.join("state"),
+            config: dir.join("config.toml"),
+        };
+        let trial = paths.state.join("acr-trials").join(new_id());
+        let tree = trial.join("repo");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("a.txt"), "code").unwrap();
+        fs::create_dir_all(trial.join("builder")).unwrap();
+        fs::write(trial.join("builder/debug.txt"), "where it stopped").unwrap();
+        let s = Scratch {
+            dir: trial.clone(),
+            tree,
+        };
+        let e = s.failed(&paths, anyhow::anyhow!("it broke"));
+        let said = format!("{e:#}");
+        assert!(
+            said.starts_with("it broke") && said.contains("kept in"),
+            "{said}"
+        );
+        let kept = kept_dir(&paths).join(trial.file_name().unwrap());
+        assert_eq!(
+            fs::read_to_string(kept.join("builder/debug.txt")).unwrap(),
+            "where it stopped"
+        );
+        assert!(!kept.join("repo").exists(), "the copy isn't kept");
+        drop(s);
+        assert!(!trial.exists());
+        // Nothing left to keep, and the error stands as it was.
+        let empty = paths.state.join("acr-trials").join(new_id());
+        fs::create_dir_all(empty.join("repo")).unwrap();
+        let s = Scratch {
+            tree: empty.join("repo"),
+            dir: empty,
+        };
+        assert_eq!(format!("{:#}", s.failed(&paths, anyhow::anyhow!("x"))), "x");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

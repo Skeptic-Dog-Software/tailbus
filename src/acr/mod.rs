@@ -117,6 +117,15 @@ pub enum AcrCmd {
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
     },
+    /// Check that a trial on this key can run, before spending one on it.
+    /// A session is started as a builder is, and one through each bridge and
+    /// set of tools the separated design uses: each must start, read the
+    /// trial's copy, fail to read a file outside it, and run a command where
+    /// it has a shell. A few small calls.
+    Check {
+        /// The answer key, as for `trial`.
+        key: PathBuf,
+    },
     /// Allow ACR to review a repository on this machine.
     AddRepo {
         /// The repository's top folder.
@@ -837,8 +846,120 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 }
             }
         }
+        AcrCmd::Check { key } => {
+            if !check(paths, &key)? {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `tailbus acr check`: prints how each session did. Returns whether all did
+/// as they should.
+fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
+    let key = trial::resolved(trial::read_key(key_path)?)?;
+    let s = trial::scratch(paths, &key)?;
+    let canary = trial::Canary::new(paths)?;
+    let mut ok = true;
+    let mut report = |what: &str, started: std::time::Instant, wrong: Result<Vec<String>>| {
+        let secs = started.elapsed().as_secs();
+        match wrong {
+            Ok(wrong) if wrong.is_empty() => println!("{what}: ok, in {secs} s"),
+            Ok(wrong) => {
+                ok = false;
+                println!("{what}: wrong, in {secs} s");
+                for w in wrong {
+                    println!("  {w}");
+                }
+            }
+            Err(e) => {
+                ok = false;
+                println!("{what}: failed after {secs} s: {e:#}");
+            }
+        }
+    };
+    let started = std::time::Instant::now();
+    let wrong = trial::check_session(paths, &s, &key, &canary);
+    report("a builder's session", started, wrong);
+
+    // The separated design's bindings: one call for each bridge and set of
+    // tools, since that's what decides how a session starts.
+    let target = Target {
+        repo: s.tree.clone(),
+        base: key.base.clone(),
+        config: None,
+        head: Some(key.head.clone()),
+        human_gate: None,
+        max_rounds: None,
+        review_scope: None,
+        bindings: Vec::new(),
+    };
+    let (cfg, _) = load_config(paths, &target, &flags(&target))?;
+    let mut names: Vec<&String> = cfg
+        .bindings
+        .values()
+        .chain(cfg.lenses.iter().filter_map(|l| l.binding.as_ref()))
+        .collect();
+    names.sort();
+    names.dedup();
+    let mut chosen: Vec<(&String, &config::Binding)> = Vec::new();
+    for name in names {
+        let Some(b) = cfg.allowed_bindings.get(name) else {
+            continue;
+        };
+        if !chosen
+            .iter()
+            .any(|(_, c)| c.agent == b.agent && c.tools == b.tools)
+        {
+            chosen.push((name, b));
+        }
+    }
+    let mut allowed = AllowedFor {
+        paths,
+        tree: s.tree.clone(),
+        bridges: Vec::new(),
+    };
+    for (_, b) in &chosen {
+        let bridge = b.agent.split('@').next().unwrap_or(&b.agent).to_string();
+        if !allowed.bridges.contains(&bridge) {
+            crate::setup::acr_repo(paths, &s.tree, true, &bridge)?;
+            allowed.bridges.push(bridge);
+        }
+    }
+    let caller = BridgeCaller::new(paths)?;
+    for (name, b) in chosen {
+        // Without a list, it gets whatever its bridge gives, a shell maybe.
+        let bash = b
+            .tools
+            .as_ref()
+            .is_none_or(|t| t.iter().any(|t| t == "Bash"));
+        let binding = config::Binding {
+            timeout: Some(trial::CHECK_SECS),
+            ..b.clone()
+        };
+        let prompt = trial::check_prompt(&s.tree, &canary.path, bash, None);
+        let started = std::time::Instant::now();
+        let answer = caller.call(&Call {
+            role: Role::Reviewer,
+            binding_name: name,
+            binding: &binding,
+            prompt: &prompt,
+            artifact: None,
+            writes: false,
+            repo: &s.tree,
+        });
+        let wrong = answer.map(|a| trial::check_answer(&a.text, &key.head, &canary.secret, bash));
+        report(&format!("{name} through {}", b.agent), started, wrong);
+    }
+    drop(allowed);
+    if !ok && let Some(kept) = s.keep(paths) {
+        println!(
+            "What the builder's session left is kept in {}.",
+            kept.display()
+        );
+    }
+    Ok(ok)
 }
 
 /// One round of the pipeline, as a change first comes out, with nobody

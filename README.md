@@ -37,7 +37,8 @@ tailbus acr add-repo ~/Work/my-repo   # let ACR review a repository here
 ```
 
 `tailbus setup acr` sets up everything ACR needs on this machine, and leaves
-alone whatever's there already, so running it again is safe:
+alone whatever's there already but the confinement, which it keeps current,
+so running it again is safe:
 
 - **A token** for headless Claude Code on your subscription. If there's none,
   it runs `claude setup-token` and asks you to paste what it prints, without
@@ -45,6 +46,12 @@ alone whatever's there already, so running it again is safe:
 - **The `claude-acr` bridge** in `config.toml`, which runs Claude Code in the
   repository under review with only the tools a role is given, a fresh
   config for each call, and its usage read from its transcript.
+- **The reviewers' confinement** in `~/.config/tailbus/acr/confine.json`,
+  which the bridge passes to every call: Claude Code's file tools, and its
+  subagents', refuse paths outside the repository under review and the
+  call's own folders. Its commands aren't confined. Claude Code's sandbox
+  would do that, but together with this it stops a session that signs in
+  with a token before its first request.
 - **ACR's bindings** in `acr.yaml`, if you have none: Haiku for the Sizer,
   Sonnet for reviewers, Opus for the Orchestrator and Judge, all on this
   machine and counted in tokens.
