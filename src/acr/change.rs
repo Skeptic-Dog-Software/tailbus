@@ -22,6 +22,75 @@ pub struct Change {
     /// The whole diff, when files were left out, for a lens that reads them.
     pub full: Option<String>,
     pub generated: Vec<LeftOut>,
+    /// Its commits, oldest first, without merges: what it says, commit by
+    /// commit, it's for.
+    pub commits: Vec<Commit>,
+}
+
+/// A commit in a change, with its whole message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub id: String,
+    pub message: String,
+}
+
+/// The commits from `base` to `tip`, oldest first, leaving out merges,
+/// whose messages say nothing about the change.
+pub fn commits(repo: &Path, base: &str, tip: &str) -> Result<Vec<Commit>> {
+    let range = format!("{base}..{tip}");
+    let out = git(
+        repo,
+        &[
+            "log",
+            "--reverse",
+            "--no-merges",
+            "--format=%h%x1f%B%x1e",
+            &range,
+        ],
+    )?;
+    Ok(out
+        .split('\x1e')
+        .filter_map(|record| {
+            let (id, message) = record.trim_start().split_once('\x1f')?;
+            Some(Commit {
+                id: id.trim().to_string(),
+                message: message.trim().to_string(),
+            })
+        })
+        .collect())
+}
+
+/// What a change says it's for, in its own words: its description, such as
+/// its pull request's, and its commit messages. Every role gets this ahead
+/// of the diff. With the comments the change adds, these are its claims: the
+/// author's account of it, to check, never to take on trust.
+pub fn intent(description: Option<&str>, commits: &[Commit]) -> String {
+    let mut out = String::from(
+        "# What this change says it's for\n\n\
+         In its own words: its description and its commit messages. With the comments it \
+         adds, these are claims to check against the code and tests, not facts.\n\n\
+         ## Its description\n\n",
+    );
+    match description.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(text) => {
+            out.push_str(text);
+            out.push_str("\n\n");
+        }
+        None => out.push_str("None was given.\n\n"),
+    }
+    out.push_str("## Its commits, oldest first\n\n");
+    if commits.is_empty() {
+        out.push_str("None.\n\n");
+    }
+    for c in commits {
+        let message = if c.message.is_empty() {
+            "(no message)"
+        } else {
+            &c.message
+        };
+        out.push_str(&format!("### {}\n\n{message}\n\n", c.id));
+    }
+    out
 }
 
 /// A generated file left out of the diff a review sends.
@@ -159,6 +228,7 @@ pub fn load(
     let change = Change {
         files: names.lines().map(str::to_string).collect(),
         diff: git(repo, &["diff", &range])?,
+        commits: commits(repo, base, head.as_deref().unwrap_or("HEAD"))?,
         ..Change::default()
     };
     leave_out_generated(repo, base, change, generated)
@@ -349,6 +419,49 @@ pub mod tests {
                 .unwrap();
             assert!(out.status.success(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn a_change_carries_its_own_commit_messages_oldest_first() {
+        let dir = repo_with(&[("a.txt", "one\n")]);
+        commit(
+            &dir,
+            &[("a.txt", "two\n")],
+            "Fix B-1: keep the edit\n\nThe save path dropped it.",
+        );
+        commit(&dir, &[("b.txt", "new\n")], "Test the edit");
+        let change = load(
+            &dir,
+            "main~2",
+            Some("main"),
+            ReviewScope::WholePr,
+            &Generated::default(),
+        )
+        .unwrap();
+        let messages: Vec<&str> = change.commits.iter().map(|c| c.message.as_str()).collect();
+        // The base's own commit isn't the change's.
+        assert_eq!(
+            messages,
+            [
+                "Fix B-1: keep the edit\n\nThe save path dropped it.",
+                "Test the edit"
+            ]
+        );
+        assert!(change.commits.iter().all(|c| c.id.len() >= 7));
+
+        let text = intent(Some("Fixes B-1.\n"), &change.commits);
+        let fix = text.find("Fix B-1: keep the edit").unwrap();
+        assert!(
+            text.contains("## Its description\n\nFixes B-1.\n"),
+            "{text}"
+        );
+        assert!(fix < text.find("Test the edit").unwrap(), "{text}");
+        assert!(text.contains("claims to check"), "{text}");
+        let bare = intent(None, &[]);
+        assert!(
+            bare.contains("None was given.") && bare.contains("None.\n"),
+            "{bare}"
+        );
     }
 
     #[test]

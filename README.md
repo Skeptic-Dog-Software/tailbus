@@ -580,6 +580,15 @@ on. Models are called only for judgment.
 | `tailbus acr resume <run id>` | Go on past a gate: `--fold` and `--waive` take blockers' IDs, and `--approve` and `--stop` do what they say. |
 | `tailbus acr benchmark --base <ref> --known <file>` | Run a binding set against a commit with known blockers, and report what was caught, missed and falsely found, and the cost. |
 
+**What the change is for.** Every role gets, ahead of the diff, what the
+change says about itself: its description, from `--description <file>` or a
+pull request's title and description with `--pr <number>` (or `--post-pr`'s)
+through `gh`, and its commit messages, oldest first. With the comments the
+change adds, these are its claims. Reviewers check them against the code and
+tests, and the Judge rates a defect by what it costs given that purpose. A
+repository with good commit messages and pull request descriptions needs
+nothing else set up for it.
+
 `run` and `resume` exit 0 when every lens is confirmed or waived, 3 when they're
 waiting for a person, 4 on an escalation, and 1 if the review ended with
 lenses open. `--post-pr <number>` puts the labels and comment on a pull

@@ -555,7 +555,13 @@ fn dimensions_text(key: &Key, criteria: &[(String, String)]) -> String {
         .join("\n")
 }
 
-fn builder_prompt(key: &Key, arm: Arm, result: &Path, criteria: &[(String, String)]) -> String {
+fn builder_prompt(
+    key: &Key,
+    arm: Arm,
+    result: &Path,
+    criteria: &[(String, String)],
+    intent: &str,
+) -> String {
     let sizing = match arm {
         Arm::OneSize => {
             "Run every reviewer on opus at xhigh effort, whatever its dimension: this trial \
@@ -566,7 +572,8 @@ fn builder_prompt(key: &Key, arm: Arm, result: &Path, criteria: &[(String, Strin
     format!(
         "You built this change. It's the range {base}..HEAD in this working directory, where \
          HEAD is {head}.\n\n\
-         What it's for:\n{context}\n\n\
+         {intent}\n\
+         Your reviewers get the same, ahead of the diff.\n\n\
          Review it with the acr skill: load it with the Skill tool and follow it. The \
          dimensions, each with this repository's criteria for it where it has them, which \
          set its bar:\n{dimensions}\n\n{sizing}\n\n\
@@ -579,7 +586,7 @@ fn builder_prompt(key: &Key, arm: Arm, result: &Path, criteria: &[(String, Strin
          Keep a finding you reject in the list, with blocker false and ruling reject.",
         base = key.base,
         head = key.head,
-        context = key.context.trim(),
+        intent = intent.trim_end(),
         dimensions = dimensions_text(key, criteria),
         result = result.display(),
     )
@@ -594,7 +601,11 @@ fn builder_led(paths: &Paths, s: &Scratch, key: &Key, arm: Arm) -> Result<Ran> {
     fs::write(skill.join("SKILL.md"), SKILL)?;
     let result = s.dir.join("result.json");
     let criteria = super::lens_criteria(paths, &s.tree, key);
-    let prompt = builder_prompt(key, arm, &result, &criteria);
+    // What the pipeline's roles get too: the key's context, frozen before any
+    // review, in place of the pull request's description, and the commits.
+    let commits = super::change::commits(&s.tree, &key.base, &key.head)?;
+    let intent = super::change::intent(Some(&key.context), &commits);
+    let prompt = builder_prompt(key, arm, &result, &criteria, &intent);
     claude(
         paths,
         &config,
@@ -1159,14 +1170,27 @@ mod tests {
             "correctness".to_string(),
             "Comments claim only what the code does.".to_string(),
         )];
-        let one = builder_prompt(&key, Arm::OneSize, Path::new("/s/result.json"), &criteria);
+        let commits = [crate::acr::change::Commit {
+            id: "abc1234".into(),
+            message: "Send it once".into(),
+        }];
+        let intent = crate::acr::change::intent(Some(&key.context), &commits);
+        let one = builder_prompt(
+            &key,
+            Arm::OneSize,
+            Path::new("/s/result.json"),
+            &criteria,
+            &intent,
+        );
         assert!(one.contains("opus at xhigh"));
         assert!(one.contains(
             "- correctness: Comments claim only what the code does.\n- regression-safety"
         ));
-        let sized = builder_prompt(&key, Arm::Sized, Path::new("/s/result.json"), &[]);
+        let sized = builder_prompt(&key, Arm::Sized, Path::new("/s/result.json"), &[], &intent);
         assert!(sized.contains("Size each reviewer") && !sized.contains("xhigh"));
         assert!(sized.contains("b..HEAD") && sized.contains("/s/result.json"));
-        assert!(sized.contains("Sends a welcome email once."));
+        // The same account of the change the pipeline's roles get.
+        assert!(sized.contains(&intent.trim_end()[..intent.trim_end().len().min(400)]));
+        assert!(sized.contains("Sends a welcome email once.") && sized.contains("Send it once"));
     }
 }

@@ -65,6 +65,46 @@ pub struct Target {
     /// Use a binding for a role, as `role=name`. Can be repeated.
     #[arg(long = "binding", value_name = "ROLE=NAME", value_parser = parse_binding)]
     bindings: Vec<(Role, String)>,
+    /// What the change says it's for, in a file, such as its pull request's
+    /// description. Every role gets it, with the commit messages, ahead of
+    /// the diff.
+    #[arg(long, value_name = "FILE", conflicts_with = "pr")]
+    description: Option<PathBuf>,
+    /// The pull request whose title and description say what the change is
+    /// for, read with `gh`. `--post-pr` reads its own when this is left out.
+    #[arg(long, value_name = "NUMBER")]
+    pr: Option<u64>,
+}
+
+/// What the change says it's for: `--description`'s file, or a pull
+/// request's title and description. None, if neither is given: then the
+/// roles go by the commit messages and the change's own comments.
+fn description_of(target: &Target, post_pr: Option<u64>) -> Result<Option<String>> {
+    if let Some(file) = &target.description {
+        let text = fs::read_to_string(file)
+            .with_context(|| format!("reading the description, {}", file.display()))?;
+        return Ok(Some(text));
+    }
+    let Some(pr) = target.pr.or(post_pr) else {
+        return Ok(None);
+    };
+    let out = Command::new("gh")
+        .args(["pr", "view", &pr.to_string(), "--json", "title,body"])
+        .args(["--jq", r##""# " + .title + "\n\n" + (.body // "")"##])
+        .current_dir(&target.repo)
+        .stdin(Stdio::null())
+        .output()
+        .context("running gh, to read the pull request's description")?;
+    if !out.status.success() {
+        bail!(
+            "couldn't read pull request #{pr}'s description with gh: {}. Pass \
+             --description <file> instead.",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    ))
 }
 
 fn parse_gate(s: &str) -> Result<HumanGate, String> {
@@ -561,6 +601,7 @@ fn setting<'a>(
         cfg,
         not_findings,
         work_dir: dir,
+        description: None,
     })
 }
 
@@ -758,9 +799,11 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             cfg.check_bindings()?;
             cfg.check_local(&this_machine(paths)?)?;
             change::checked_out(&target.repo, target.head.as_deref())?;
+            let description = description_of(&target, post_pr)?;
             let id = new_id();
             let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
-            let s = setting(paths, &cfg, &id, Some(list))?;
+            let mut s = setting(paths, &cfg, &id, Some(list))?;
+            s.description = description;
             // Under way until this ends, so an update to tailbus waits for it.
             let _active = keep::active_guard(paths, &id)?;
             let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
@@ -799,7 +842,8 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 stop,
             };
             flow::decide(&mut run, &decision)?;
-            let s = setting(paths, &cfg, &run_id, None)?;
+            let mut s = setting(paths, &cfg, &run_id, None)?;
+            s.description = run.description.clone();
             let (repo, base) = (run.repo.clone(), run.base.clone());
             let caller = BridgeCaller::new(paths)?;
             let head = run.head.clone();
@@ -814,7 +858,8 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                     .with_context(|| format!("reading {}", known.display()))?,
             )
             .context("in the known blockers")?;
-            let run = one_round(paths, &target)?;
+            let description = description_of(&target, None)?;
+            let run = one_round(paths, &target, description)?;
             let score = flow::score(&run, &known)?;
             println!("{}", serde_json::to_string_pretty(&score)?);
         }
@@ -894,6 +939,8 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         max_rounds: None,
         review_scope: None,
         bindings: Vec::new(),
+        description: None,
+        pr: None,
     };
     let (cfg, _) = load_config(paths, &target, &flags(&target))?;
     let mut names: Vec<&String> = cfg
@@ -964,7 +1011,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
 
 /// One round of the pipeline, as a change first comes out, with nobody
 /// fixing anything and escalations taken as seen. Leaves nothing behind.
-fn one_round(paths: &Paths, target: &Target) -> Result<Run> {
+fn one_round(paths: &Paths, target: &Target, description: Option<String>) -> Result<Run> {
     let mut flags = flags(target);
     flags.max_rounds = Some(1);
     flags.human_gate = Some(HumanGate::Exception);
@@ -974,7 +1021,8 @@ fn one_round(paths: &Paths, target: &Target) -> Result<Run> {
     change::checked_out(&target.repo, target.head.as_deref())?;
     let id = new_id();
     let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
-    let s = setting(paths, &cfg, &id, Some(list))?;
+    let mut s = setting(paths, &cfg, &id, Some(list))?;
+    s.description = description;
     // Under way until this ends, so an update to tailbus waits for it.
     let _active = keep::active_guard(paths, &id)?;
     let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
@@ -1023,6 +1071,8 @@ fn lens_criteria(paths: &Paths, tree: &Path, key: &trial::Key) -> Vec<(String, S
         max_rounds: None,
         review_scope: None,
         bindings: Vec::new(),
+        description: None,
+        pr: None,
     };
     match load_config(paths, &target, &flags(&target)) {
         Ok((cfg, _)) => cfg
@@ -1048,6 +1098,8 @@ fn separated(paths: &Paths, tree: &Path, key: &trial::Key) -> Result<trial::Ran>
         max_rounds: None,
         review_scope: None,
         bindings: Vec::new(),
+        description: None,
+        pr: None,
     };
     let (cfg, _) = load_config(paths, &target, &flags(&target))?;
     let mut bridges: Vec<String> = cfg
@@ -1067,7 +1119,9 @@ fn separated(paths: &Paths, tree: &Path, key: &trial::Key) -> Result<trial::Ran>
         crate::setup::acr_repo(paths, tree, true, bridge)?;
         allowed.bridges.push(bridge.clone());
     }
-    let run = one_round(paths, &target)?;
+    // The key's context, frozen before any review, stands in for the pull
+    // request's description, which may have changed since.
+    let run = one_round(paths, &target, Some(key.context.clone()))?;
     drop(allowed);
     let mut found = Vec::new();
     let mut failures: Vec<String> = run.escalations.iter().map(|e| e.reason.clone()).collect();
@@ -1150,7 +1204,26 @@ mod tests {
             max_rounds: None,
             review_scope: None,
             bindings: Vec::new(),
+            description: None,
+            pr: None,
         }
+    }
+
+    #[test]
+    fn a_description_comes_from_its_file_and_nothing_is_none() {
+        let dir = std::env::temp_dir().join(format!("tb-desc-{}", new_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pr.md");
+        fs::write(&file, "# Fix B-1\n\nAn edit keeps the date.").unwrap();
+        let mut t = target(&dir, None);
+        assert_eq!(description_of(&t, None).unwrap(), None);
+        t.description = Some(file);
+        assert_eq!(
+            description_of(&t, Some(7)).unwrap().as_deref(),
+            Some("# Fix B-1\n\nAn edit keeps the date.")
+        );
+        t.description = Some(dir.join("missing.md"));
+        assert!(description_of(&t, None).is_err());
     }
 
     #[test]

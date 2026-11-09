@@ -128,7 +128,8 @@ pub fn sizer_prompt(tiers: &[&Tier], files: &[String]) -> String {
         })
         .collect();
     format!(
-        "Classify the attached change into one tier. The tiers run from lowest to highest:\n\n\
+        "Classify the attached change into one tier. It starts with what the change says \
+         it's for, then its diff. The tiers run from lowest to highest:\n\n\
          {rules}\nThe changed files are: {}.\n\n\
          Answer with only JSON: {{\"tier\": \"<id>\", \"sure\": true or false, \
          \"reason\": \"<one line>\"}}. If you're not sure, say so.",
@@ -157,7 +158,8 @@ pub fn orchestrator_prompt(lenses: &[(&str, &str)], escalate: &[String]) -> Stri
         .collect();
     let escalate_list: String = escalate.iter().map(|e| format!("- {e}\n")).collect();
     format!(
-        "Read the attached change, and say which of these apply to it.\n\n\
+        "Read the attached change, which starts with what it says it's for, then its diff, \
+         and say which of these apply to it.\n\n\
          Lenses, each with when it applies:\n{lens_list}\n\
          Things that must go to a person:\n{escalate_list}\n\
          Answer with only JSON: {{\"lenses\": [\"<id>\"], \"escalate\": [\"<item, word for word>\"]}}. \
@@ -187,8 +189,9 @@ struct Reviewed {
 }
 
 /// A reviewer's whole brief: the lens, the scope, and what's already been
-/// decided. It gets nothing else: not the author's reasoning, and not the
-/// rebuttals of earlier rounds. The artifact is the attached file.
+/// decided. The attached file is the change: what it says it's for, then its
+/// diff. Those are its claims; the reviewer gets nothing of the case made
+/// for them, and none of the rebuttals of earlier rounds.
 pub fn reviewer_prompt(lens: &Lens, scope: &str, not_findings: &str) -> String {
     let decided = match not_findings.trim() {
         "" => "None.".to_string(),
@@ -197,9 +200,12 @@ pub fn reviewer_prompt(lens: &Lens, scope: &str, not_findings: &str) -> String {
     format!(
         "You are the reviewer for {id}. Find what is wrong.\n\n\
          What wrong means here: {criteria}\n\n\
-         Scope: {scope}. The change is the attached diff. Attack that, and nothing outside this \
-         lens. Your working directory is the repository, as the change leaves it: read any of \
-         it you need, but change nothing.\n\n\
+         Scope: {scope}. The change is the attached file: first what it says it's for, in its \
+         own description and commit messages, then its diff. Attack that, and nothing outside \
+         this lens. The description, the commit messages and the comments the change adds are \
+         claims: check them against the code and tests too, and report one the change doesn't \
+         bear out. Your working directory is the repository, as the change leaves it: read any \
+         of it you need, but change nothing.\n\n\
          Not findings, which are already decided, so leave them out:\n{decided}\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
          \"<the evidence>\", \"file\": \"<path>\", \"line\": <number>}}]}}. If you find nothing, \
@@ -254,11 +260,15 @@ struct Judged {
 pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Result<String> {
     Ok(format!(
         "Judge these findings from {n} reviewer(s) of the {id} lens. Its criteria: {criteria}\n\n\
-         The change is the attached diff, and your working directory is the repository, as the \
-         change leaves it. Check each finding against the code. Change nothing in the \
+         The change is the attached file: what it says it's for, then its diff. Your working \
+         directory is the repository, as the change leaves it. Check each finding against the \
+         code. Change nothing in the \
          repository: you repair nothing. To test a claim, you may write and run a script, but \
          only under $TMPDIR, which is yours for this call and goes when it ends.\n\n\
-         Merge findings that are the same defect into one. Rate each as:\n\
+         Merge findings that are the same defect into one. Rate each by what it costs, given \
+         what the change says it's for: a defect that defeats that purpose, or a claim about \
+         meeting it that the code and tests don't bear out, costs more than the same defect \
+         elsewhere. Rate each as:\n\
          - Critical: wrong result, data loss, security hole\n\
          - High: real defect in a realistic case\n\
          - Medium: real defect in a narrow case\n\

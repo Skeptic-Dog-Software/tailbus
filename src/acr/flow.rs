@@ -234,6 +234,10 @@ pub struct Run {
     pub escalations: Vec<Escalation>,
     pub disagreements: Vec<Disagreement>,
     pub usage: Vec<Usage>,
+    /// What the change says it's for, such as its pull request's
+    /// description, kept so a resumed review sends the same.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// What stays the same through a review.
@@ -242,6 +246,10 @@ pub struct Setting<'a> {
     pub not_findings: String,
     /// Where a round's diff is written.
     pub work_dir: PathBuf,
+    /// What the change says it's for, such as its pull request's
+    /// description. Every role gets it, with the commit messages, ahead of
+    /// the diff.
+    pub description: Option<String>,
 }
 
 /// A person's answer at a gate.
@@ -376,14 +384,17 @@ impl Artifacts {
     }
 }
 
+/// A round's change as every role gets it: what the change says it's for,
+/// then its diff.
 fn write_artifact(s: &Setting, change: &Change, round: u32) -> Result<Artifacts> {
     fs::create_dir_all(&s.work_dir)?;
+    let intent = super::change::intent(s.description.as_deref(), &change.commits);
     let diff = s.work_dir.join(format!("round-{round}.diff"));
-    fs::write(&diff, &change.diff)?;
+    fs::write(&diff, format!("{intent}# The diff\n\n{}", change.diff))?;
     let full = match &change.full {
         Some(text) => {
             let path = s.work_dir.join(format!("round-{round}.full.diff"));
-            fs::write(&path, text)?;
+            fs::write(&path, format!("{intent}# The diff\n\n{text}"))?;
             Some(path)
         }
         None => None,
@@ -529,6 +540,7 @@ pub fn start(
         escalations: Vec::new(),
         disagreements: Vec::new(),
         usage: Vec::new(),
+        description: s.description.clone(),
     };
     let artifacts = write_artifact(s, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
@@ -1116,6 +1128,8 @@ lenses:
         changes: std::sync::atomic::AtomicU32,
         /// The roles that got the change as a file.
         with_diff: Mutex<Vec<Role>>,
+        /// What each of them got in it.
+        sent: Mutex<Vec<(Role, String)>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -1127,6 +1141,7 @@ lenses:
                 tamper: None,
                 changes: Default::default(),
                 with_diff: Mutex::new(Vec::new()),
+                sent: Mutex::new(Vec::new()),
             }
         }
 
@@ -1144,8 +1159,10 @@ lenses:
                 call.writes,
                 call.prompt.to_string(),
             ));
-            if call.artifact.is_some() {
+            if let Some(path) = call.artifact {
                 self.with_diff.lock().unwrap().push(call.role);
+                let text = fs::read_to_string(path).unwrap_or_default();
+                self.sent.lock().unwrap().push((call.role, text));
             }
             if self.tamper == Some(call.role) {
                 self.changes
@@ -1234,6 +1251,7 @@ lenses:
             cfg,
             not_findings: "- the decided thing".into(),
             work_dir: std::env::temp_dir().join(format!("tb-acr-run-{}", new_id())),
+            description: None,
         }
     }
 
@@ -1312,7 +1330,43 @@ lenses:
         assert_eq!(both.for_lens(&lens), both.diff.as_path());
         lens.include_generated = true;
         let whole = both.for_lens(&lens);
-        assert_eq!(fs::read_to_string(whole).unwrap(), "the whole diff");
+        assert!(
+            fs::read_to_string(whole)
+                .unwrap()
+                .ends_with("# The diff\n\nthe whole diff")
+        );
+    }
+
+    #[test]
+    fn every_role_gets_what_the_change_says_its_for_ahead_of_the_diff() {
+        let cfg = plain("exception", 1, 1);
+        let mut s = setting(&cfg);
+        s.description = Some("Fixes B-1: an edited reminder keeps the user's date.".into());
+        let mut c = change(&["a.src"]);
+        c.commits = vec![super::super::change::Commit {
+            id: "abc1234".into(),
+            message: "Keep the edited date\n\nThe save path dropped it.".into(),
+        }];
+        let fake = Fake::new(defect_in("alpha", 0));
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        let again = c.clone();
+        drive(&mut run, &s, &fake, &|_| Ok(again.clone())).unwrap();
+        // Kept, so a resumed review sends the same.
+        assert_eq!(run.description, s.description);
+        let sent = fake.sent.lock().unwrap();
+        assert!(sent.iter().any(|(r, _)| *r == Role::Reviewer));
+        for (role, text) in sent.iter() {
+            assert!(
+                text.starts_with("# What this change says it's for"),
+                "{role:?}: {text}"
+            );
+            let said = text
+                .find("an edited reminder keeps the user's date")
+                .unwrap();
+            let commit = text.find("Keep the edited date").unwrap();
+            let diff = text.find("# The diff\n\n+let x = 1;").unwrap();
+            assert!(said < commit && commit < diff, "{role:?}: {text}");
+        }
     }
 
     #[test]
