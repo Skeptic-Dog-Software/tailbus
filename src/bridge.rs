@@ -525,16 +525,16 @@ fn read_secret(name: &str, path: &Path) -> Result<String> {
     Ok(value.to_string())
 }
 
-/// Fills in `{NAME}`s from `vars`, and `{FILE:/path}`s with the file's
-/// text, in which only `{AGENT}` is filled in, so a message can't reach
-/// what's meant to be fixed, such as a system prompt. It's one pass, so
-/// nothing from a message is read as a template. Anything else in braces
-/// stays as it is.
 /// The machine part of `name@machine`.
 fn machine_of(address: &str) -> &str {
     address.split_once('@').map_or("", |(_, m)| m)
 }
 
+/// Fills in `{NAME}`s from `vars`, and `{FILE:/path}`s with the file's
+/// text, in which only `{AGENT}` is filled in, so a message can't reach
+/// what's meant to be fixed, such as a system prompt. It's one pass, so
+/// nothing from a message is read as a template. Anything else in braces
+/// stays as it is.
 fn expand(template: &str, vars: &[(&str, &str)]) -> Result<String> {
     fill(template, vars, true)
 }
