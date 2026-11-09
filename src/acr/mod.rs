@@ -31,9 +31,10 @@ use crate::util::new_id;
 /// The bus agent reviews are sent as, always: a review's traffic is its
 /// own, and never lands in a session's inbox.
 const SENDER: &str = "acr";
-/// Seconds a call waits past its binding's timeout, or with none.
-const WAIT_MARGIN: u64 = 120;
-const DEFAULT_CALL_SECS: u64 = 1800;
+/// How long a review waits for each reply. It counts time queued behind
+/// the bridge's other runs, so it's long: the bridge's cap on the run
+/// itself is what stops one that runs away.
+const REPLY_WAIT: u64 = 24 * 3600;
 /// `run` and `resume` exit with these for a review that needs a person.
 const WAITING: u8 = 3;
 const ESCALATED: u8 = 4;
@@ -391,7 +392,7 @@ impl Caller for BridgeCaller {
             attachments,
             ..Extras::default()
         };
-        let wait = b.timeout.unwrap_or(DEFAULT_CALL_SECS) + WAIT_MARGIN;
+        let wait = REPLY_WAIT;
         let asked = std::time::Instant::now();
         let mut client = Client::connect(&self.socket)?;
         client.send(&Request::Call {

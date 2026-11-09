@@ -10,19 +10,19 @@ allowed_bindings:
     agent: models@my-mac
     model: example/small-model
     tools: [read, grep, glob]
-    timeout: 300
+    timeout: 14400   # 4 hours: a cap no review should ever reach
   medium:
     agent: models@my-mac
     model: example/medium-model
     effort: high
     tools: [read, grep, glob]
-    timeout: 900
+    timeout: 14400
   large:
     agent: models@my-mac
     model: example/large-model
     effort: medium
     tools: [read, grep, glob]
-    timeout: 900
+    timeout: 14400
     writes: true    # the Orchestrator may apply fixes, in the repository
 defaults:
   human_gate: exception

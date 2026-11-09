@@ -717,7 +717,8 @@ model = "claude-sonnet-5-5"
 working_directory = {home}
 home = {home}
 path = {path}
-timeout_secs = 900
+# 4 hours: a cap no review should ever reach. A run ends when it's done.
+timeout_secs = 14400
 max_concurrent = 3
 
 [bridges.{ACR_AGENT}.env]
@@ -729,6 +730,7 @@ CLAUDE_CONFIG_DIR = "{{SESSION_DIR}}"
 CLAUDE_CODE_OAUTH_TOKEN = {token}
 
 [bridges.{ACR_AGENT}.options]
+max_timeout_secs = 14400
 tools = ["Read", "Grep", "Glob", "Bash", "Write"]
 tools_args = ["--tools", "{{TOOLS}}", "--allowedTools", "{{TOOLS}}"]
 models = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
@@ -762,7 +764,8 @@ fn acr_bindings(machine: &str) -> String {
         r#"# ACR's bindings, set up by `tailbus setup acr`: Anthropic models through
 # {agent}, headless Claude Code on your subscription, so they count in
 # tokens. ACR runs on one machine: every role works in the repository, and
-# reviewers read it in place, read-only.
+# reviewers read it in place, read-only. Each timeout is 4 hours, a cap no
+# review should ever reach.
 version: 1
 allowed_bindings:
   haiku-low:       # the Sizer: one quick call to pick the tier
@@ -770,28 +773,28 @@ allowed_bindings:
     model: claude-haiku-5-5
     effort: low
     tools: [Read, Grep, Glob]
-    timeout: 600
+    timeout: 14400
     subscription: true
   sonnet-high:     # reviewers: most of the calls, and they attack
     agent: {agent}
     model: claude-sonnet-5-5
     effort: high
     tools: [Read, Grep, Glob]
-    timeout: 900
+    timeout: 14400
     subscription: true
   opus-medium:     # the Orchestrator: few calls; without writes, fixes escalate
     agent: {agent}
     model: claude-opus-5-5
     effort: medium
     tools: [Read, Grep, Glob]
-    timeout: 900
+    timeout: 14400
     subscription: true
   opus-judge:      # the Judge: checks claims, and may run scripts in its scratch space
     agent: {agent}
     model: claude-opus-5-5
     effort: medium
     tools: [Read, Grep, Glob, Bash, Write]
-    timeout: 900
+    timeout: 14400
     subscription: true
 defaults:
   bindings:

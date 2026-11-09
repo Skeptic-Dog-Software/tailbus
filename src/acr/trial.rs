@@ -31,8 +31,9 @@ const BUILDER_MODEL: &str = "claude-opus-5-5";
 /// The scorer, which only compares lists.
 const SCORER_MODEL: &str = "claude-sonnet-5-5";
 /// The longest a builder's run may take.
-const BUILDER_TIMEOUT: Duration = Duration::from_secs(90 * 60);
-const SCORER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Caps a trial should never reach: a whole review can take a while.
+const BUILDER_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
+const SCORER_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// What a change's in-session review found, as its builder ruled.
 #[derive(Debug, Clone, Deserialize)]

@@ -592,6 +592,13 @@ base.
 - A reviewer or Judge that fails leaves its lens open and escalates. A review
   that didn't happen never reads as a clean one.
 
+**Time limits.** A review should never time out, so give each binding's
+`timeout`, and its bridge's `timeout_secs` and `max_timeout_secs`, a cap no
+review will reach: 4 hours, as `tailbus setup acr` does. A run still ends as
+soon as it's done. A review waits up to a day for each reply, counting any
+time queued behind the bridge's other runs, so a queue never cuts one short:
+only the bridge's cap on the run itself stops one.
+
 **Severity** is the same everywhere, so that results compare. A lens's
 `severity` can change what Medium and Low do, but not Critical, High or
 Rejected.
