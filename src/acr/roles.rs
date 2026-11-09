@@ -1,20 +1,113 @@
 //! What each role is asked, and what it must answer. Answers are JSON, and
 //! one that can't be read is a failure, never an empty result.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::config::{Lens, Severity, Tier};
 
-/// The JSON in an answer, which a model may have wrapped in other words.
+/// The JSON in an answer, which a model may have wrapped in other words,
+/// braces among them: the first whole object in it that reads as `T`. If
+/// none does, the error is the first object's.
 fn json_in<T: DeserializeOwned>(text: &str) -> Result<T> {
-    let start = text.find('{').context("the answer has no JSON")?;
-    let end = text.rfind('}').context("the answer has no JSON")?;
-    if end < start {
-        bail!("the answer has no JSON");
+    let mut first_error = None;
+    let mut from = 0;
+    while let Some(start) = text[from..].find('{').map(|i| from + i) {
+        let mut objects =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        match objects.next() {
+            Some(Ok(value)) => {
+                from = start + objects.byte_offset();
+                match serde_json::from_value(value) {
+                    Ok(answer) => return Ok(answer),
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                }
+            }
+            _ => from = start + 1,
+        }
     }
-    serde_json::from_str(&text[start..=end]).context("reading the answer's JSON")
+    match first_error {
+        Some(e) => Err(anyhow::Error::new(e).context("reading the answer's JSON")),
+        None => bail!("the answer has no JSON"),
+    }
+}
+
+/// Readers for what models write where a strict one would throw a whole
+/// answer away: a range for a line, a severity in lower case, one side as a
+/// string, a flag as a word.
+mod lenient {
+    use serde::Deserialize;
+    use serde::de::{Deserializer, Error};
+    use serde_json::Value;
+
+    use super::Severity;
+
+    /// A line, or the first number in text such as "169-171" or "L42".
+    pub fn line<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::Number(n) => n.as_u64(),
+            Value::String(s) => {
+                let digits: String = s
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse().ok()
+            }
+            _ => None,
+        })
+    }
+
+    /// A severity in any case, such as "high", or "High: a real defect".
+    pub fn severity<'de, D: Deserializer<'de>>(d: D) -> Result<Severity, D::Error> {
+        let text = String::deserialize(d)?;
+        let word: String = text
+            .trim()
+            .chars()
+            .take_while(char::is_ascii_alphabetic)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        Ok(match word.as_str() {
+            "critical" => Severity::Critical,
+            "high" => Severity::High,
+            "medium" => Severity::Medium,
+            "low" => Severity::Low,
+            "rejected" | "reject" => Severity::Rejected,
+            _ => return Err(D::Error::custom(format!("{text:?} isn't a severity"))),
+        })
+    }
+
+    /// True or false, or the words for them.
+    pub fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+        match Value::deserialize(d)? {
+            Value::Bool(b) => Ok(b),
+            Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" => Ok(true),
+                "false" | "no" => Ok(false),
+                _ => Err(D::Error::custom(format!("{s:?} isn't true or false"))),
+            },
+            other => Err(D::Error::custom(format!("{other} isn't true or false"))),
+        }
+    }
+
+    /// A list of strings, or one string.
+    pub fn strings<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::Null => Vec::new(),
+            Value::String(s) => vec![s],
+            Value::Array(items) => items
+                .into_iter()
+                .map(|v| match v {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                })
+                .collect(),
+            other => vec![other.to_string()],
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,7 +177,7 @@ pub struct Raw {
     pub detail: String,
     #[serde(default)]
     pub file: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::line")]
     pub line: Option<u64>,
 }
 
@@ -128,23 +221,24 @@ pub struct Rating {
     pub detail: String,
     #[serde(default)]
     pub file: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::line")]
     pub line: Option<u64>,
+    #[serde(deserialize_with = "lenient::severity")]
     pub severity: Severity,
-    #[serde(default = "yes")]
+    #[serde(default = "yes", deserialize_with = "lenient::flag")]
     pub relevant: bool,
-    #[serde(default = "yes")]
+    #[serde(default = "yes", deserialize_with = "lenient::flag")]
     pub on_task: bool,
     #[serde(default)]
     pub reason: String,
     /// The reviewers disagreed about it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub split: bool,
     /// Rejecting it is a values call, not a fact.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::flag")]
     pub values_call: bool,
     /// Both sides, when it's split or a values call.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::strings")]
     pub sides: Vec<String>,
 }
 
@@ -212,6 +306,41 @@ mod tests {
     #[test]
     fn finds_json_among_other_words() {
         let text = "Here you go:\n```json\n{\"findings\": []}\n```\nDone.";
+        assert!(read_findings(text).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_judge_answer_survives_what_models_write() {
+        let text = r#"Checked each claim.
+```json
+{"findings": [
+  {"title": "Lost email", "file": "welcome.go", "line": "128-138", "severity": "high",
+   "split": "true", "sides": "one reviewer says it's fine"},
+  {"title": "Nit", "line": 7, "severity": "Low: an unlikely edge", "relevant": "no"},
+  {"title": "Noise", "line": null, "severity": "REJECTED", "reason": "decided"}
+]}
+```
+Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
+        let ratings = read_ratings(text).unwrap();
+        assert_eq!(ratings.len(), 3);
+        assert_eq!(ratings[0].line, Some(128));
+        assert_eq!(ratings[0].severity, Severity::High);
+        assert!(ratings[0].split);
+        assert_eq!(ratings[0].sides, ["one reviewer says it's fine"]);
+        assert_eq!(ratings[1].severity, Severity::Low);
+        assert!(!ratings[1].relevant);
+        assert_eq!(ratings[2].line, None);
+        assert_eq!(ratings[2].severity, Severity::Rejected);
+        let err = format!(
+            "{:#}",
+            read_ratings(r#"{"findings": [{"title": "x", "severity": "dire"}]}"#).unwrap_err()
+        );
+        assert!(err.contains("isn't a severity"), "{err}");
+    }
+
+    #[test]
+    fn the_answer_is_the_first_object_that_fits() {
+        let text = "An example: {\"note\": 1}. The answer: {\"findings\": []} {stray";
         assert!(read_findings(text).unwrap().is_empty());
     }
 

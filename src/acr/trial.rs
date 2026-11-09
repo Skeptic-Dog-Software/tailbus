@@ -156,6 +156,10 @@ pub struct Outcome {
     pub models: Vec<String>,
     pub score: Score,
     pub findings: Vec<Found>,
+    /// What went wrong in the design's run, such as a Judge whose answer
+    /// couldn't be read. A score beside failures says less than it seems.
+    #[serde(default)]
+    pub failures: Vec<String>,
 }
 
 /// A trial's scratch folder and worktree, removed however it ends.
@@ -358,12 +362,7 @@ fn builder_prompt(key: &Key, arm: Arm, result: &Path) -> String {
 
 /// The builder-led designs: a fresh headless builder with the method as its
 /// skill, sized one way or the other.
-fn builder_led(
-    paths: &Paths,
-    s: &Scratch,
-    key: &Key,
-    arm: Arm,
-) -> Result<(Vec<Found>, Counts, Vec<String>)> {
+fn builder_led(paths: &Paths, s: &Scratch, key: &Key, arm: Arm) -> Result<Ran> {
     let config = s.dir.join("builder");
     let skill = config.join("skills").join("acr");
     fs::create_dir_all(&skill)?;
@@ -394,7 +393,12 @@ fn builder_led(
                 .collect()
         })
         .unwrap_or_default();
-    Ok((findings, counts, models))
+    Ok(Ran {
+        findings,
+        tokens: counts,
+        models,
+        failures: Vec::new(),
+    })
 }
 
 fn score(paths: &Paths, s: &Scratch, key: &Key, found: &[Found]) -> Result<Score> {
@@ -489,7 +493,18 @@ fn score(paths: &Paths, s: &Scratch, key: &Key, found: &[Found]) -> Result<Score
 
 /// The separate-roles design runs through `tailbus acr`'s own pipeline,
 /// which ACR's module provides.
-pub type Separated<'a> = &'a dyn Fn(&Path, &Key) -> Result<(Vec<Found>, Counts, Vec<String>)>;
+/// What a design did: what it found, what it used, and what went wrong
+/// along the way, so that a design that broke isn't scored as one that
+/// found nothing.
+#[derive(Debug, Default)]
+pub struct Ran {
+    pub findings: Vec<Found>,
+    pub tokens: Counts,
+    pub models: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+pub type Separated<'a> = &'a dyn Fn(&Path, &Key) -> Result<Ran>;
 
 /// Runs one design on one change, and scores it.
 pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Result<Outcome> {
@@ -499,12 +514,12 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Re
     .with_context(|| format!("in {}", key_path.display()))?;
     let s = scratch(paths, &key)?;
     let started = Instant::now();
-    let (findings, tokens, models) = match arm {
+    let ran = match arm {
         Arm::OneSize | Arm::Sized => builder_led(paths, &s, &key, arm)?,
         Arm::Separated => separated(&s.tree, &key)?,
     };
     let seconds = started.elapsed().as_secs();
-    let score = score(paths, &s, &key, &findings)?;
+    let score = score(paths, &s, &key, &ran.findings)?;
     Ok(Outcome {
         key: key_path
             .file_stem()
@@ -513,10 +528,11 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Re
         pr: key.pr,
         arm,
         seconds,
-        tokens,
-        models,
+        tokens: ran.tokens,
+        models: ran.models,
         score,
-        findings,
+        findings: ran.findings,
+        failures: ran.failures,
     })
 }
 

@@ -872,11 +872,7 @@ impl Drop for AllowedFor<'_> {
 }
 
 /// The separate-roles design on a trial's worktree.
-fn separated(
-    paths: &Paths,
-    tree: &Path,
-    key: &trial::Key,
-) -> Result<(Vec<trial::Found>, trial::Counts, Vec<String>)> {
+fn separated(paths: &Paths, tree: &Path, key: &trial::Key) -> Result<trial::Ran> {
     let target = Target {
         repo: tree.to_path_buf(),
         base: key.base.clone(),
@@ -908,8 +904,15 @@ fn separated(
     let run = one_round(paths, &target)?;
     drop(allowed);
     let mut found = Vec::new();
+    let mut failures: Vec<String> = run.escalations.iter().map(|e| e.reason.clone()).collect();
     for lens in run.lenses.values() {
         for round in &lens.rounds {
+            for failure in &round.failures {
+                let failure = format!("{}, round {}: {failure}", lens.id, round.round);
+                if !failures.iter().any(|f| f.contains(&failure)) {
+                    failures.push(failure);
+                }
+            }
             for f in &round.findings {
                 found.push(trial::Found {
                     dimension: lens.id.clone(),
@@ -935,7 +938,12 @@ fn separated(
         }
     }
     counts.total = counts.input + counts.output + counts.cache_read + counts.cache_write;
-    Ok((found, counts, models))
+    Ok(trial::Ran {
+        findings: found,
+        tokens: counts,
+        models,
+        failures,
+    })
 }
 
 /// A run's config, as it was when it started: resuming can't pick up a
