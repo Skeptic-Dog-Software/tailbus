@@ -1276,6 +1276,8 @@ fn pipeline_arm(
             run: run.id.clone(),
             patch: None,
             tokens_by_round: by_round,
+            steelmans: run.steelmans.clone(),
+            disagreements: run.disagreements.clone(),
         };
         Some((summary, patch))
     } else {

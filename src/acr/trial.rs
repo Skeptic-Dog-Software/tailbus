@@ -192,11 +192,18 @@ pub struct Converged {
     pub rounds: u32,
     /// It ended with no blocker in any lens, rather than at its cap.
     pub converged: bool,
-    /// Its run, in ACR's state, which keeps each round's diff and verdicts.
+    /// Its run's id. A finished run's files are removed, so what's worth
+    /// keeping of it is here.
     pub run: String,
     /// What it left the change as: a patch on the key's head.
     pub patch: Option<PathBuf>,
     pub tokens_by_round: Vec<u64>,
+    /// What each steelman was given, did and declined.
+    #[serde(default)]
+    pub steelmans: Vec<super::flow::Steelman>,
+    /// Splits, values calls and declined findings: each the user's call.
+    #[serde(default)]
+    pub disagreements: Vec<super::flow::Disagreement>,
 }
 
 /// A trial's scratch folder and its copy of the change, removed however it
@@ -1196,6 +1203,7 @@ mod tests {
                 run: "r1".into(),
                 patch: Some(PathBuf::from("/p/k-r1.patch")),
                 tokens_by_round: vec![9, 5, 3, 2],
+                ..Converged::default()
             }),
             ..outcome
         };
