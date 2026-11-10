@@ -241,6 +241,52 @@ pub struct Policy {
     pub bindings: BTreeMap<Role, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub costs: Option<Costs>,
+    /// What every round does besides its lenses' reviewers. See `Stage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stages: Option<Vec<Stage>>,
+    /// How the repository's tests run, for the mutation stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<Tests>,
+}
+
+/// What a careful reviewer does by habit, made part of every round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Stage {
+    /// Every role gets what the repository's history says about the
+    /// changed files: earlier commits to them, docs and tests that mention
+    /// them, and where the functions the change touches are used.
+    Context,
+    /// A lens that checks, one by one, every claim the change makes about
+    /// itself.
+    Claims,
+    /// A lens that proposes small breaks in the changed code, which the
+    /// pipeline runs against the tests in copies of its own. A break the
+    /// tests miss is a finding.
+    Mutation,
+    /// A lens that writes and runs scenarios of what the change says it
+    /// does. Its binding needs a shell.
+    Probes,
+}
+
+/// How the repository's tests run.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tests {
+    /// The command, run from the repository's root. `{tests}` in it stands
+    /// for the test files to run. Without it, it's found from the
+    /// repository's files: Flutter, Cargo, Go, npm or pytest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// How many mutants run at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// Seconds one run of the tests may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    /// How many mutants a reviewer proposes in a round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutants: Option<u32>,
 }
 
 /// US dollars per million tokens. Cached input left out costs what other
@@ -335,6 +381,8 @@ impl Policy {
             (Some(costs), Some(later)) => Some(costs.over(later)),
             (costs, later) => later.or(costs),
         };
+        self.stages = later.stages.or(self.stages);
+        self.tests = later.tests.or(self.tests);
         self
     }
 }
@@ -434,6 +482,10 @@ pub struct Config {
     /// the repository can change.
     #[serde(default)]
     pub outside: bool,
+    #[serde(default)]
+    pub stages: Vec<Stage>,
+    #[serde(default)]
+    pub tests: Tests,
 }
 
 /// The framework's own defaults. They name no binding, model or provider:
@@ -506,8 +558,35 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         allowed_bindings: user.allowed_bindings.clone(),
         costs: merged.costs.unwrap_or_default(),
         outside: false,
+        stages: merged.stages.unwrap_or_default(),
+        tests: merged.tests.unwrap_or_default(),
     };
     config.check()?;
+    with_stage_lenses(config)
+}
+
+/// The config with a lens for each stage that runs as one. They apply to
+/// every change, and a Judge rates what they find, as any lens's.
+fn with_stage_lenses(mut config: Config) -> Result<Config> {
+    for stage in config.stages.clone() {
+        let Some(id) = super::stages::lens_id(stage) else {
+            continue;
+        };
+        if config.lenses.iter().any(|l| l.id == id) {
+            bail!("a lens is named {id}, which the {id} stage's own lens is called");
+        }
+        config.lenses.push(Lens {
+            id: id.to_string(),
+            criteria: super::stages::criteria(stage).to_string(),
+            triggers: Triggers {
+                paths: vec!["**".into()],
+                ..Triggers::default()
+            },
+            binding: None,
+            severity: BTreeMap::new(),
+            include_generated: false,
+        });
+    }
     Ok(config)
 }
 
@@ -785,6 +864,7 @@ mod tests {
             include_str!("plan.rs"),
             include_str!("report.rs"),
             include_str!("roles.rs"),
+            include_str!("stages.rs"),
         ] {
             let code = source.split("#[cfg(test)]").next().unwrap();
             // Words from the two examples' configs.
@@ -1155,6 +1235,8 @@ mod tests {
             generated: Some(Generated::default()),
             bindings: BTreeMap::from([(Role::Judge, "x".to_string())]),
             costs: Some(Costs::default()),
+            stages: Some(Vec::new()),
+            tests: Some(Tests::default()),
         })
         .unwrap();
         let mut ours: Vec<String> = repo.as_object().unwrap().keys().cloned().collect();

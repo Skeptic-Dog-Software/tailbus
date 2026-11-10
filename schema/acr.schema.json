@@ -134,6 +134,23 @@
           }
         }
       }
+    },
+    "stages": {
+      "description": "What every round does besides its lenses' reviewers. context: every role gets what the repository's history says about the changed files. claims: a lens that checks every claim the change makes about itself. mutation: a lens that proposes small breaks in the changed code, which the pipeline runs against the tests; a break they miss is a finding. probes: a lens that writes and runs scenarios of what the change says it does, which needs a binding with a shell.",
+      "type": "array",
+      "items": {"enum": ["context", "claims", "mutation", "probes"]},
+      "uniqueItems": true
+    },
+    "tests": {
+      "description": "How the repository's tests run, for the mutation stage.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": {"type": "string", "description": "Run from the repository's root. {tests} stands for the test files to run. Without it, it's found from the repository's files: Flutter, Cargo, Go, npm or pytest."},
+        "parallel": {"type": "integer", "minimum": 1, "description": "How many mutants run at once."},
+        "timeout": {"type": "integer", "minimum": 1, "description": "Seconds one run of the tests may take."},
+        "mutants": {"type": "integer", "minimum": 1, "description": "How many mutants a reviewer proposes in a round."}
+      }
     }
   },
   "$defs": {

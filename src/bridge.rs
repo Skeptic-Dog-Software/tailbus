@@ -919,7 +919,38 @@ struct Saved {
     ext: Option<Box<Extras>>,
 }
 
-/// What `log/<run id>/meta.json` holds, beside the run's output.
+/// Copies every transcript under a session's `projects` folder, as a
+/// Claude Code session leaves them, to `to`. Nothing, for an agent that
+/// keeps none there.
+fn keep_transcripts(session: &Path, to: &Path) {
+    let Ok(projects) = fs::read_dir(session.join("projects")) else {
+        return;
+    };
+    for project in projects.flatten() {
+        let mut stack = vec![project.path()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "jsonl")
+                    && let Ok(rel) = path.strip_prefix(session.join("projects"))
+                {
+                    let dest = to.join(rel);
+                    if let Some(parent) = dest.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::copy(&path, &dest);
+                }
+            }
+        }
+    }
+}
+
+/// What `log/<run id>/meta.json` holds, beside the run's output./// What `log/<run id>/meta.json` holds, beside the run's output.
 #[derive(Debug, Serialize, Deserialize)]
 struct RunLog {
     sender: String,
@@ -2010,6 +2041,12 @@ impl Bridge {
             self.keep_output(&stdout, &log_dir.join("stdout"), false)?,
             self.keep_output(&stderr, &log_dir.join("stderr"), true)?,
         );
+        // A caller that asks for a log by name gets the agent's transcripts
+        // too, from a fresh session, to see what it did: a trial, say.
+        let asked = msg.ext.as_ref().and_then(|e| e.options.as_ref());
+        if asked.and_then(|o| o.log) == Some(true) && plan.session == SessionMode::Fresh {
+            keep_transcripts(&session_dir, &log_dir.join("transcripts"));
+        }
         let tail_of_stderr = read_end(&stderr, self.cfg.stderr_tail_bytes);
         let brief = read_end(&stderr, 8 * STDERR_TAIL);
         let errors = tail(&brief, STDERR_TAIL);

@@ -192,6 +192,10 @@ pub struct Outcome {
     /// couldn't be read. A score beside failures says less than it seems.
     #[serde(default)]
     pub failures: Vec<String>,
+    /// What the design's stages reported of their own work, such as how
+    /// many mutants the tests caught.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     #[serde(flatten)]
     pub converged: Option<Converged>,
 }
@@ -746,6 +750,7 @@ fn builder_led(paths: &Paths, s: &Scratch, key: &Key, arm: Arm) -> Result<Ran> {
         models,
         failures: Vec::new(),
         converged: None,
+        notes: Vec::new(),
     })
 }
 
@@ -862,6 +867,7 @@ pub struct Ran {
     pub failures: Vec<String>,
     /// A review to convergence's, with its patch as text.
     pub converged: Option<(Converged, String)>,
+    pub notes: Vec<String>,
 }
 
 /// The pipeline's designs run through `tailbus acr`'s own pipeline, which
@@ -1036,6 +1042,7 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, pipeline: Pipeline) -> Resu
         score,
         findings: ran.findings,
         failures: ran.failures,
+        notes: ran.notes,
         converged,
     })
 }
@@ -1311,6 +1318,7 @@ mod tests {
             score: None,
             findings: Vec::new(),
             failures: Vec::new(),
+            notes: Vec::new(),
             converged: None,
         };
         let line = serde_json::to_string(&outcome).unwrap();

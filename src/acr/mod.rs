@@ -10,6 +10,7 @@ mod keep;
 mod plan;
 mod report;
 mod roles;
+mod stages;
 mod trial;
 
 use std::fs;
@@ -330,6 +331,10 @@ struct BridgeCaller {
     /// Attachments this put in the store, or got back there, to remove when
     /// it's done: a review leaves nothing behind.
     made: std::sync::Mutex<Vec<String>>,
+    /// Asks each bridge to keep its run's log and transcripts, which a
+    /// review otherwise leaves none of: for a trial, to see what each
+    /// reviewer did.
+    keep_logs: bool,
 }
 
 impl Drop for BridgeCaller {
@@ -355,6 +360,7 @@ impl BridgeCaller {
                 bus.attachment_store_bytes,
             ),
             made: std::sync::Mutex::default(),
+            keep_logs: false,
         })
     }
 
@@ -430,8 +436,9 @@ impl Caller for BridgeCaller {
             workdir: Some(call.repo.display().to_string()),
             model: b.model.clone(),
             effort: b.effort.clone(),
-            // A review keeps its own record, and leaves nothing behind.
-            log: Some(false),
+            // A review keeps its own record, and leaves nothing behind,
+            // unless it's a trial's, kept to see what each agent did.
+            log: Some(self.keep_logs),
             // And runs on one machine, which the bridge checks too.
             review: Some(true),
         };
@@ -1118,7 +1125,7 @@ pub const STEELMAN_BINDING: &str = "steelman";
 /// One round of the pipeline, as a change first comes out, with nobody
 /// fixing anything and escalations taken as seen. Leaves nothing behind.
 fn one_round(paths: &Paths, target: &Target, description: Option<String>) -> Result<Run> {
-    pipeline_run(paths, target, description, false)
+    pipeline_run(paths, target, description, false, false)
 }
 
 /// The pipeline with nobody in the loop: one round, or to convergence. An
@@ -1128,6 +1135,7 @@ fn pipeline_run(
     target: &Target,
     description: Option<String>,
     converge: bool,
+    keep_logs: bool,
 ) -> Result<Run> {
     let mut flags = flags(target);
     flags.max_rounds = Some(if converge { CONVERGE_CAP } else { 1 });
@@ -1155,7 +1163,8 @@ fn pipeline_run(
     let _active = keep::active_guard(paths, &id)?;
     let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
     let change = reload(&cfg, repo, base, head)?;
-    let caller = BridgeCaller::new(paths)?;
+    let mut caller = BridgeCaller::new(paths)?;
+    caller.keep_logs = keep_logs;
     let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
     // After a steelman, the change is the working tree, with any file it
     // added in the diff too.
@@ -1279,10 +1288,11 @@ fn pipeline_arm(
     }
     // The key's context, frozen before any review, stands in for the pull
     // request's description, which may have changed since.
-    let run = pipeline_run(paths, &target, Some(key.context.clone()), converge)?;
+    let run = pipeline_run(paths, &target, Some(key.context.clone()), converge, true)?;
     drop(allowed);
     let mut found = Vec::new();
     let mut failures: Vec<String> = run.escalations.iter().map(|e| e.reason.clone()).collect();
+    let mut notes: Vec<String> = Vec::new();
     for lens in run.lenses.values() {
         for round in &lens.rounds {
             for failure in &round.failures {
@@ -1290,6 +1300,9 @@ fn pipeline_arm(
                 if !failures.iter().any(|f| f.contains(&failure)) {
                     failures.push(failure);
                 }
+            }
+            for note in &round.notes {
+                notes.push(format!("{}, round {}: {note}", lens.id, round.round));
             }
             for f in &round.findings {
                 found.push(trial::Found {
@@ -1346,6 +1359,7 @@ fn pipeline_arm(
         models,
         failures,
         converged,
+        notes,
     })
 }
 

@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::proto::RunUsage;
 
 use super::change::{self, Change};
-use super::config::{Action, Binding, Config, HumanGate, Lens, Role, Severity};
+use super::config::{Action, Binding, Config, HumanGate, Lens, Role, Severity, Stage as Kind};
 use super::plan::{self, Why, tokens_in};
 use super::roles::{self, Raw};
+use super::stages;
 
 /// What a role's call needs.
 pub struct Call<'a> {
@@ -134,6 +135,10 @@ pub struct Round {
     /// What went wrong, if the round didn't fully run.
     pub failures: Vec<String>,
     pub findings: Vec<Finding>,
+    /// What a stage reports of its own work, such as how many mutants the
+    /// tests caught.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,9 +430,12 @@ impl Artifacts {
 
 /// A round's change as every role gets it: what the change says it's for,
 /// then its diff.
-fn write_artifact(s: &Setting, change: &Change, round: u32) -> Result<Artifacts> {
+fn write_artifact(s: &Setting, run: &Run, change: &Change, round: u32) -> Result<Artifacts> {
     fs::create_dir_all(&s.work_dir)?;
-    let intent = super::change::intent(s.description.as_deref(), &change.commits);
+    let mut intent = super::change::intent(s.description.as_deref(), &change.commits);
+    if s.cfg.stages.contains(&Kind::Context) {
+        intent.push_str(&stages::context_pack(&run.repo, &run.base, change));
+    }
     let diff = s.work_dir.join(format!("round-{round}.diff"));
     fs::write(&diff, format!("{intent}# The diff\n\n{}", change.diff))?;
     let full = match &change.full {
@@ -605,7 +613,7 @@ pub fn start(
         converge: s.converge,
         steelmans: Vec::new(),
     };
-    let artifacts = write_artifact(s, change, 0)?;
+    let artifacts = write_artifact(s, &run, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
     choose_lenses(&mut run, s, change, caller, &artifacts.diff)?;
     if let Some(why) = plan::config_escalation(s.cfg, change) {
@@ -626,12 +634,35 @@ fn lens_of<'a>(cfg: &'a Config, id: &str) -> Result<&'a Lens> {
 
 /// Every open lens's reviewers, at once, each a fresh session that sees
 /// only its brief and the change.
+/// What one reviewer is asked to do.
+enum Brief {
+    /// Review, and answer with findings.
+    Review { prompt: String, repo: PathBuf },
+    /// Propose mutants, which are then run against the tests in `runs`.
+    Mutate {
+        prompt: String,
+        repo: PathBuf,
+        runs: PathBuf,
+        command: String,
+    },
+    /// Can't run, and why.
+    Fail(String),
+}
+
+/// What attacking a round gives back: each lens's reviewers' findings, and
+/// what its stages noted.
+type Attacked = (
+    BTreeMap<String, Vec<Result<Vec<Raw>>>>,
+    BTreeMap<String, Vec<String>>,
+);
+
 fn attack(
     run: &mut Run,
     s: &Setting,
     caller: &dyn Caller,
     artifacts: &Artifacts,
-) -> Result<BTreeMap<String, Vec<Result<Vec<Raw>>>>> {
+    change: &Change,
+) -> Result<Attacked> {
     let cfg = s.cfg;
     let scope = match run.head.as_deref() {
         Some(head) => format!("the change from {} to {head}", run.base),
@@ -655,13 +686,24 @@ fn attack(
         .repo
         .file_name()
         .map_or_else(|| "repo".into(), |n| n.to_owned());
-    let mut briefs = Vec::new();
+    let command = cfg
+        .tests
+        .command
+        .clone()
+        .or_else(|| stages::test_command(&run.repo));
+    let mut briefs: Vec<(&Lens, Brief)> = Vec::new();
     for result in open {
         let lens = lens_of(cfg, &result.id)?;
         let binding = cfg.binding(Role::Reviewer, Some(lens))?;
         let own = binding.changes_files() && copies.0.is_some();
-        let prompt = roles::reviewer_prompt(lens, &scope, &s.not_findings, own);
-        for n in 1..=run.fan_out {
+        let stage = stages::of_lens(&lens.id, &cfg.stages);
+        // A mutation reviewer only proposes, so one is enough.
+        let fan_out = if stage == Some(Kind::Mutation) {
+            1
+        } else {
+            run.fan_out
+        };
+        for n in 1..=fan_out {
             let repo = match &copies.0 {
                 Some(dir) if own => {
                     let copy = dir.join(format!("{}-{n}", lens.id)).join(&name);
@@ -671,17 +713,65 @@ fn attack(
                 }
                 _ => run.repo.clone(),
             };
-            briefs.push((lens, prompt.clone(), repo));
+            let brief = match stage {
+                None | Some(Kind::Context) => Brief::Review {
+                    prompt: roles::reviewer_prompt(lens, &scope, &s.not_findings, own),
+                    repo,
+                },
+                Some(Kind::Claims) => Brief::Review {
+                    prompt: stages::claims_prompt(
+                        &stages::claims(change, s.description.as_deref()),
+                        &scope,
+                        &s.not_findings,
+                        own,
+                    ),
+                    repo,
+                },
+                Some(Kind::Probes) if !own => Brief::Fail(
+                    "the probes stage runs scenarios, so its reviewer's binding needs a shell"
+                        .into(),
+                ),
+                Some(Kind::Probes) => Brief::Review {
+                    prompt: stages::probes_prompt(&scope, &s.not_findings, command.as_deref()),
+                    repo,
+                },
+                Some(Kind::Mutation) => match (&copies.0, &command) {
+                    (Some(dir), Some(command)) => Brief::Mutate {
+                        prompt: stages::mutants_prompt(&scope, cfg.tests.mutants.unwrap_or(12)),
+                        repo,
+                        runs: stages::mutation_dir(dir, &lens.id, n),
+                        command: command.clone(),
+                    },
+                    (None, _) => Brief::Fail("the mutation stage needs a place for copies".into()),
+                    (_, None) => Brief::Fail(
+                        "the mutation stage can't tell how this repository's tests run: \
+                         set tests.command in its review config"
+                            .into(),
+                    ),
+                },
+            };
+            briefs.push((lens, brief));
         }
     }
-    let answers: Vec<_> = thread::scope(|scope| {
+    let limit = std::time::Duration::from_secs(cfg.tests.timeout.unwrap_or(900));
+    let parallel = cfg.tests.parallel.unwrap_or(2) as usize;
+    let checkout = run.repo.clone();
+    let checkout = checkout.as_path();
+    type Done = (Option<Usage>, Vec<Raw>, Option<String>);
+    let answers: Vec<Result<Done>> = thread::scope(|scope| {
         let handles: Vec<_> = briefs
             .iter()
-            .map(|(lens, prompt, repo)| {
-                scope.spawn(move || -> Result<(Usage, Vec<Raw>)> {
+            .map(|(lens, brief)| {
+                scope.spawn(move || -> Result<Done> {
                     let artifact = artifacts.for_lens(lens);
                     let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
                     let binding = cfg.binding(Role::Reviewer, Some(lens))?;
+                    let (prompt, repo) = match brief {
+                        Brief::Fail(why) => bail!("{why}"),
+                        Brief::Review { prompt, repo } | Brief::Mutate { prompt, repo, .. } => {
+                            (prompt, repo)
+                        }
+                    };
                     let call = Call {
                         role: Role::Reviewer,
                         binding_name: name,
@@ -693,7 +783,21 @@ fn attack(
                     };
                     let answer = caller.call(&call)?;
                     let usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
-                    Ok((usage, roles::read_findings(&answer.text)?))
+                    match brief {
+                        Brief::Mutate { runs, command, .. } => {
+                            let mutants = stages::read_mutants(&answer.text)?;
+                            let runner = stages::Runner {
+                                repo: checkout,
+                                dir: runs,
+                                command,
+                                parallel,
+                                limit,
+                            };
+                            let (found, summary) = stages::run_mutants(&runner, &mutants)?;
+                            Ok((Some(usage), found, Some(summary)))
+                        }
+                        _ => Ok((Some(usage), roles::read_findings(&answer.text)?, None)),
+                    }
                 })
             })
             .collect();
@@ -707,15 +811,21 @@ fn attack(
     });
     drop(copies);
     let mut by_lens: BTreeMap<String, Vec<Result<Vec<Raw>>>> = BTreeMap::new();
-    for ((lens, _, _), answer) in briefs.iter().zip(answers) {
-        let result = answer.map(|(mut usage, findings)| {
-            usage.round = run.round;
-            run.usage.push(usage);
+    let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for ((lens, _), answer) in briefs.iter().zip(answers) {
+        let result = answer.map(|(usage, findings, note)| {
+            if let Some(mut usage) = usage {
+                usage.round = run.round;
+                run.usage.push(usage);
+            }
+            if let Some(note) = note {
+                notes.entry(lens.id.clone()).or_default().push(note);
+            }
             findings
         });
         by_lens.entry(lens.id.clone()).or_default().push(result);
     }
-    Ok(by_lens)
+    Ok((by_lens, notes))
 }
 
 /// A round's reviewer copies, removed when it's dropped.
@@ -800,18 +910,19 @@ fn rate(run: &mut Run, cfg: &Config, lens: &Lens, ratings: Vec<roles::Rating>) -
 /// what's next. Judging stays out of the orchestration's context.
 fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller) -> Result<()> {
     let cfg = s.cfg;
-    let artifacts = write_artifact(s, change, run.round)?;
+    let artifacts = write_artifact(s, run, change, run.round)?;
     if run.round > 1 {
         choose_lenses(run, s, change, caller, &artifacts.diff)?;
     }
     // Only an Orchestrator may change the checkout.
     let before = caller.fingerprint(&run.repo);
-    let reviews = attack(run, s, caller, &artifacts)?;
+    let (reviews, mut notes) = attack(run, s, caller, &artifacts, change)?;
     for (id, results) in reviews {
         let lens = lens_of(cfg, &id)?;
         let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
         let mut round = Round {
             round: run.round,
+            notes: notes.remove(&id).unwrap_or_default(),
             ..Round::default()
         };
         let mut lists = Vec::new();
@@ -1513,10 +1624,12 @@ lenses:
         let cfg = plain("exception", 1, 1);
         let s = setting(&cfg);
         let mut c = change(&["a.src"]);
-        let lean = write_artifact(&s, &c, 1).unwrap();
+        let fake = Fake::new(defect_in("alpha", 99));
+        let run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        let lean = write_artifact(&s, &run, &c, 1).unwrap();
         assert!(lean.full.is_none());
         c.full = Some("the whole diff".into());
-        let both = write_artifact(&s, &c, 2).unwrap();
+        let both = write_artifact(&s, &run, &c, 2).unwrap();
         let mut lens = cfg.lenses[0].clone();
         assert_eq!(both.for_lens(&lens), both.diff.as_path());
         lens.include_generated = true;
@@ -1724,6 +1837,62 @@ lenses:
         drop(calls);
         // Each round's tokens are kept apart.
         assert!(run.usage.iter().any(|u| u.round == 3));
+    }
+
+    #[test]
+    fn stages_join_as_lenses_and_each_runs_its_own_way() {
+        use super::super::change::tests::repo_with;
+        let top = "stages: [context, claims, mutation, probes]\ntests: {command: 'true'}";
+        let cfg = config("exception", 1, 1, "", top);
+        for id in ["claims", "mutation", "probes"] {
+            assert!(cfg.lenses.iter().any(|l| l.id == id), "{id}");
+        }
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let s = setting(&cfg);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                // The mutation reviewer proposes nothing.
+                Role::Reviewer if prompt.contains("proposing small breaks") => {
+                    r#"{"mutants": []}"#.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let mut c = change(&["a.src"]);
+        c.diff = "+++ b/a.src\n@@ -0,0 +1 @@\n+// Sets x to one, as the spec says.\n".into();
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let calls = fake.calls.lock().unwrap();
+        let claims = calls
+            .iter()
+            .find(|c| c.3.contains("You check what a change claims"))
+            .expect("a claims reviewer");
+        assert!(
+            claims
+                .3
+                .contains("[a.src:1] comment: Sets x to one, as the spec says.")
+        );
+        drop(calls);
+        // Read-only reviewers can't run scenarios, and with nowhere for
+        // copies the mutation stage can't run either: each says so.
+        let failed = |id: &str| run.lenses[id].rounds[0].failures.join(" ");
+        assert!(
+            failed("probes").contains("needs a shell"),
+            "{}",
+            failed("probes")
+        );
+        assert!(
+            failed("mutation").contains("place for copies"),
+            "{}",
+            failed("mutation")
+        );
+        // Every role got the history pack ahead of the diff.
+        let sent = fake.sent.lock().unwrap();
+        assert!(
+            sent.iter()
+                .all(|(_, text)| text.contains("What the repository's history says"))
+        );
     }
 
     #[test]

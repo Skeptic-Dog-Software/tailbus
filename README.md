@@ -611,6 +611,28 @@ convergence left it. `every_dimension: true` has a builder review every
 dimension the key names, where it would otherwise skip one the change can't
 affect.
 
+**Stages.** A repository's review config can turn on `stages`, which
+make what a careful reviewer does by habit part of every round:
+
+- `context`: every role gets what the repository's history says about the
+  changed files, gathered from git: earlier commits to them, docs and tests
+  that mention them, and where the functions the change touches are used.
+- `claims`: a lens that lists every claim the change makes about itself
+  (the doc lines and comments it adds, its tests' names, its commit
+  messages and description) and checks each one.
+- `mutation`: a lens whose reviewer proposes small breaks in the changed
+  code. ACR applies each in a copy of its own and runs the tests; a break
+  they don't catch is a finding, with its proof. The tests run as
+  `tests.command`, or as the repository's files suggest: Flutter, Cargo,
+  Go, npm or pytest. `{tests}` in the command stands for the test files.
+- `probes`: a lens whose reviewer writes and runs scenarios of what the
+  change says it does, and of the edges around it. Its binding needs a
+  shell.
+
+A Judge rates what the stages find, as any lens's findings. `tests.parallel`,
+`tests.timeout` and `tests.mutants` set how many mutants run at once, how
+long one run of the tests may take, and how many a reviewer proposes.
+
 `run` and `resume` exit 0 when every lens is confirmed or waived, 3 when they're
 waiting for a person, 4 on an escalation, and 1 if the review ended with
 lenses open. `--post-pr <number>` puts the labels and comment on a pull

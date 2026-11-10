@@ -10,7 +10,7 @@ use super::config::{Lens, Severity, Tier};
 /// The JSON in an answer, which a model may have wrapped in other words,
 /// braces among them: the first whole object in it that reads as `T`. If
 /// none does, the error is the first object's.
-fn json_in<T: DeserializeOwned>(text: &str) -> Result<T> {
+pub(super) fn json_in<T: DeserializeOwned>(text: &str) -> Result<T> {
     let mut first_error = None;
     let mut from = 0;
     while let Some(start) = text[from..].find('{').map(|i| from + i) {
