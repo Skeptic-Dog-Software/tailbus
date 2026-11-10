@@ -973,6 +973,9 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     // Only an Orchestrator may change the checkout.
     let before = caller.fingerprint(&run.repo);
     let (reviews, mut notes) = attack(run, s, caller, &artifacts, change)?;
+    // Each lens's reviewers, then its Judge: the Judges all at once, since
+    // each sees only its own lens.
+    let mut lenses: Vec<(String, &Lens, Round, Vec<Vec<Raw>>)> = Vec::new();
     for (id, results) in reviews {
         let lens = lens_of(cfg, &id)?;
         let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
@@ -992,20 +995,63 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
                 Err(e) => round.failures.push(format!("{label}: {e:#}")),
             }
         }
-        if lists.iter().any(|l| !l.is_empty()) {
-            let diff = artifacts.for_lens(lens);
-            let judged = roles::judge_prompt(lens, &lists, &s.not_findings).and_then(|prompt| {
-                let text = ask(run, s, caller, Role::Judge, &prompt, Some(diff))?;
-                roles::read_ratings(&text)
-            });
-            match judged {
-                Ok(ratings) => round.findings = rate(run, cfg, lens, ratings),
-                Err(e) => round.failures.push(format!("the Judge: {e:#}")),
+        lenses.push((id, lens, round, lists));
+    }
+    let judge_name = cfg.binding_name(Role::Judge, None)?;
+    let judge = cfg.binding(Role::Judge, None)?;
+    let repo = run.repo.clone();
+    let artifacts = &artifacts;
+    // A lens's Judge's answer, if it had findings to judge.
+    type Judged = Option<Result<(Usage, Vec<roles::Rating>)>>;
+    let judged: Vec<Judged> = thread::scope(|scope| {
+        let handles: Vec<_> = lenses
+            .iter()
+            .map(|(_, lens, _, lists)| {
+                let repo = repo.as_path();
+                lists.iter().any(|l| !l.is_empty()).then(|| {
+                    scope.spawn(move || -> Result<(Usage, Vec<roles::Rating>)> {
+                        let prompt = roles::judge_prompt(lens, lists, &s.not_findings)?;
+                        let diff = artifacts.for_lens(lens);
+                        let call = Call {
+                            role: Role::Judge,
+                            binding_name: judge_name,
+                            binding: judge,
+                            prompt: &prompt,
+                            artifact: Some(diff),
+                            writes: false,
+                            repo,
+                        };
+                        let answer = caller.call(&call)?;
+                        let usage = usage(cfg, &call, input_bytes(&prompt, Some(diff)), &answer);
+                        Ok((usage, roles::read_ratings(&answer.text)?))
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow!("a Judge's thread died")))
+                })
+            })
+            .collect()
+    });
+    let changed = before.is_some() && caller.fingerprint(&run.repo) != before;
+    for ((id, lens, mut round, _), judged) in lenses.into_iter().zip(judged) {
+        match judged {
+            Some(Ok((mut usage, ratings))) => {
+                usage.round = run.round;
+                run.usage.push(usage);
+                round.findings = rate(run, cfg, lens, ratings);
             }
+            Some(Err(e)) => round.failures.push(format!("the Judge: {e:#}")),
+            None => {}
         }
-        if before.is_some() && caller.fingerprint(&run.repo) != before {
+        if changed {
             round.failures.push(
-                "the repository changed during the reviewers' or the Judge's turn, and only an \
+                "the repository changed during the reviewers' or the Judges' turn, and only an \
                  Orchestrator may change it"
                     .into(),
             );
@@ -1893,6 +1939,38 @@ lenses:
         drop(calls);
         // Each round's tokens are kept apart.
         assert!(run.usage.iter().any(|u| u.round == 3));
+    }
+
+    #[test]
+    fn a_rounds_judges_run_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cfg = plain("exception", 1, 1);
+        let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let fake = Fake::new(|role, _: &str| {
+            Ok(match role {
+                Role::Reviewer => ONE.to_string(),
+                Role::Judge => {
+                    let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(n, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    rating("Low")
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(fake.count(Role::Judge), 2);
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            2,
+            "alpha's and beta's Judges overlap"
+        );
+        assert!(run.lenses.values().all(|l| l.rounds[0].findings.len() == 1));
+        assert_eq!(
+            run.usage.iter().filter(|u| u.role == Role::Judge).count(),
+            2
+        );
     }
 
     #[test]
