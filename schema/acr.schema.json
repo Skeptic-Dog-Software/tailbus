@@ -137,9 +137,9 @@
       }
     },
     "stages": {
-      "description": "What every round does besides its lenses' reviewers. gate: first, before any reviewer, changed lines no test runs and breaks in changed code every test passes; a gap that blocks stops the round, sparing the reviewers until the tests are written. brief: before the reviewers, the Orchestrator writes each lens a brief for this change: where to attack, and how. context: every role gets what the repository's history says about the changed files. claims: a lens that checks every claim the change makes about itself. mutation: a lens that proposes small breaks in the changed code, which the pipeline runs against the tests; a break they miss is a finding. probes: a lens that writes and runs scenarios of what the change says it does, which needs a binding with a shell.",
+      "description": "What every round does besides its lenses' reviewers. gate: first, before any reviewer, changed lines no test runs and breaks in changed code every test passes; a gap that blocks stops the round, sparing the reviewers until the tests are written. brief: before the reviewers, the Orchestrator writes each lens a brief for this change: where to attack, and how. context: every role gets what the repository's history says about the changed files. claims: a lens that checks every claim the change makes about itself. mutation: a lens that proposes small breaks in the changed code, which the pipeline runs against the tests; a break they miss is a finding. probes: a lens that writes and runs scenarios of what the change says it does, which needs a binding with a shell. test-writing: between rounds of a review to convergence, a fresh writer pins each fixed blocker with a test that fails before the fix and passes after, and closes the gate's gaps.",
       "type": "array",
-      "items": {"enum": ["gate", "brief", "context", "claims", "mutation", "probes"]},
+      "items": {"enum": ["gate", "brief", "context", "claims", "mutation", "probes", "test-writing"]},
       "uniqueItems": true
     },
     "tests": {

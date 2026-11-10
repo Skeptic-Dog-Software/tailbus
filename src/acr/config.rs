@@ -290,6 +290,12 @@ pub enum Stage {
     /// A lens that writes and runs scenarios of what the change says it
     /// does. Its binding needs a shell.
     Probes,
+    /// Between rounds of a review to convergence, after the steelman's
+    /// fixes: a fresh writer, which didn't make them, pins each fixed
+    /// blocker with a test and closes the gate's gaps. Each test it writes
+    /// is run on the code from before the fixes, where it must fail, and
+    /// after, where it must pass.
+    TestWriting,
 }
 
 /// How the repository's tests run.

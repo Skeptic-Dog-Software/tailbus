@@ -35,7 +35,7 @@ use super::roles::Raw;
 /// The lens a stage runs as, if it runs as one.
 pub fn lens_id(stage: Stage) -> Option<&'static str> {
     match stage {
-        Stage::Brief | Stage::Context => None,
+        Stage::Brief | Stage::Context | Stage::TestWriting => None,
         Stage::Claims => Some("claims"),
         Stage::Mutation => Some("mutation"),
         Stage::Gate => Some("tests"),
@@ -51,7 +51,7 @@ pub fn of_lens(id: &str, on: &[Stage]) -> Option<Stage> {
 /// What wrong means for a stage's lens, which its Judge rates by.
 pub fn criteria(stage: Stage) -> &'static str {
     match stage {
-        Stage::Brief | Stage::Context => "",
+        Stage::Brief | Stage::Context | Stage::TestWriting => "",
         Stage::Claims => {
             "A claim the change makes about itself is false, or the code and tests don't bear \
              it out: a comment, a test's name or header, a doc or ledger line, a commit message \
@@ -984,6 +984,69 @@ pub fn run_gate(g: &GateRuns, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)> 
     summary.push(mutated);
     found.extend(survivors);
     Ok((found, summary.join("; ")))
+}
+
+/// Whether `tests` pass in `dir`: Some(true) if they do, Some(false) if they
+/// fail, None if they ran past `limit`.
+pub fn tests_pass(
+    dir: &Path,
+    command: &str,
+    tests: &[String],
+    limit: Duration,
+    log: &Path,
+) -> Result<Option<bool>> {
+    Ok(match run_tests(dir, command, tests, limit, log)?.0 {
+        Ran::Passed => Some(true),
+        Ran::Failed => Some(false),
+        Ran::TimedOut => None,
+    })
+}
+
+/// The test writer's brief: pins for the blockers just fixed, and tests
+/// that close the gate's gaps, written by a session that didn't fix them.
+pub fn writer_prompt(intent: &str, blockers: &str, runbook: Option<&str>) -> String {
+    let runbook = runbook
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| format!("# How to work in this repository\n\n{}\n\n", r.trim()))
+        .unwrap_or_default();
+    format!(
+        "You write tests for a change, between rounds of an adversarial review. Fresh \
+         reviewers attacked it, a Judge upheld the blockers below, and they've just been fixed \
+         in the working directory. You didn't fix them, and you have no case to make for the \
+         fixes: write the tests that show whether they hold.\n\n\
+         {intent}\n\
+         # The blockers just fixed\n\n{blockers}\n\
+         # What to write\n\n\
+         For each blocker, a test that fails on the code as it was before the fix and passes \
+         now: its pin. Where a finding comes with a test or scenario that shows it, use that. \
+         Where a blocker is a gap in the tests, a line no test runs or a break every test \
+         passes, write the test that closes it: one that runs the line, or fails on the \
+         break. Put each where the repository keeps its tests, in their style. Change nothing \
+         but tests. Run what you write. Don't commit. Each test file you name is then run on \
+         the code from before the fixes, where it must fail, and after, where it must pass.\n\n\
+         {runbook}\
+         Answer with only JSON: {{\"tests\": [{{\"file\": \"<test file, from the root>\", \
+         \"pins\": [\"<finding id>\"]}}], \"done\": \"<what you wrote, in a few lines>\"}}."
+    )
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Written {
+    #[serde(default)]
+    pub tests: Vec<WrittenTest>,
+    #[serde(default)]
+    pub done: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WrittenTest {
+    pub file: String,
+    #[serde(default)]
+    pub pins: Vec<String>,
+}
+
+pub fn read_written(text: &str) -> Result<Written> {
+    super::roles::json_in::<Written>(text)
 }
 
 /// Where a lens's mutants run, for one reviewer in one round.

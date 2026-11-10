@@ -269,10 +269,29 @@ pub struct Steelman {
     pub round: u32,
     pub blockers: Vec<String>,
     pub done: String,
+    /// What the test writer that followed it wrote, and how each test
+    /// fared on the code from before the fixes and after.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pins: Vec<Pin>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tests_done: String,
     pub declined: Vec<roles::Declined>,
 }
 
-/// What stays the same through a review.
+/// A test file the writer wrote between rounds, and how it fared: a pin
+/// fails on the code from before the fixes and passes after. None where it
+/// couldn't be run, or ran past the limit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pin {
+    pub file: String,
+    /// The findings it pins.
+    #[serde(default)]
+    pub pins: Vec<String>,
+    pub fails_before: Option<bool>,
+    pub passes_after: Option<bool>,
+}
+
+/// What stays the same through a review./// What stays the same through a review.
 pub struct Setting<'a> {
     pub cfg: &'a Config,
     pub not_findings: String,
@@ -767,12 +786,14 @@ fn attack(
                 _ => run.repo.clone(),
             };
             let brief = match stage {
-                None | Some(Kind::Context) | Some(Kind::Brief) | Some(Kind::Gate) => {
-                    Brief::Review {
-                        prompt: roles::reviewer_prompt(lens, &scope, &s.not_findings, own, &guide),
-                        repo,
-                    }
-                }
+                None
+                | Some(Kind::Context)
+                | Some(Kind::Brief)
+                | Some(Kind::Gate)
+                | Some(Kind::TestWriting) => Brief::Review {
+                    prompt: roles::reviewer_prompt(lens, &scope, &s.not_findings, own, &guide),
+                    repo,
+                },
                 Some(Kind::Claims) => Brief::Review {
                     prompt: stages::claims_prompt(
                         &stages::claims(change, s.description.as_deref()),
@@ -997,7 +1018,118 @@ fn gate_round(
     Ok(round)
 }
 
-/// A round's reviewer copies, removed when it's dropped./// A round's reviewer copies, removed when it's dropped.
+/// The test-writing round between rounds: a fresh writer pins the blockers
+/// just fixed, and each test it names is run on the code from before the
+/// fixes, where it must fail, and after, where it must pass. A test that
+/// passes before pins nothing, and a person hears so.
+fn write_tests(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    blockers: &str,
+    intent: &str,
+    before: Option<&Path>,
+) -> (Vec<Pin>, String) {
+    let cfg = s.cfg;
+    let prompt = stages::writer_prompt(intent, blockers, cfg.runbook.as_deref());
+    let written = (|| -> Result<stages::Written> {
+        let name = cfg.binding_name(Role::Orchestrator, None)?;
+        let repo = run.repo.clone();
+        let call = Call {
+            role: Role::Orchestrator,
+            binding_name: name,
+            binding: cfg.binding(Role::Orchestrator, None)?,
+            prompt: &prompt,
+            artifact: None,
+            writes: true,
+            repo: &repo,
+        };
+        let answer = caller.call(&call)?;
+        record(run, cfg, &call, prompt.len(), &answer);
+        stages::read_written(&answer.text)
+    })();
+    let written = match written {
+        Ok(w) => w,
+        Err(e) => {
+            escalate(
+                run,
+                format!("the test writer after round {}: {e:#}", run.round),
+            );
+            return (Vec::new(), String::new());
+        }
+    };
+    let command = cfg
+        .tests
+        .command
+        .clone()
+        .or_else(|| stages::test_command(&run.repo));
+    let limit = std::time::Duration::from_secs(cfg.tests.timeout.unwrap_or(900));
+    // The code after the fixes and the new tests, in a copy, so running the
+    // tests leaves nothing in the checkout.
+    let after = Copies(
+        s.copies
+            .as_ref()
+            .map(|root| root.join(format!("{}-r{}-after", run.id, run.round))),
+    );
+    let after_copy = after.0.as_ref().and_then(|dir| {
+        let copy = dir.join(run.repo.file_name().unwrap_or_default());
+        super::change::copy_of(&run.repo, &copy).ok().map(|_| copy)
+    });
+    let mut pins = Vec::new();
+    for t in &written.tests {
+        let mut pin = Pin {
+            file: t.file.clone(),
+            pins: t.pins.clone(),
+            fails_before: None,
+            passes_after: None,
+        };
+        if let (Some(command), true) = (&command, run.repo.join(&t.file).is_file()) {
+            let files = [t.file.clone()];
+            if let Some(before) = before {
+                let to = before.join(&t.file);
+                let copied = to
+                    .parent()
+                    .map_or(Ok(()), fs::create_dir_all)
+                    .and_then(|_| fs::copy(run.repo.join(&t.file), &to).map(|_| ()));
+                if copied.is_ok() {
+                    let log = before.with_extension("before.log");
+                    pin.fails_before = stages::tests_pass(before, command, &files, limit, &log)
+                        .ok()
+                        .flatten()
+                        .map(|passed| !passed);
+                }
+            }
+            if let Some(after) = &after_copy {
+                let log = after.with_extension("after.log");
+                pin.passes_after = stages::tests_pass(after, command, &files, limit, &log)
+                    .ok()
+                    .flatten();
+            }
+        }
+        if pin.fails_before == Some(false) {
+            escalate(
+                run,
+                format!(
+                    "{} pins nothing: it passes on the code from before round {}'s fixes",
+                    pin.file, run.round
+                ),
+            );
+        }
+        if pin.passes_after == Some(false) {
+            escalate(
+                run,
+                format!(
+                    "{} fails on the code after round {}'s fixes",
+                    pin.file, run.round
+                ),
+            );
+        }
+        pins.push(pin);
+    }
+    (pins, written.done)
+}
+
+/// A round's reviewer copies, removed when it's dropped./// A round's reviewer copies, removed when it's dropped./// A round's reviewer copies, removed when it's dropped.
 struct Copies(Option<PathBuf>);
 
 impl Drop for Copies {
@@ -1315,19 +1447,35 @@ fn fix(
             })
             .collect()
     };
-    let prompt = if run.converge {
+    let writing = run.converge && s.cfg.stages.contains(&Kind::TestWriting);
+    let intent = if run.converge {
         let fixed = run.lenses.values().any(|l| !l.done.is_empty());
         let change = reload(fixed)?;
-        let intent = super::change::intent(s.description.as_deref(), &change.commits);
+        super::change::intent(s.description.as_deref(), &change.commits)
+    } else {
+        String::new()
+    };
+    let prompt = if run.converge {
         let earlier: String = run
             .steelmans
             .iter()
             .map(|m| format!("- After round {}: {}\n", m.round, m.done))
             .collect();
-        roles::steelman_prompt(&intent, &earlier, &list(&folded))
+        roles::steelman_prompt(&intent, &earlier, &list(&folded), writing)
     } else {
         roles::fix_prompt(&list(&folded))
     };
+    // The code as it is before the fixes, for the pins to fail on.
+    let before = Copies(
+        s.copies
+            .as_ref()
+            .filter(|_| writing)
+            .map(|root| root.join(format!("{}-r{}-before", run.id, run.round))),
+    );
+    let snapshot = before.0.as_ref().and_then(|dir| {
+        let copy = dir.join(run.repo.file_name().unwrap_or_default());
+        super::change::copy_of(&run.repo, &copy).ok().map(|_| copy)
+    });
     let cfg = s.cfg;
     let name = cfg.binding_name(Role::Orchestrator, None)?;
     let repo = run.repo.clone();
@@ -1374,7 +1522,17 @@ fn fix(
                     blockers: folded.iter().map(|(_, f)| f.id.clone()).collect(),
                     done: fixed.done.clone(),
                     declined: fixed.declined.clone(),
+                    pins: Vec::new(),
+                    tests_done: String::new(),
                 });
+                if writing {
+                    let (pins, done) =
+                        write_tests(run, s, caller, &list(&folded), &intent, snapshot.as_deref());
+                    if let Some(m) = run.steelmans.last_mut() {
+                        m.pins = pins;
+                        m.tests_done = done;
+                    }
+                }
                 // The change is a new version now: every lens attacks it.
                 for lens in run.lenses.values_mut() {
                     if lens.outcome == Outcome::Confirmed {
@@ -2085,6 +2243,67 @@ lenses:
         drop(calls);
         // Each round's tokens are kept apart.
         assert!(run.usage.iter().any(|u| u.round == 3));
+    }
+
+    #[test]
+    fn a_writer_pins_the_fixes_and_each_pin_must_fail_before_and_pass_after() {
+        use super::super::change::tests::repo_with;
+        let top = "stages: [test-writing]\ntests: {command: 'sh {tests}'}";
+        let cfg = config("exception", 20, 1, "", top);
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-pins-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.converge = true;
+        s.copies = Some(root.clone());
+        let fixed = Mutex::new(false);
+        let checkout = repo.clone();
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && !*fixed.lock().unwrap() => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                Role::Orchestrator if prompt.contains("You synthesize") => {
+                    assert!(prompt.contains("Leave the tests that pin these fixes"));
+                    fs::write(checkout.join("a.src"), "let x = 2;\n").unwrap();
+                    *fixed.lock().unwrap() = true;
+                    r#"{"done": "x is two now"}"#.to_string()
+                }
+                Role::Orchestrator if prompt.contains("You write tests for a change") => {
+                    assert!(prompt.contains("alpha-r1-1"));
+                    fs::write(checkout.join("pin.sh"), "grep -q 'x = 2' a.src\n").unwrap();
+                    fs::write(checkout.join("idle.sh"), "true\n").unwrap();
+                    r#"{"tests": [{"file": "pin.sh", "pins": ["alpha-r1-1"]}, {"file": "idle.sh", "pins": ["alpha-r1-1"]}], "done": "pinned"}"#
+                        .to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        // The pin that pins nothing stops the review for a person; with
+        // nobody in the loop, it's taken as seen and the review goes on.
+        assert_eq!(run.waiting, Some(Gate::Escalation));
+        for e in &mut run.escalations {
+            e.seen = true;
+        }
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(run.status, Status::Confirmed);
+        let m = &run.steelmans[0];
+        assert_eq!(m.tests_done, "pinned");
+        let pin = |f: &str| m.pins.iter().find(|p| p.file == f).unwrap().clone();
+        assert_eq!(pin("pin.sh").fails_before, Some(true));
+        assert_eq!(pin("pin.sh").passes_after, Some(true));
+        // A test that passes on the old code pins nothing, and a person hears.
+        assert_eq!(pin("idle.sh").fails_before, Some(false));
+        assert!(
+            run.escalations
+                .iter()
+                .any(|e| e.reason.contains("idle.sh pins nothing"))
+        );
     }
 
     fn gated(mode: &str) -> (Run, Vec<(Role, String, bool, String)>) {

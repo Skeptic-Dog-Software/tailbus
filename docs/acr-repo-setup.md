@@ -118,13 +118,27 @@ network or fails, fix the runbook.
 ## 5. Stages and the test command
 
 ```yaml
-stages: [brief, context, claims, mutation, probes]
+stages: [gate, brief, context, claims, probes, test-writing]
 tests:
   command: "<setup that is cheap to repeat>; <the test script> {tests}"
-  parallel: 2
+  coverage: "<setup>; <the test script with coverage>"
+  report: coverage/lcov.info
+  parallel: 1
   timeout: 900
   mutants: 12
 ```
+
+- **`gate`** runs first in every round. It finds changed lines no test runs
+  (from the coverage report) and mutants of the changed code every test
+  passes. A gap that blocks ends the round before the brief or any
+  reviewer, so reviewers attack only code whose tests are enough. Set
+  `tests.coverage` to a command that writes an lcov report. Most test tools
+  have a flag for that.
+- **`test-writing`** works between rounds of a review to convergence. After
+  the steelman's fixes, a fresh writer pins each fixed blocker with a test.
+  Each pin must fail on the code from before the fixes and pass after.
+- Size `tests.parallel` to the machine: test runs are CPU- and
+  memory-bound, so on a small machine, run one at a time.
 
 - **`brief`**: before each round, the Orchestrator writes each lens a brief
   for this change. It covers where to attack and how, as questions to

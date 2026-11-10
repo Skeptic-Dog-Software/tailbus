@@ -337,7 +337,22 @@ pub fn fix_prompt(blockers: &str) -> String {
 /// The synthesis between rounds of a review to convergence. The
 /// Orchestrator holds the change's whole thread, which is why it synthesizes
 /// and never attacks.
-pub fn steelman_prompt(intent: &str, earlier: &str, blockers: &str) -> String {
+/// `writer_follows`: a test writer pins the fixes next, so the steelman
+/// leaves that to it.
+pub fn steelman_prompt(
+    intent: &str,
+    earlier: &str,
+    blockers: &str,
+    writer_follows: bool,
+) -> String {
+    let pins = if writer_follows {
+        "Leave the tests that pin these fixes to the test writer who follows you, and run the \
+         existing tests that cover what you change."
+    } else {
+        "Where a blocker comes with a test or scenario that shows it, keep that test as its \
+         pin; where a blocker is a gap in the tests, write the test that closes it. Run the \
+         tests that cover what you change."
+    };
     let earlier = if earlier.is_empty() {
         "Nothing yet: this is the first.\n"
     } else {
@@ -359,7 +374,7 @@ pub fn steelman_prompt(intent: &str, earlier: &str, blockers: &str) -> String {
          Fold in these and nothing else: what the Judge upheld without blocking goes to a \
          person, not into the work. Keep the change to what it's for. Where the work claims \
          something about itself, in a comment, a test name, a doc or a ledger row, make the \
-         claim true or take it out. Run the tests that cover what you change. Don't commit.\n\n\
+         claim true or take it out. {pins} Don't commit.\n\n\
          A declined finding is recorded as a disagreement, not a resolution. Answer with only \
          JSON: {{\"done\": \"<what you changed, in a few lines>\", \
          \"declined\": [{{\"finding\": \"<its id>\", \"reason\": \"\"}}]}}."

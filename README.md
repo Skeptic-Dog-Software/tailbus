@@ -620,6 +620,21 @@ affect.
 **Stages.** A repository's review config can turn on `stages`, which
 make what a careful reviewer does by habit part of every round:
 
+- `gate`: first, before any reviewer. Are the change's tests enough?
+  Changed lines no test runs, from a coverage report (`tests.coverage`,
+  `tests.report`), and mutants of the changed code every test passes. The
+  gaps are the `tests` lens's findings; one that blocks ends the round
+  there, sparing the reviewers until the tests are written (`tests.gate:
+  warn` lets them run anyway). The gate runs the mutants itself.
+- `brief`: before the reviewers, the Orchestrator writes each lens a brief
+  for this change: where to attack, and how.
+- `test-writing`: between rounds of a review to convergence, after the
+  steelman's fixes, a fresh writer that didn't make them pins each fixed
+  blocker with a test and closes the gate's gaps. Each test it writes is
+  run on the code from before the fixes, where it must fail, and after,
+  where it must pass; one that passes before pins nothing, and a person
+  hears so.
+
 - `context`: every role gets what the repository's history says about the
   changed files, gathered from git: earlier commits to them, docs and tests
   that mention them, and where the functions the change touches are used.
