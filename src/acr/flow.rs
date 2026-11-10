@@ -677,13 +677,23 @@ type Attacked = (
     BTreeMap<String, Vec<String>>,
 );
 
+/// Where a round's copies go, and what they're made from: the round's warm
+/// copy, or the checkout.
+#[derive(Clone, Copy)]
+struct Copying<'a> {
+    dir: Option<&'a Path>,
+    source: &'a Path,
+}
+
 fn attack(
     run: &mut Run,
     s: &Setting,
     caller: &dyn Caller,
     artifacts: &Artifacts,
     change: &Change,
+    copying: Copying,
 ) -> Result<Attacked> {
+    let Copying { dir, source } = copying;
     let cfg = s.cfg;
     let scope = match run.head.as_deref() {
         Some(head) => format!("the change from {} to {head}", run.base),
@@ -735,15 +745,7 @@ fn attack(
     } else {
         BTreeMap::new()
     };
-    // Copies for this round, gone when it ends, however it ends.
-    let copies = Copies(
-        s.copies
-            .as_ref()
-            .map(|root| root.join(format!("{}-r{}", run.id, run.round))),
-    );
-    if let Some(root) = &s.copies {
-        prune_copies(root);
-    }
+    let copies = dir.map(Path::to_path_buf);
     let name = run
         .repo
         .file_name()
@@ -757,7 +759,7 @@ fn attack(
     for id in &open {
         let lens = lens_of(cfg, id)?;
         let binding = cfg.binding(Role::Reviewer, Some(lens))?;
-        let own = binding.changes_files() && copies.0.is_some();
+        let own = binding.changes_files() && copies.is_some();
         let stage = stages::of_lens(&lens.id, &cfg.stages);
         // The gate ran before the reviewers.
         if stage == Some(Kind::Gate) {
@@ -776,10 +778,10 @@ fn attack(
             run.fan_out
         };
         for n in 1..=fan_out {
-            let repo = match &copies.0 {
+            let repo = match &copies {
                 Some(dir) if own => {
                     let copy = dir.join(format!("{}-{n}", lens.id)).join(&name);
-                    super::change::copy_of(&run.repo, &copy)
+                    super::change::copy_of(source, &copy)
                         .with_context(|| format!("making {}'s reviewer a copy", lens.id))?;
                     copy
                 }
@@ -817,7 +819,7 @@ fn attack(
                     ),
                     repo,
                 },
-                Some(Kind::Mutation) => match (&copies.0, &command) {
+                Some(Kind::Mutation) => match (&copies, &command) {
                     (Some(dir), Some(command)) => Brief::Mutate {
                         prompt: stages::mutants_prompt(
                             &scope,
@@ -841,8 +843,7 @@ fn attack(
     }
     let limit = std::time::Duration::from_secs(cfg.tests.timeout.unwrap_or(900));
     let parallel = cfg.tests.parallel.unwrap_or(2) as usize;
-    let checkout = run.repo.clone();
-    let checkout = checkout.as_path();
+    let checkout = source;
     type Done = (Option<Usage>, Vec<Raw>, Option<String>);
     let answers: Vec<Result<Done>> = thread::scope(|scope| {
         let handles: Vec<_> = asks
@@ -895,7 +896,6 @@ fn attack(
             })
             .collect()
     });
-    drop(copies);
     let mut by_lens: BTreeMap<String, Vec<Result<Vec<Raw>>>> = BTreeMap::new();
     for ((lens, _), answer) in asks.iter().zip(answers) {
         let result = answer.map(|(usage, findings, note)| {
@@ -913,7 +913,40 @@ fn attack(
     Ok((by_lens, notes))
 }
 
-/// The test gate's round for its lens: mutants proposed by a reviewer and
+/// The round's warm copy: a copy of the change with the repository's setup
+/// run in it once, for every other copy this round to be made from. None,
+/// with why, if there's no setup or it failed, so copies start cold.
+fn warm_copy(run: &Run, s: &Setting, dir: Option<&Path>) -> (Option<PathBuf>, Option<String>) {
+    let (Some(setup), Some(dir)) = (s.cfg.tests.setup.as_deref(), dir) else {
+        return (None, None);
+    };
+    let copy = dir
+        .join("warm")
+        .join(run.repo.file_name().unwrap_or_default());
+    let limit = std::time::Duration::from_secs(s.cfg.tests.timeout.unwrap_or(900));
+    let ready = super::change::copy_of(&run.repo, &copy)
+        .and_then(|_| stages::tests_pass(&copy, setup, &[], limit, &dir.join("warm.log")));
+    match ready {
+        Ok(Some(true)) => (Some(copy), None),
+        Ok(Some(false)) => (
+            None,
+            Some("the setup command failed, so copies started cold".into()),
+        ),
+        Ok(None) => (
+            None,
+            Some(format!(
+                "the setup command ran past {} s, so copies started cold",
+                limit.as_secs()
+            )),
+        ),
+        Err(e) => (
+            None,
+            Some(format!("no warm copy, so copies started cold: {e:#}")),
+        ),
+    }
+}
+
+/// The test gate's round for its lens/// The test gate's round for its lens: mutants proposed by a reviewer and
 /// run with coverage against the tests, and the gaps judged.
 fn gate_round(
     run: &mut Run,
@@ -922,14 +955,16 @@ fn gate_round(
     artifacts: &Artifacts,
     change: &Change,
     id: &str,
+    copying: Copying,
 ) -> Result<Round> {
+    let Copying { dir, source } = copying;
     let cfg = s.cfg;
     let lens = lens_of(cfg, id)?;
     let mut round = Round {
         round: run.round,
         ..Round::default()
     };
-    let Some(root) = s.copies.as_ref() else {
+    let Some(root) = dir else {
         round
             .failures
             .push("the test gate needs a place for copies".into());
@@ -952,8 +987,7 @@ fn gate_round(
         Some(head) => format!("the change from {} to {head}", run.base),
         None => format!("the working tree against {}", run.base),
     };
-    let dir = Copies(Some(root.join(format!("{}-r{}-gate", run.id, run.round))));
-    prune_copies(root);
+    let dir = Copies(Some(root.join("gate")));
     let guide = stages::guide(lens.attack.as_deref(), None, None);
     let prompt = stages::mutants_prompt(&scope, cfg.tests.mutants.unwrap_or(12), &guide);
     let proposed = ask(
@@ -974,7 +1008,7 @@ fn gate_round(
     };
     let runs = stages::GateRuns {
         runner: stages::Runner {
-            repo: &run.repo,
+            repo: source,
             dir: dir.0.as_deref().expect("set above"),
             command: &command,
             parallel: cfg.tests.parallel.unwrap_or(2) as usize,
@@ -1217,6 +1251,22 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     }
     // Only an Orchestrator may change the checkout.
     let before = caller.fingerprint(&run.repo);
+    // This round's copies, gone when it ends, however it ends, made from
+    // one copy set up once: the package install and a first build.
+    let round_dir = Copies(
+        s.copies
+            .as_ref()
+            .map(|root| root.join(format!("{}-r{}", run.id, run.round))),
+    );
+    if let Some(root) = &s.copies {
+        prune_copies(root);
+    }
+    let (warm, warm_note) = warm_copy(run, s, round_dir.0.as_deref());
+    let source = warm.clone().unwrap_or_else(|| run.repo.clone());
+    let copying = Copying {
+        dir: round_dir.0.as_deref(),
+        source: &source,
+    };
     // The test gate first: a gap that blocks ends the round before any
     // reviewer runs.
     if let Some(id) = stages::lens_id(Kind::Gate).filter(|id| {
@@ -1226,7 +1276,8 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
                 .get(*id)
                 .is_some_and(|l| l.outcome == Outcome::Open)
     }) {
-        let round = gate_round(run, s, caller, &artifacts, change, id)?;
+        let mut round = gate_round(run, s, caller, &artifacts, change, id, copying)?;
+        round.notes.extend(warm_note.clone());
         let blocks = round
             .findings
             .iter()
@@ -1250,7 +1301,12 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             return Ok(());
         }
     }
-    let (reviews, mut notes) = attack(run, s, caller, &artifacts, change)?;
+    let (reviews, mut notes) = attack(run, s, caller, &artifacts, change, copying)?;
+    if let Some(note) = &warm_note {
+        for id in reviews.keys() {
+            notes.entry(id.clone()).or_default().push(note.clone());
+        }
+    }
     // Each lens's reviewers, then its Judge: the Judges all at once, since
     // each sees only its own lens.
     let mut lenses: Vec<(String, &Lens, Round, Vec<Vec<Raw>>)> = Vec::new();
@@ -1830,6 +1886,8 @@ lenses:
         sent: Mutex<Vec<(Role, String)>>,
         /// Where each call worked, and whether the change's file was there.
         repos: Mutex<Vec<(Role, PathBuf, bool)>>,
+        /// Whether each call's working directory held what a setup leaves.
+        warmed: Mutex<Vec<bool>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -1843,6 +1901,7 @@ lenses:
                 with_diff: Mutex::new(Vec::new()),
                 sent: Mutex::new(Vec::new()),
                 repos: Mutex::new(Vec::new()),
+                warmed: Mutex::new(Vec::new()),
             }
         }
 
@@ -1870,6 +1929,12 @@ lenses:
                 call.repo.to_path_buf(),
                 call.repo.join("a.src").is_file(),
             ));
+            if call.role == Role::Reviewer {
+                self.warmed
+                    .lock()
+                    .unwrap()
+                    .push(call.repo.join("warmed").is_file());
+            }
             if self.tamper == Some(call.role) {
                 self.changes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2496,6 +2561,34 @@ lenses:
             sent.iter()
                 .all(|(_, text)| text.contains("What the repository's history says"))
         );
+    }
+
+    #[test]
+    fn reviewers_copies_come_from_one_warm_copy_set_up_once() {
+        use super::super::change::tests::repo_with;
+        let mut cfg = config("exception", 1, 1, "", "tests: {setup: 'touch warmed'}");
+        let name = cfg.bindings[&Role::Reviewer].clone();
+        cfg.allowed_bindings.get_mut(&name).unwrap().tools =
+            Some(vec!["Read".into(), "Bash".into()]);
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-warm-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.copies = Some(root.clone());
+        let fake = Fake::new(defect_in("alpha", 99));
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let warmed = fake.warmed.lock().unwrap().clone();
+        assert_eq!(
+            warmed,
+            [true, true],
+            "each reviewer's copy has the setup's work"
+        );
+        // The setup ran in a copy, never in the checkout, and the round's
+        // copies are gone.
+        assert!(!repo.join("warmed").exists());
+        assert!(!root.join("r-r1").exists());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

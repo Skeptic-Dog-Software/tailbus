@@ -316,6 +316,11 @@ pub struct Tests {
     /// How many mutants a reviewer proposes in a round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutants: Option<u32>,
+    /// A command run once a round, from the root of a copy of the change,
+    /// before any reviewer's copy is made from it: the package install and
+    /// a first build, so every copy starts warm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<String>,
     /// The command that runs the tests with coverage, from the root, for
     /// the gate: it writes an lcov report.
     #[serde(default, skip_serializing_if = "Option::is_none")]

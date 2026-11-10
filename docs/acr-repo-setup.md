@@ -120,6 +120,7 @@ network or fails, fix the runbook.
 ```yaml
 stages: [gate, brief, context, claims, probes, test-writing]
 tests:
+  setup: "<the offline package install>; <the cache copy>; <a first build or test run>"
   command: "<setup that is cheap to repeat>; <the test script> {tests}"
   coverage: "<setup>; <the test script with coverage>"
   report: coverage/lcov.info
@@ -137,6 +138,11 @@ tests:
 - **`test-writing`** works between rounds of a review to convergence. After
   the steelman's fixes, a fresh writer pins each fixed blocker with a test.
   Each pin must fail on the code from before the fixes and pass after.
+- **`tests.setup`** runs once a round, in one copy of the change, before
+  any reviewer's copy is made from it. Every copy that round, reviewers'
+  and mutants', is then cloned from it with its build caches, so none
+  starts cold. Put the package install and a first build or test run in
+  it.
 - Size `tests.parallel` to the machine: test runs are CPU- and
   memory-bound, so on a small machine, run one at a time.
 
