@@ -265,6 +265,13 @@ pub struct Policy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Stage {
+    /// First in each round, before any reviewer: are the change's tests
+    /// enough? Changed lines no test runs, from a coverage report, and
+    /// breaks in the changed code every test passes, from mutants. Gaps
+    /// are the `tests` lens's findings, and a gap that blocks stops the
+    /// round there, sparing the reviewers' tokens until the tests are
+    /// written. It runs the mutation stage's mutants itself.
+    Gate,
     /// Before each round's reviewers, the Orchestrator writes each lens a
     /// brief for this change: where in it to attack, and how. It reads the
     /// change and the code, with no case of its own to make for it.
@@ -303,6 +310,28 @@ pub struct Tests {
     /// How many mutants a reviewer proposes in a round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutants: Option<u32>,
+    /// The command that runs the tests with coverage, from the root, for
+    /// the gate: it writes an lcov report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<String>,
+    /// Where that report is, from the root: `coverage/lcov.info` if unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
+    /// What a gap that blocks does: `stop` the round before the reviewers,
+    /// the default, or `warn` and let them run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateMode>,
+}
+
+/// What the test gate does with a gap that blocks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateMode {
+    /// The round ends before any reviewer runs.
+    #[default]
+    Stop,
+    /// The reviewers run anyway.
+    Warn,
 }
 
 /// US dollars per million tokens. Cached input left out costs what other
@@ -588,10 +617,15 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
 /// The config with a lens for each stage that runs as one. They apply to
 /// every change, and a Judge rates what they find, as any lens's.
 fn with_stage_lenses(mut config: Config) -> Result<Config> {
+    let gated = config.stages.contains(&Stage::Gate);
     for stage in config.stages.clone() {
         let Some(id) = super::stages::lens_id(stage) else {
             continue;
         };
+        // The gate runs the mutants itself.
+        if gated && stage == Stage::Mutation {
+            continue;
+        }
         if config.lenses.iter().any(|l| l.id == id) {
             bail!("a lens is named {id}, which the {id} stage's own lens is called");
         }

@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::proto::RunUsage;
 
 use super::change::{self, Change};
-use super::config::{Action, Binding, Config, HumanGate, Lens, Role, Severity, Stage as Kind};
+use super::config::{
+    Action, Binding, Config, GateMode, HumanGate, Lens, Role, Severity, Stage as Kind,
+};
 use super::plan::{self, Why, tokens_in};
 use super::roles::{self, Raw};
 use super::stages;
@@ -738,6 +740,10 @@ fn attack(
         let binding = cfg.binding(Role::Reviewer, Some(lens))?;
         let own = binding.changes_files() && copies.0.is_some();
         let stage = stages::of_lens(&lens.id, &cfg.stages);
+        // The gate ran before the reviewers.
+        if stage == Some(Kind::Gate) {
+            continue;
+        }
         // A reviewer that can run things gets the runbook too.
         let guide = stages::guide(
             lens.attack.as_deref(),
@@ -761,10 +767,12 @@ fn attack(
                 _ => run.repo.clone(),
             };
             let brief = match stage {
-                None | Some(Kind::Context) | Some(Kind::Brief) => Brief::Review {
-                    prompt: roles::reviewer_prompt(lens, &scope, &s.not_findings, own, &guide),
-                    repo,
-                },
+                None | Some(Kind::Context) | Some(Kind::Brief) | Some(Kind::Gate) => {
+                    Brief::Review {
+                        prompt: roles::reviewer_prompt(lens, &scope, &s.not_findings, own, &guide),
+                        repo,
+                    }
+                }
                 Some(Kind::Claims) => Brief::Review {
                     prompt: stages::claims_prompt(
                         &stages::claims(change, s.description.as_deref()),
@@ -884,7 +892,112 @@ fn attack(
     Ok((by_lens, notes))
 }
 
-/// A round's reviewer copies, removed when it's dropped.
+/// The test gate's round for its lens: mutants proposed by a reviewer and
+/// run with coverage against the tests, and the gaps judged.
+fn gate_round(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    artifacts: &Artifacts,
+    change: &Change,
+    id: &str,
+) -> Result<Round> {
+    let cfg = s.cfg;
+    let lens = lens_of(cfg, id)?;
+    let mut round = Round {
+        round: run.round,
+        ..Round::default()
+    };
+    let Some(root) = s.copies.as_ref() else {
+        round
+            .failures
+            .push("the test gate needs a place for copies".into());
+        return Ok(round);
+    };
+    let Some(command) = cfg
+        .tests
+        .command
+        .clone()
+        .or_else(|| stages::test_command(&run.repo))
+    else {
+        round.failures.push(
+            "the test gate can't tell how this repository's tests run: set tests.command in \
+             its review config"
+                .into(),
+        );
+        return Ok(round);
+    };
+    let scope = match run.head.as_deref() {
+        Some(head) => format!("the change from {} to {head}", run.base),
+        None => format!("the working tree against {}", run.base),
+    };
+    let dir = Copies(Some(root.join(format!("{}-r{}-gate", run.id, run.round))));
+    prune_copies(root);
+    let guide = stages::guide(lens.attack.as_deref(), None, None);
+    let prompt = stages::mutants_prompt(&scope, cfg.tests.mutants.unwrap_or(12), &guide);
+    let proposed = ask(
+        run,
+        s,
+        caller,
+        Role::Reviewer,
+        &prompt,
+        Some(&artifacts.diff),
+    )
+    .and_then(|text| stages::read_mutants(&text));
+    let mutants = match proposed {
+        Ok(m) => m,
+        Err(e) => {
+            round.failures.push(format!("its mutants: {e:#}"));
+            Vec::new()
+        }
+    };
+    let runs = stages::GateRuns {
+        runner: stages::Runner {
+            repo: &run.repo,
+            dir: dir.0.as_deref().expect("set above"),
+            command: &command,
+            parallel: cfg.tests.parallel.unwrap_or(2) as usize,
+            limit: std::time::Duration::from_secs(cfg.tests.timeout.unwrap_or(900)),
+        },
+        coverage: cfg.tests.coverage.as_deref(),
+        report: cfg.tests.report.as_deref().unwrap_or("coverage/lcov.info"),
+        diff: &change.diff,
+    };
+    let gaps = match stages::run_gate(&runs, &mutants) {
+        Ok((gaps, summary)) => {
+            round.notes.push(summary);
+            gaps
+        }
+        Err(e) => {
+            round.failures.push(format!("{e:#}"));
+            Vec::new()
+        }
+    };
+    drop(dir);
+    round.reviewers.push(format!(
+        "The test gate, {id}: coverage and mutants run here"
+    ));
+    if !gaps.is_empty() {
+        let judged = roles::judge_prompt(lens, &[gaps], &s.not_findings).and_then(|prompt| {
+            let text = ask(
+                run,
+                s,
+                caller,
+                Role::Judge,
+                &prompt,
+                Some(artifacts.for_lens(lens)),
+            )?;
+            roles::read_ratings(&text)
+        });
+        match judged {
+            Ok(ratings) => round.findings = rate(run, cfg, lens, ratings),
+            Err(e) => round.failures.push(format!("the Judge: {e:#}")),
+        }
+    }
+    Ok(round)
+}
+
+/// A round's reviewer copies, removed when it's dropped./// A round's reviewer copies, removed when it's dropped.
 struct Copies(Option<PathBuf>);
 
 impl Drop for Copies {
@@ -972,6 +1085,39 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     }
     // Only an Orchestrator may change the checkout.
     let before = caller.fingerprint(&run.repo);
+    // The test gate first: a gap that blocks ends the round before any
+    // reviewer runs.
+    if let Some(id) = stages::lens_id(Kind::Gate).filter(|id| {
+        cfg.stages.contains(&Kind::Gate)
+            && run
+                .lenses
+                .get(*id)
+                .is_some_and(|l| l.outcome == Outcome::Open)
+    }) {
+        let round = gate_round(run, s, caller, &artifacts, change, id)?;
+        let blocks = round
+            .findings
+            .iter()
+            .any(|f| f.blocks() && f.state == FindingState::Open);
+        for failure in &round.failures {
+            escalate(
+                run,
+                format!(
+                    "{id} wasn't fully checked in round {}: {failure}",
+                    run.round
+                ),
+            );
+        }
+        let lens = run.lenses.get_mut(id).expect("open");
+        if round.failures.is_empty() && !blocks {
+            lens.outcome = Outcome::Confirmed;
+        }
+        lens.rounds.push(round);
+        if blocks && cfg.tests.gate.unwrap_or_default() == GateMode::Stop {
+            settle(run, cfg);
+            return Ok(());
+        }
+    }
     let (reviews, mut notes) = attack(run, s, caller, &artifacts, change)?;
     // Each lens's reviewers, then its Judge: the Judges all at once, since
     // each sees only its own lens.
@@ -1939,6 +2085,61 @@ lenses:
         drop(calls);
         // Each round's tokens are kept apart.
         assert!(run.usage.iter().any(|u| u.round == 3));
+    }
+
+    fn gated(mode: &str) -> (Run, Vec<(Role, String, bool, String)>) {
+        use super::super::change::tests::repo_with;
+        let top = format!("stages: [gate]\ntests: {{command: 'true', gate: {mode}}}");
+        let cfg = config("exception", 1, 1, "", &top);
+        assert!(cfg.lenses.iter().any(|l| l.id == "tests"));
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-gate-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.copies = Some(root.clone());
+        // `true` passes whatever the code, so the mutant survives.
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("proposing small breaks") => {
+                    r#"{"mutants": [{"file": "a.src", "find": "x = 1", "replace": "x = 2", "why": "x is one", "tests": []}]}"#
+                        .to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let calls = fake.calls.lock().unwrap().clone();
+        (run, calls)
+    }
+
+    #[test]
+    fn a_test_gap_that_blocks_stops_the_round_before_the_reviewers() {
+        let (run, calls) = gated("stop");
+        let gate = &run.lenses["tests"].rounds[0];
+        assert_eq!(gate.findings.len(), 1);
+        assert!(gate.findings[0].blocks());
+        assert!(
+            gate.notes[0].contains("1 mutants: 0 caught, 1 missed"),
+            "{:?}",
+            gate.notes
+        );
+        // Only the mutants' proposer ran: no lens's reviewer spent a thing.
+        let reviewers: Vec<_> = calls.iter().filter(|c| c.0 == Role::Reviewer).collect();
+        assert_eq!(reviewers.len(), 1);
+        assert!(reviewers[0].3.contains("proposing small breaks"));
+        assert!(run.lenses["alpha"].rounds.is_empty() && run.lenses["beta"].rounds.is_empty());
+    }
+
+    #[test]
+    fn a_warning_gate_lets_the_reviewers_run() {
+        let (run, calls) = gated("warn");
+        assert!(run.lenses["tests"].rounds[0].findings[0].blocks());
+        assert_eq!(calls.iter().filter(|c| c.0 == Role::Reviewer).count(), 3);
+        assert_eq!(run.lenses["alpha"].rounds.len(), 1);
     }
 
     #[test]

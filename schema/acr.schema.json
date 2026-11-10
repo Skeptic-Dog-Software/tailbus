@@ -137,9 +137,9 @@
       }
     },
     "stages": {
-      "description": "What every round does besides its lenses' reviewers. brief: before the reviewers, the Orchestrator writes each lens a brief for this change: where to attack, and how. context: every role gets what the repository's history says about the changed files. claims: a lens that checks every claim the change makes about itself. mutation: a lens that proposes small breaks in the changed code, which the pipeline runs against the tests; a break they miss is a finding. probes: a lens that writes and runs scenarios of what the change says it does, which needs a binding with a shell.",
+      "description": "What every round does besides its lenses' reviewers. gate: first, before any reviewer, changed lines no test runs and breaks in changed code every test passes; a gap that blocks stops the round, sparing the reviewers until the tests are written. brief: before the reviewers, the Orchestrator writes each lens a brief for this change: where to attack, and how. context: every role gets what the repository's history says about the changed files. claims: a lens that checks every claim the change makes about itself. mutation: a lens that proposes small breaks in the changed code, which the pipeline runs against the tests; a break they miss is a finding. probes: a lens that writes and runs scenarios of what the change says it does, which needs a binding with a shell.",
       "type": "array",
-      "items": {"enum": ["brief", "context", "claims", "mutation", "probes"]},
+      "items": {"enum": ["gate", "brief", "context", "claims", "mutation", "probes"]},
       "uniqueItems": true
     },
     "tests": {
@@ -150,7 +150,10 @@
         "command": {"type": "string", "description": "Run from the repository's root. {tests} stands for the test files to run. Without it, it's found from the repository's files: Flutter, Cargo, Go, npm or pytest."},
         "parallel": {"type": "integer", "minimum": 1, "description": "How many mutants run at once."},
         "timeout": {"type": "integer", "minimum": 1, "description": "Seconds one run of the tests may take."},
-        "mutants": {"type": "integer", "minimum": 1, "description": "How many mutants a reviewer proposes in a round."}
+        "mutants": {"type": "integer", "minimum": 1, "description": "How many mutants a reviewer proposes in a round."},
+        "coverage": {"type": "string", "description": "The command that runs the tests with coverage, from the root, writing an lcov report, for the gate."},
+        "report": {"type": "string", "description": "Where the coverage report is, from the root: coverage/lcov.info if unset."},
+        "gate": {"enum": ["stop", "warn"], "description": "What a gap that blocks does: stop the round before the reviewers (the default), or warn and let them run."}
       }
     },
     "runbook": {

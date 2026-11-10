@@ -38,6 +38,7 @@ pub fn lens_id(stage: Stage) -> Option<&'static str> {
         Stage::Brief | Stage::Context => None,
         Stage::Claims => Some("claims"),
         Stage::Mutation => Some("mutation"),
+        Stage::Gate => Some("tests"),
         Stage::Probes => Some("probes"),
     }
 }
@@ -61,6 +62,13 @@ pub fn criteria(stage: Stage) -> &'static str {
             "A small break in the code the change adds or changes passes every test that should \
              catch it. It blocks when the change, its tests or its docs claim that behaviour is \
              covered, or when the break would ship the defect the change exists to prevent."
+        }
+        Stage::Gate => {
+            "The change's tests aren't enough: a line it adds or changes that no test runs, or \
+             a small break in its code that every test passes. It blocks when the untested \
+             code is what the change exists to do or fix, or when the change, its tests or \
+             its docs claim that behaviour is covered. A break that changes nothing a user or \
+             caller could see isn't a finding."
         }
         Stage::Probes => {
             "Run as a scenario, the change doesn't do what it says, or breaks at an edge: done \
@@ -857,6 +865,127 @@ fn run_tests(
     Ok((ran, tail))
 }
 
+/// Changed lines no test runs, from an lcov report, one finding for each
+/// file. A changed file the report doesn't have, of a kind it covers, is a
+/// file no test loads at all. Tests and docs aren't counted.
+pub fn uncovered(report: &str, root: &Path, diff: &str) -> Vec<Raw> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let root = format!("{}/", root.display());
+    let mut zero: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut file = String::new();
+    for line in report.lines() {
+        if let Some(path) = line.strip_prefix("SF:") {
+            file = path.strip_prefix(root.as_str()).unwrap_or(path).to_string();
+            seen.insert(file.clone());
+        } else if let Some(rest) = line.strip_prefix("DA:") {
+            let mut parts = rest.split(',');
+            let (Some(n), Some(hits)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if hits.trim() == "0"
+                && let Ok(n) = n.trim().parse()
+            {
+                zero.entry(file.clone()).or_default().insert(n);
+            }
+        }
+    }
+    let kinds: BTreeSet<String> = seen
+        .iter()
+        .filter_map(|f| f.rsplit_once('.').map(|(_, x)| x.to_string()))
+        .collect();
+    let mut gaps: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+    let mut unloaded: BTreeSet<String> = BTreeSet::new();
+    for (f, n, text) in added_lines(diff) {
+        let code = text.trim();
+        if is_test_path(&f) || is_doc(&f) || code.is_empty() || comment_of(code).is_some() {
+            continue;
+        }
+        if seen.contains(&f) {
+            if zero.get(&f).is_some_and(|z| z.contains(&n)) {
+                gaps.entry(f).or_default().push((n, code.to_string()));
+            }
+        } else if f.rsplit_once('.').is_some_and(|(_, x)| kinds.contains(x)) {
+            unloaded.insert(f);
+        }
+    }
+    let mut found = Vec::new();
+    for (f, lines) in gaps {
+        let shown: String = lines
+            .iter()
+            .take(15)
+            .map(|(n, code)| format!("- {n}: {}\n", clip(code, 160)))
+            .collect();
+        found.push(Raw {
+            title: format!("No test runs {} changed line(s) in {f}", lines.len()),
+            detail: format!(
+                "The coverage report shows these lines, which the change adds or changes, \
+                 run by no test:\n{shown}"
+            ),
+            file: Some(f),
+            line: lines.first().map(|(n, _)| *n),
+        });
+    }
+    for f in unloaded {
+        found.push(Raw {
+            title: format!("No test loads {f}, which the change touches"),
+            detail: format!(
+                "{f} isn't in the coverage report at all, so no test runs any of the change's \
+                 lines in it."
+            ),
+            file: Some(f),
+            line: None,
+        });
+    }
+    found
+}
+
+/// The test gate's runs.
+pub struct GateRuns<'a> {
+    pub runner: Runner<'a>,
+    /// The coverage command, if there's one.
+    pub coverage: Option<&'a str>,
+    /// Where its lcov report is, from the root.
+    pub report: &'a str,
+    pub diff: &'a str,
+}
+
+/// Runs the gate: coverage first, which has to pass as it stands, then the
+/// mutants. Returns the gaps as findings, with a summary.
+pub fn run_gate(g: &GateRuns, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)> {
+    let r = &g.runner;
+    let mut found = Vec::new();
+    let mut summary = Vec::new();
+    if let Some(command) = g.coverage {
+        let name = r
+            .repo
+            .file_name()
+            .map_or_else(|| "repo".into(), |n| n.to_owned());
+        let copy = r.dir.join("coverage").join(&name);
+        copy_of(r.repo, &copy).context("copying the change to measure coverage")?;
+        let (ran, out) = run_tests(&copy, command, &[], r.limit, &r.dir.join("coverage.log"))?;
+        if ran != Ran::Passed {
+            bail!(
+                "the coverage run didn't pass as the change stands ({command}): {}",
+                clip(&out, 1500)
+            );
+        }
+        let text = fs::read_to_string(copy.join(g.report))
+            .with_context(|| format!("reading the coverage report {}", g.report))?;
+        let gaps = uncovered(&text, &copy, g.diff);
+        summary.push(format!(
+            "coverage: {} file(s) with changed lines no test runs",
+            gaps.len()
+        ));
+        found.extend(gaps);
+        let _ = fs::remove_dir_all(r.dir.join("coverage"));
+    }
+    let (survivors, mutated) = run_mutants(r, mutants)?;
+    summary.push(mutated);
+    found.extend(survivors);
+    Ok((found, summary.join("; ")))
+}
+
 /// Where a lens's mutants run, for one reviewer in one round.
 pub fn mutation_dir(copies: &Path, lens: &str, n: u32) -> PathBuf {
     copies.join(format!("{lens}-{n}-runs"))
@@ -1044,6 +1173,41 @@ mod tests {
         };
         assert!(run_mutants(&failing, &mutants).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_lines_no_test_runs_are_gaps_and_an_unloaded_file_is_one() {
+        let report = "SF:/copy/lib/a.dart\nDA:10,3\nDA:11,0\nDA:12,0\nend_of_record\n\
+                      SF:lib/c.dart\nDA:1,1\nend_of_record\n";
+        let diff = [
+            "+++ b/lib/a.dart",
+            "@@ -9,1 +10,4 @@",
+            "+  x = 1;",
+            "+  y = 2;",
+            "+  // a comment",
+            "+  z = 3;",
+            "+++ b/lib/b.dart",
+            "@@ -0,0 +1,1 @@",
+            "+void f() {}",
+            "+++ b/test/a_test.dart",
+            "@@ -0,0 +1,1 @@",
+            "+test();",
+            "+++ b/pubspec.yaml",
+            "@@ -0,0 +1,1 @@",
+            "+name: x",
+        ]
+        .join("\n");
+        let found = uncovered(report, Path::new("/copy"), &diff);
+        let titles: Vec<&str> = found.iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "No test runs 1 changed line(s) in lib/a.dart",
+                "No test loads lib/b.dart, which the change touches"
+            ]
+        );
+        assert!(found[0].detail.contains("- 11: y = 2;"));
+        assert_eq!(found[0].line, Some(11));
     }
 
     #[test]
