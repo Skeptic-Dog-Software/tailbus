@@ -199,6 +199,9 @@ pub struct Usage {
     /// It came out of a subscription: tokens count, dollars don't.
     #[serde(default)]
     pub subscription: bool,
+    /// The round it was spent in.
+    #[serde(default)]
+    pub round: u32,
 }
 
 impl Usage {
@@ -238,6 +241,25 @@ pub struct Run {
     /// description, kept so a resumed review sends the same.
     #[serde(default)]
     pub description: Option<String>,
+    /// Reviewed to convergence: see `Setting::converge`.
+    #[serde(default)]
+    pub converge: bool,
+    /// What each steelman between rounds did, in order.
+    #[serde(default)]
+    pub steelmans: Vec<Steelman>,
+}
+
+/// A synthesis between rounds of a review to convergence: what the
+/// Orchestrator was given to fold in, what it did, and what it declined and
+/// why. A declined finding is a disagreement, not a resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Steelman {
+    /// The round whose findings it folded in.
+    pub round: u32,
+    pub blockers: Vec<String>,
+    pub others: Vec<String>,
+    pub done: String,
+    pub declined: Vec<roles::Declined>,
 }
 
 /// What stays the same through a review.
@@ -250,6 +272,14 @@ pub struct Setting<'a> {
     /// description. Every role gets it, with the commit messages, ahead of
     /// the diff.
     pub description: Option<String>,
+    /// Review to convergence, as the essay ACR comes from prescribes: build,
+    /// attack, steelman, attack again, until the attackers agree. After each
+    /// round with a blocker, the Orchestrator folds in every finding the
+    /// Judge upheld, not only the blockers, and then every lens is attacked
+    /// again by fresh reviewers, since a fix for one can break another. It
+    /// ends when one round, on one version of the change, has no blocker in
+    /// any lens.
+    pub converge: bool,
 }
 
 /// A person's answer at a gate.
@@ -279,6 +309,7 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
         measured: false,
         agent_usd: None,
         subscription: call.binding.subscription,
+        round: 0,
     };
     match &answer.usage {
         Some(counted) => {
@@ -322,7 +353,9 @@ fn usage(cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) -> Usag
 }
 
 fn record(run: &mut Run, cfg: &Config, call: &Call, input_bytes: usize, answer: &Answer) {
-    run.usage.push(usage(cfg, call, input_bytes, answer));
+    let mut usage = usage(cfg, call, input_bytes, answer);
+    usage.round = run.round;
+    run.usage.push(usage);
 }
 
 fn escalate(run: &mut Run, reason: String) {
@@ -541,6 +574,8 @@ pub fn start(
         disagreements: Vec::new(),
         usage: Vec::new(),
         description: s.description.clone(),
+        converge: s.converge,
+        steelmans: Vec::new(),
     };
     let artifacts = write_artifact(s, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
@@ -622,7 +657,8 @@ fn attack(
     });
     let mut by_lens: BTreeMap<String, Vec<Result<Vec<Raw>>>> = BTreeMap::new();
     for ((lens, _), answer) in briefs.iter().zip(answers) {
-        let result = answer.map(|(usage, findings)| {
+        let result = answer.map(|(mut usage, findings)| {
+            usage.round = run.round;
             run.usage.push(usage);
             findings
         });
@@ -797,27 +833,58 @@ fn settle(run: &mut Run, cfg: &Config) {
     }
 }
 
-/// Has the Orchestrator fix what's been folded in.
-fn fix(run: &mut Run, s: &Setting, caller: &dyn Caller) -> Result<()> {
-    let folded: Vec<(String, Finding)> = run
-        .lenses
-        .values()
-        .filter_map(|l| l.latest().map(|r| (l.id.clone(), r)))
-        .flat_map(|(id, r)| {
-            r.findings
-                .iter()
-                .filter(|f| f.state == FindingState::Folded)
-                .map(move |f| (id.clone(), f.clone()))
-        })
-        .collect();
-    let list: String = folded
-        .iter()
-        .map(|(_, f)| {
-            let at = f.file.as_deref().unwrap_or("somewhere in the change");
-            format!("- {} ({at}): {}\n  {}\n", f.id, f.title, f.detail)
-        })
-        .collect();
-    let prompt = roles::fix_prompt(&list);
+/// Has the Orchestrator fix what's been folded in: only the blockers, or in
+/// a review to convergence, a steelman of everything the Judge upheld.
+fn fix(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    reload: &dyn Fn(bool) -> Result<Change>,
+) -> Result<()> {
+    // Each lens's latest round, if no steelman has had it yet.
+    let since = run.steelmans.last().map_or(0, |m| m.round);
+    let latest = |state: FindingState| -> Vec<(String, Finding)> {
+        run.lenses
+            .values()
+            .filter_map(|l| l.latest().map(|r| (l.id.clone(), r)))
+            .filter(|(_, r)| r.round > since)
+            .flat_map(|(id, r)| {
+                r.findings
+                    .iter()
+                    .filter(move |f| f.state == state)
+                    .map(move |f| (id.clone(), f.clone()))
+            })
+            .collect()
+    };
+    let folded = latest(FindingState::Folded);
+    // Upheld, but not blocking.
+    let others = if run.converge {
+        latest(FindingState::Logged)
+    } else {
+        Vec::new()
+    };
+    let list = |findings: &[(String, Finding)]| -> String {
+        findings
+            .iter()
+            .map(|(_, f)| {
+                let at = f.file.as_deref().unwrap_or("somewhere in the change");
+                format!("- {} ({at}): {}\n  {}\n", f.id, f.title, f.detail)
+            })
+            .collect()
+    };
+    let prompt = if run.converge {
+        let fixed = run.lenses.values().any(|l| !l.done.is_empty());
+        let change = reload(fixed)?;
+        let intent = super::change::intent(s.description.as_deref(), &change.commits);
+        let earlier: String = run
+            .steelmans
+            .iter()
+            .map(|m| format!("- After round {}: {}\n", m.round, m.done))
+            .collect();
+        roles::steelman_prompt(&intent, &earlier, &list(&folded), &list(&others))
+    } else {
+        roles::fix_prompt(&list(&folded))
+    };
     let cfg = s.cfg;
     let name = cfg.binding_name(Role::Orchestrator, None)?;
     let repo = run.repo.clone();
@@ -840,6 +907,38 @@ fn fix(run: &mut Run, s: &Setting, caller: &dyn Caller) -> Result<()> {
                 let lens = run.lenses.get_mut(id).expect("found above");
                 if !lens.done.contains(&fixed.done) {
                     lens.done.push(fixed.done.clone());
+                }
+            }
+            if run.converge {
+                let lens_of = |finding: &str| {
+                    folded
+                        .iter()
+                        .chain(&others)
+                        .find(|(_, f)| f.id == finding)
+                        .map(|(lens, _)| lens.clone())
+                };
+                for d in &fixed.declined {
+                    run.disagreements.push(Disagreement {
+                        lens: lens_of(&d.finding).unwrap_or_default(),
+                        finding: d.finding.clone(),
+                        sides: vec![
+                            "The Judge upheld it.".into(),
+                            format!("The steelman declined it: {}", d.reason),
+                        ],
+                    });
+                }
+                run.steelmans.push(Steelman {
+                    round: run.round,
+                    blockers: folded.iter().map(|(_, f)| f.id.clone()).collect(),
+                    others: others.iter().map(|(_, f)| f.id.clone()).collect(),
+                    done: fixed.done.clone(),
+                    declined: fixed.declined.clone(),
+                });
+                // The change is a new version now: every lens attacks it.
+                for lens in run.lenses.values_mut() {
+                    if lens.outcome == Outcome::Confirmed {
+                        lens.outcome = Outcome::Open;
+                    }
                 }
             }
             run.round += 1;
@@ -894,7 +993,7 @@ pub fn drive(
                 pause(run, Gate::Fold);
                 return Ok(());
             }
-            Stage::Fix => fix(run, s, caller)?,
+            Stage::Fix => fix(run, s, caller, reload)?,
             Stage::Final => {
                 pause(run, Gate::Final);
                 return Ok(());
@@ -1252,6 +1351,7 @@ lenses:
             not_findings: "- the decided thing".into(),
             work_dir: std::env::temp_dir().join(format!("tb-acr-run-{}", new_id())),
             description: None,
+            converge: false,
         }
     }
 
@@ -1474,6 +1574,114 @@ lenses:
         assert!(fix.2, "the Orchestrator's fix writes");
         let others = calls.iter().filter(|c| !c.3.contains("Fix these"));
         assert!(others.into_iter().all(|c| !c.2), "nothing else may write");
+    }
+
+    /// A review to convergence of a change to a.src.
+    fn converging<F: Fn(Role, &str) -> Result<String> + Sync>(cfg: &Config, fake: &Fake<F>) -> Run {
+        let mut s = setting(cfg);
+        s.converge = true;
+        s.description = Some("Makes x one.".into());
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, fake).unwrap();
+        let again = c.clone();
+        drive(&mut run, &s, fake, &|_| Ok(again.clone())).unwrap();
+        run
+    }
+
+    #[test]
+    fn a_review_to_convergence_attacks_every_lens_after_each_steelman() {
+        let cfg = plain("exception", 20, 1);
+        let fixes = Mutex::new(0);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && *fixes.lock().unwrap() < 2 => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                Role::Orchestrator if prompt.contains("You synthesize") => {
+                    *fixes.lock().unwrap() += 1;
+                    r#"{"done": "made it stronger"}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let run = converging(&cfg, &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        assert_eq!(run.round, 3);
+        // beta had nothing to fix, but the change changed under it twice.
+        assert_eq!(fake.count(Role::Reviewer), 6);
+        assert_eq!(run.lenses["beta"].rounds.len(), 3);
+        assert_eq!(run.steelmans.len(), 2);
+        assert_eq!(run.steelmans[0].blockers, ["alpha-r1-1"]);
+        assert_eq!(run.steelmans[1].round, 2);
+        let calls = fake.calls.lock().unwrap();
+        let steelmans: Vec<_> = calls
+            .iter()
+            .filter(|c| c.3.contains("You synthesize"))
+            .collect();
+        assert_eq!(steelmans.len(), 2);
+        assert!(
+            steelmans.iter().all(|c| c.0 == Role::Orchestrator && c.2),
+            "it writes"
+        );
+        // It holds the thread: what the change is for, and what came before.
+        assert!(steelmans[0].3.contains("Makes x one."));
+        assert!(steelmans[0].3.contains("Nothing yet"));
+        assert!(steelmans[1].3.contains("After round 1: made it stronger"));
+        assert!(!calls.iter().any(|c| c.3.contains("Fix these")));
+        drop(calls);
+        // Each round's tokens are kept apart.
+        assert!(run.usage.iter().any(|u| u.round == 3));
+    }
+
+    #[test]
+    fn a_steelman_folds_what_was_upheld_and_its_declines_are_disagreements() {
+        let cfg = plain("exception", 20, 1);
+        let fixed = Mutex::new(false);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && !*fixed.lock().unwrap() => {
+                    ONE.to_string()
+                }
+                Role::Reviewer if prompt.contains("beta") => ONE.to_string(),
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge if prompt.contains("alpha criteria") => rating("High"),
+                Role::Judge => rating("Low"),
+                Role::Orchestrator if prompt.contains("You synthesize") => {
+                    *fixed.lock().unwrap() = true;
+                    r#"{"done": "fixed alpha", "declined": [{"finding": "beta-r1-1", "reason": "it's a style call"}]}"#
+                        .to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let run = converging(&cfg, &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        // beta's Low finding never blocks, so round 2 ends it.
+        assert_eq!(run.round, 2);
+        assert_eq!(run.steelmans.len(), 1);
+        assert_eq!(run.steelmans[0].others, ["beta-r1-1"]);
+        let calls = fake.calls.lock().unwrap();
+        let steelman = calls
+            .iter()
+            .find(|c| c.3.contains("You synthesize"))
+            .unwrap();
+        assert!(steelman.3.contains("alpha-r1-1") && steelman.3.contains("beta-r1-1"));
+        drop(calls);
+        let d = run
+            .disagreements
+            .iter()
+            .find(|d| d.finding == "beta-r1-1")
+            .unwrap();
+        assert_eq!(d.lens, "beta");
+        assert!(d.sides[1].contains("style call"));
+        // What the last round found is reported, not folded: the change it
+        // ends at is the one every lens attacked.
+        assert_eq!(
+            run.lenses["beta"].rounds[1].findings[0].state,
+            FindingState::Logged
+        );
     }
 
     #[test]

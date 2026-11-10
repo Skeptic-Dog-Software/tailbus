@@ -89,6 +89,9 @@ pub enum Arm {
     Sized,
     /// The separate-roles pipeline: router, orchestrator, reviewers, judge.
     Separated,
+    /// The same pipeline, reviewed to convergence: attack, steelman, attack
+    /// again, until one round on one version has no blocker in any lens.
+    Converge,
 }
 
 /// A finding as a design reported it.
@@ -104,6 +107,13 @@ pub struct Found {
     pub file: String,
     #[serde(default)]
     pub blocker: bool,
+    /// The round that found it, where a design keeps count.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub round: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -123,6 +133,9 @@ pub struct Matched {
     pub found_later: bool,
     pub caught: bool,
     pub as_blocker: bool,
+    /// The design's findings that match it, by their place in its list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<usize>,
 }
 
 /// What a design caught of the key. The main counts are against what the
@@ -168,6 +181,22 @@ pub struct Outcome {
     /// couldn't be read. A score beside failures says less than it seems.
     #[serde(default)]
     pub failures: Vec<String>,
+    #[serde(flatten)]
+    pub converged: Option<Converged>,
+}
+
+/// What a review to convergence did besides find things.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Converged {
+    /// The rounds it took.
+    pub rounds: u32,
+    /// It ended with no blocker in any lens, rather than at its cap.
+    pub converged: bool,
+    /// Its run, in ACR's state, which keeps each round's diff and verdicts.
+    pub run: String,
+    /// What it left the change as: a patch on the key's head.
+    pub patch: Option<PathBuf>,
+    pub tokens_by_round: Vec<u64>,
 }
 
 /// A trial's scratch folder and its copy of the change, removed however it
@@ -221,6 +250,13 @@ fn kept_dir(paths: &Paths) -> PathBuf {
     paths.state.join("acr-trials-kept")
 }
 
+/// How long the change a review to convergence left is kept, to audit it.
+const PATCH_DAYS: u64 = 30;
+
+fn patches_dir(paths: &Paths) -> PathBuf {
+    paths.state.join("acr-bench").join("converged")
+}
+
 /// Removes what failed trials left once it's past keeping, and the folders
 /// and canaries of trials that were killed.
 fn prune(paths: &Paths) {
@@ -233,6 +269,7 @@ fn prune(paths: &Paths) {
     let places = [
         (kept_dir(paths), KEPT_DAYS),
         (paths.state.join("acr-trials"), STALE_DAYS),
+        (patches_dir(paths), PATCH_DAYS),
     ];
     for (dir, days) in places {
         for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -640,6 +677,7 @@ fn builder_led(paths: &Paths, s: &Scratch, key: &Key, arm: Arm) -> Result<Ran> {
         tokens: counts,
         models,
         failures: Vec::new(),
+        converged: None,
     })
 }
 
@@ -697,12 +735,22 @@ fn score(paths: &Paths, dir: &Path, key: &Key, found: &[Found]) -> Result<Score>
             .and_then(|rows| rows.iter().find(|r| r["id"] == f.id.as_str()));
         let caught = row.is_some_and(|r| r["caught"].as_bool() == Some(true));
         let as_blocker = caught && row.is_some_and(|r| r["as_blocker"].as_bool() == Some(true));
+        let matches = row
+            .and_then(|r| r["matches"].as_array())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|i| i.as_u64())
+                    .map(|i| i as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
         per_finding.push(Matched {
             id: f.id.clone(),
             blocker: f.blocker,
             found_later: f.found_later,
             caught,
             as_blocker,
+            matches,
         });
     }
     let extra = value["extra"].as_array().cloned().unwrap_or_default();
@@ -744,9 +792,13 @@ pub struct Ran {
     pub tokens: Counts,
     pub models: Vec<String>,
     pub failures: Vec<String>,
+    /// A review to convergence's, with its patch as text.
+    pub converged: Option<(Converged, String)>,
 }
 
-pub type Separated<'a> = &'a dyn Fn(&Path, &Key) -> Result<Ran>;
+/// The pipeline's designs run through `tailbus acr`'s own pipeline, which
+/// ACR's module provides.
+pub type Pipeline<'a> = &'a dyn Fn(&Path, &Key, Arm) -> Result<Ran>;
 
 /// A check's session: the smallest model, since all it does is a few reads.
 const CHECK_MODEL: &str = "claude-haiku-5-5";
@@ -874,15 +926,27 @@ fn key_name(key_path: &Path) -> String {
         .unwrap_or_default()
 }
 
-pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Result<Outcome> {
+pub fn run(paths: &Paths, key_path: &Path, arm: Arm, pipeline: Pipeline) -> Result<Outcome> {
     let key = resolved(read_key(key_path)?)?;
     let s = scratch(paths, &key)?;
     let started = Instant::now();
-    let ran = match arm {
+    let mut ran = match arm {
         Arm::OneSize | Arm::Sized => builder_led(paths, &s, &key, arm),
-        Arm::Separated => separated(&s.tree, &key),
+        Arm::Separated | Arm::Converge => pipeline(&s.tree, &key, arm),
     }
     .map_err(|e| s.failed(paths, e))?;
+    // Kept apart from the copy, which goes, so the result can be audited.
+    let converged = match ran.converged.take() {
+        Some((mut c, patch)) => {
+            let dir = patches_dir(paths);
+            fs::create_dir_all(&dir)?;
+            let path = dir.join(format!("{}-{}.patch", key_name(key_path), c.run));
+            fs::write(&path, patch).with_context(|| format!("writing {}", path.display()))?;
+            c.patch = Some(path);
+            Some(c)
+        }
+        None => None,
+    };
     let seconds = started.elapsed().as_secs();
     // New work has no findings yet: it's scored once its own review is done.
     let score = if key.findings.is_empty() {
@@ -900,6 +964,7 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, separated: Separated) -> Re
         score,
         findings: ran.findings,
         failures: ran.failures,
+        converged,
     })
 }
 
@@ -1113,12 +1178,34 @@ mod tests {
             score: None,
             findings: Vec::new(),
             failures: Vec::new(),
+            converged: None,
         };
         let line = serde_json::to_string(&outcome).unwrap();
         let value: Value = serde_json::from_str(&line).unwrap();
         assert!(value["score"].is_null());
+        assert!(value.get("rounds").is_none(), "{line}");
         let back: Outcome = serde_json::from_str(&line).unwrap();
-        assert!(back.score.is_none());
+        assert!(back.score.is_none() && back.converged.is_none());
+
+        // A review to convergence's result says how it went, on the same line.
+        let converged = Outcome {
+            arm: Arm::Converge,
+            converged: Some(Converged {
+                rounds: 4,
+                converged: true,
+                run: "r1".into(),
+                patch: Some(PathBuf::from("/p/k-r1.patch")),
+                tokens_by_round: vec![9, 5, 3, 2],
+            }),
+            ..outcome
+        };
+        let line = serde_json::to_string(&converged).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["arm"], "converge");
+        assert_eq!(value["rounds"], 4);
+        assert_eq!(value["tokens_by_round"][3], 2);
+        let back: Outcome = serde_json::from_str(&line).unwrap();
+        assert!(back.converged.is_some_and(|c| c.converged && c.run == "r1"));
     }
 
     #[test]

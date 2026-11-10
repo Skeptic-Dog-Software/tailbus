@@ -579,6 +579,8 @@ on. Models are called only for judgment.
 | `tailbus acr run --base <ref>` | Review a change. `--head <ref>` names it, or it's the working tree. Prints the report as JSON. |
 | `tailbus acr resume <run id>` | Go on past a gate: `--fold` and `--waive` take blockers' IDs, and `--approve` and `--stop` do what they say. |
 | `tailbus acr benchmark --base <ref> --known <file>` | Run a binding set against a commit with known blockers, and report what was caught, missed and falsely found, and the cost. |
+| `tailbus acr check <key>` | Check that a trial on an answer key can run: each session starts, reads the trial's copy, is refused a file outside it, and writes where it should. |
+| `tailbus acr trial <key> --arm <design>` | Review the key's change blind, in a copy holding only its head's history, and score the result against the key. |
 
 **What the change is for.** Every role gets, ahead of the diff, what the
 change says about itself: its description, from `--description <file>` or a
@@ -588,6 +590,17 @@ change adds, these are its claims. Reviewers check them against the code and
 tests, and the Judge rates a defect by what it costs given that purpose. A
 repository with good commit messages and pull request descriptions needs
 nothing else set up for it.
+
+**To convergence.** `tailbus acr trial <key> --arm converge` runs the
+pipeline as the essay ACR comes from prescribes, with nobody in the loop.
+Fresh reviewers attack. The Orchestrator then steelmans the change: it folds
+in every finding the Judge upheld, and any it declines is recorded, with its
+reason, as a disagreement. Every lens then attacks the new version, and this
+repeats until one round has no blocker in any lens. The Orchestrator here is
+the `steelman` binding, which needs `writes: true`. A review stops at 20
+rounds, a cap none should reach. The result gives the rounds, the tokens each
+took, and a patch of what the steelmans left, kept for 30 days in
+`acr-bench/converged/` so it can be audited.
 
 `run` and `resume` exit 0 when every lens is confirmed or waived, 3 when they're
 waiting for a person, 4 on an escalation, and 1 if the review ended with

@@ -300,9 +300,54 @@ pub fn fix_prompt(blockers: &str) -> String {
     )
 }
 
+/// The synthesis between rounds of a review to convergence. The
+/// Orchestrator holds the change's whole thread, which is why it synthesizes
+/// and never attacks.
+pub fn steelman_prompt(intent: &str, earlier: &str, blockers: &str, others: &str) -> String {
+    let earlier = if earlier.is_empty() {
+        "Nothing yet: this is the first.\n"
+    } else {
+        earlier
+    };
+    let others = if others.is_empty() { "None.\n" } else { others };
+    format!(
+        "You synthesize this change between rounds of an adversarial review. Fresh reviewers, \
+         each with a clean context, attacked it one dimension at a time, and a Judge upheld the \
+         findings below. Make the work the strongest version of itself: the version its most \
+         capable advocate would stand behind. You never review it yourself; new reviewers will \
+         attack what you leave, on every dimension.\n\n\
+         {intent}\n\
+         # What earlier rounds changed\n\n{earlier}\n\
+         # Blockers\n\n\
+         Fold each into the work in the working directory, so that a fresh reviewer finds \
+         nothing in it to block. If you're sure one is wrong, decline it and say why.\n\n\
+         {blockers}\n\
+         # Other upheld findings\n\n\
+         Fold in each one that makes the work stronger, and decline the rest, saying why.\n\n\
+         {others}\n\
+         # How\n\n\
+         Keep the change to what it's for. Where the work claims something about itself, in \
+         a comment, a test name, a doc or a ledger row, make the claim true or take it out. \
+         Run the tests that cover what you change. Don't commit.\n\n\
+         A declined finding is recorded as a disagreement, not a resolution. Answer with only \
+         JSON: {{\"done\": \"<what you changed, in a few lines>\", \
+         \"declined\": [{{\"finding\": \"<its id>\", \"reason\": \"\"}}]}}."
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Declined {
+    pub finding: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Fixed {
     pub done: String,
+    /// A steelman's: what it left out, and why.
+    #[serde(default)]
+    pub declined: Vec<Declined>,
 }
 
 pub fn read_fixed(text: &str) -> Result<Fixed> {

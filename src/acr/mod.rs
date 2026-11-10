@@ -150,7 +150,8 @@ pub enum AcrCmd {
         /// review found. For new work, leave the findings out: the trials
         /// are saved unscored, for `rescore` once its own review is done.
         key: PathBuf,
-        /// One design. Left out, all three, one after another.
+        /// One design. Left out, the three that review one round, one after
+        /// another; `converge` runs only when named.
         #[arg(long, value_enum)]
         arm: Option<trial::Arm>,
         /// Add each result, as a line of JSON, to this file too.
@@ -602,6 +603,7 @@ fn setting<'a>(
         not_findings,
         work_dir: dir,
         description: None,
+        converge: false,
     })
 }
 
@@ -880,9 +882,9 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                     trial::Arm::Separated,
                 ],
             };
-            let separated = |tree: &Path, key: &trial::Key| separated(paths, tree, key);
+            let pipeline = |tree: &Path, key: &trial::Key, arm| pipeline_arm(paths, tree, key, arm);
             for arm in arms {
-                let outcome = trial::run(paths, &key, arm, &separated)?;
+                let outcome = trial::run(paths, &key, arm, &pipeline)?;
                 let line = serde_json::to_string(&outcome)?;
                 println!("{line}");
                 if let Some(out) = &out {
@@ -999,6 +1001,43 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         let wrong = answer.map(|a| trial::check_answer(&a.text, &key.head, &canary.secret, bash));
         report(&format!("{name} through {}", b.agent), started, wrong);
     }
+    // A review to convergence's steelman, which writes in the copy.
+    if let Some(b) = cfg.allowed_bindings.get(STEELMAN_BINDING) {
+        let bridge = b.agent.split('@').next().unwrap_or(&b.agent).to_string();
+        if !allowed.bridges.contains(&bridge) {
+            crate::setup::acr_repo(paths, &s.tree, true, &bridge)?;
+            allowed.bridges.push(bridge);
+        }
+        let binding = config::Binding {
+            timeout: Some(trial::CHECK_SECS),
+            ..b.clone()
+        };
+        let result = s.tree.join(".acr-check-steelman.json");
+        let prompt = trial::check_prompt(&s.tree, &canary.path, true, Some(&result));
+        let started = std::time::Instant::now();
+        let answer = caller.call(&Call {
+            role: Role::Orchestrator,
+            binding_name: STEELMAN_BINDING,
+            binding: &binding,
+            prompt: &prompt,
+            artifact: None,
+            writes: true,
+            repo: &s.tree,
+        });
+        let wrong = answer.map(|a| {
+            let mut wrong = trial::check_answer(&a.text, &key.head, &canary.secret, true);
+            if fs::read_to_string(&result).is_err() {
+                wrong.push(format!("it didn't write {} in the copy", result.display()));
+            }
+            wrong
+        });
+        let _ = fs::remove_file(&result);
+        report(
+            &format!("{STEELMAN_BINDING} through {}, writing", b.agent),
+            started,
+            wrong,
+        );
+    }
     drop(allowed);
     if !ok && let Some(kept) = s.keep(paths) {
         println!(
@@ -1009,35 +1048,83 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
     Ok(ok)
 }
 
+/// The most rounds a review to convergence may take: a cap no review should
+/// reach, so one that does is a review that isn't converging.
+const CONVERGE_CAP: u32 = 20;
+
+/// The Orchestrator's binding in a review to convergence. It must be able to
+/// write, since its steelman folds findings into the change.
+pub const STEELMAN_BINDING: &str = "steelman";
+
 /// One round of the pipeline, as a change first comes out, with nobody
 /// fixing anything and escalations taken as seen. Leaves nothing behind.
 fn one_round(paths: &Paths, target: &Target, description: Option<String>) -> Result<Run> {
+    pipeline_run(paths, target, description, false)
+}
+
+/// The pipeline with nobody in the loop: one round, or to convergence. An
+/// escalation is recorded and taken as seen, and the review goes on.
+fn pipeline_run(
+    paths: &Paths,
+    target: &Target,
+    description: Option<String>,
+    converge: bool,
+) -> Result<Run> {
     let mut flags = flags(target);
-    flags.max_rounds = Some(1);
+    flags.max_rounds = Some(if converge { CONVERGE_CAP } else { 1 });
     flags.human_gate = Some(HumanGate::Exception);
     let (cfg, source) = load_config(paths, target, &flags)?;
     cfg.check_bindings()?;
     cfg.check_local(&this_machine(paths)?)?;
+    if converge {
+        let name = cfg.binding_name(Role::Orchestrator, None)?;
+        if !cfg.binding(Role::Orchestrator, None)?.writes {
+            bail!(
+                "a review to convergence needs an Orchestrator that can fold findings in, \
+                 and {name} can't: give it `writes: true` in acr.yaml"
+            );
+        }
+    }
     change::checked_out(&target.repo, target.head.as_deref())?;
     let id = new_id();
     let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
     let mut s = setting(paths, &cfg, &id, Some(list))?;
     s.description = description;
+    s.converge = converge;
     // Under way until this ends, so an update to tailbus waits for it.
     let _active = keep::active_guard(paths, &id)?;
     let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
     let change = reload(&cfg, repo, base, head)?;
     let caller = BridgeCaller::new(paths)?;
     let mut run = flow::start(&id, repo, base, head, &s, &change, &caller)?;
-    for e in &mut run.escalations {
-        e.seen = true;
+    // After a steelman, the change is the working tree, with any file it
+    // added in the diff too.
+    let reloading = |fixed: bool| {
+        if fixed {
+            change::git(repo, &["add", "--intent-to-add", "--all"])?;
+        }
+        reload(&cfg, repo, base, head.filter(|_| !fixed))
+    };
+    loop {
+        for e in &mut run.escalations {
+            e.seen = true;
+        }
+        flow::drive(&mut run, &s, &caller, &reloading)?;
+        match run.waiting {
+            None => break,
+            Some(flow::Gate::Escalation) => {}
+            Some(gate) => bail!(
+                "run {} is waiting at {gate:?}, which nobody here answers",
+                run.id
+            ),
+        }
     }
-    flow::drive(&mut run, &s, &caller, &|_| reload(&cfg, repo, base, head))?;
     for e in &mut run.escalations {
         e.seen = true;
     }
     save(paths, &run, &cfg)?;
-    // One round, forced, says nothing about how many reviews take.
+    // Forced through with nobody in the loop, it says nothing about how many
+    // rounds reviews take.
     keep::finished(paths, &run, false)?;
     Ok(run)
 }
@@ -1087,8 +1174,15 @@ fn lens_criteria(paths: &Paths, tree: &Path, key: &trial::Key) -> Vec<(String, S
     }
 }
 
-/// The separate-roles design on a trial's worktree.
-fn separated(paths: &Paths, tree: &Path, key: &trial::Key) -> Result<trial::Ran> {
+/// The pipeline's designs on a trial's worktree: one round, or to
+/// convergence.
+fn pipeline_arm(
+    paths: &Paths,
+    tree: &Path,
+    key: &trial::Key,
+    arm: trial::Arm,
+) -> Result<trial::Ran> {
+    let converge = arm == trial::Arm::Converge;
     let target = Target {
         repo: tree.to_path_buf(),
         base: key.base.clone(),
@@ -1097,7 +1191,11 @@ fn separated(paths: &Paths, tree: &Path, key: &trial::Key) -> Result<trial::Ran>
         human_gate: None,
         max_rounds: None,
         review_scope: None,
-        bindings: Vec::new(),
+        bindings: if converge {
+            vec![(Role::Orchestrator, STEELMAN_BINDING.to_string())]
+        } else {
+            Vec::new()
+        },
         description: None,
         pr: None,
     };
@@ -1121,7 +1219,7 @@ fn separated(paths: &Paths, tree: &Path, key: &trial::Key) -> Result<trial::Ran>
     }
     // The key's context, frozen before any review, stands in for the pull
     // request's description, which may have changed since.
-    let run = one_round(paths, &target, Some(key.context.clone()))?;
+    let run = pipeline_run(paths, &target, Some(key.context.clone()), converge)?;
     drop(allowed);
     let mut found = Vec::new();
     let mut failures: Vec<String> = run.escalations.iter().map(|e| e.reason.clone()).collect();
@@ -1140,12 +1238,14 @@ fn separated(paths: &Paths, tree: &Path, key: &trial::Key) -> Result<trial::Ran>
                     detail: f.detail.clone(),
                     file: f.file.clone().unwrap_or_default(),
                     blocker: f.blocks(),
+                    round: round.round,
                 });
             }
         }
     }
     let mut counts = trial::Counts::default();
     let mut models = Vec::new();
+    let mut by_round: Vec<u64> = Vec::new();
     for u in &run.usage {
         counts.input += u.tokens_in;
         counts.cache_read += u.cache_read;
@@ -1156,13 +1256,34 @@ fn separated(paths: &Paths, tree: &Path, key: &trial::Key) -> Result<trial::Ran>
         {
             models.push(m.clone());
         }
+        let at = u.round.max(1) as usize - 1;
+        if by_round.len() <= at {
+            by_round.resize(at + 1, 0);
+        }
+        by_round[at] += u.tokens();
     }
     counts.total = counts.input + counts.output + counts.cache_read + counts.cache_write;
+    let converged = if converge {
+        // What the steelmans left, as a patch on the key's head.
+        change::git(tree, &["add", "--all"])?;
+        let patch = change::git(tree, &["diff", "--cached", "--binary", &key.head])?;
+        let summary = trial::Converged {
+            rounds: run.round,
+            converged: run.status == flow::Status::Confirmed,
+            run: run.id.clone(),
+            patch: None,
+            tokens_by_round: by_round,
+        };
+        Some((summary, patch))
+    } else {
+        None
+    };
     Ok(trial::Ran {
         findings: found,
         tokens: counts,
         models,
         failures,
+        converged,
     })
 }
 
