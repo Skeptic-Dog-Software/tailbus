@@ -2,6 +2,7 @@
 //! decided non-issues always come from the base, never the change, so a
 //! change can't switch off its own review.
 
+use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -171,6 +172,77 @@ pub fn fingerprint(repo: &Path) -> Result<String> {
         hash.update(git(repo, args)?.as_bytes());
     }
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A reviewer's own copy of the checkout at `to`, as it is now, changes and
+/// untracked files too, to run and break things in. Its repository is its
+/// own: it reads the checkout's history through git's alternates, and has
+/// its own index and refs, so nothing done in it reaches the checkout. That
+/// holds for a linked worktree too, whose `.git` a plain copy would share.
+pub fn copy_of(repo: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    let entries: Vec<_> = fs::read_dir(repo)
+        .with_context(|| format!("reading {}", repo.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name() != ".git")
+        .map(|e| e.path())
+        .collect();
+    if !entries.is_empty() {
+        // A clone of each file where the file system can make one, which
+        // costs next to nothing; a plain copy where it can't.
+        let clone: &[&str] = if cfg!(target_os = "macos") {
+            &["-c", "-pR"]
+        } else {
+            &["-a", "--reflink=auto"]
+        };
+        let copied = |flags: &[&str]| {
+            Command::new("cp")
+                .args(flags)
+                .args(&entries)
+                .arg(to)
+                .stdin(Stdio::null())
+                .output()
+        };
+        let mut out = copied(clone).context("running cp")?;
+        if !out.status.success() && cfg!(target_os = "macos") {
+            out = copied(&["-pR"]).context("running cp")?;
+        }
+        if !out.status.success() {
+            bail!(
+                "copying {} to {}: {}",
+                repo.display(),
+                to.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = Path::new(common.trim());
+    let head = git(repo, &["rev-parse", "HEAD"])?;
+    git(to, &["init", "--quiet"])?;
+    let objects = to.join(".git/objects/info");
+    fs::create_dir_all(&objects)?;
+    fs::write(
+        objects.join("alternates"),
+        format!("{}\n", common.join("objects").display()),
+    )?;
+    if common.join("shallow").is_file() {
+        fs::copy(common.join("shallow"), to.join(".git/shallow"))?;
+    }
+    git(to, &["update-ref", "--no-deref", "HEAD", head.trim()])?;
+    git(to, &["read-tree", "HEAD"])?;
+    // Fills in what the index knows of each file, so its first status is
+    // quick. It exits 1 when files differ from HEAD, which they may.
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(to)
+        .args(["update-index", "-q", "--refresh"])
+        .stdin(Stdio::null())
+        .output();
+    Ok(())
 }
 
 /// Reviewers read the checkout itself, so a commit under review must be the
@@ -385,6 +457,51 @@ pub mod tests {
     use crate::util::new_id;
 
     /// A git repository with one commit of `files` on `main`.
+    #[test]
+    fn a_reviewers_copy_is_the_checkout_as_it_is_and_reaches_nothing_back() {
+        let repo = repo_with(&[("a.txt", "one\n"), ("dir/b.txt", "b\n")]);
+        let base = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        commit(&repo, &[("a.txt", "two\n")], "the change");
+        let head = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        // A fix on top, not committed, and a new file.
+        fs::write(repo.join("a.txt"), "three\n").unwrap();
+        fs::write(repo.join("new.txt"), "new\n").unwrap();
+        let before = fingerprint(&repo).unwrap();
+        let to = std::env::temp_dir()
+            .join(format!("tb-acr-copy-{}", new_id()))
+            .join("repo");
+        copy_of(&repo, &to).unwrap();
+        assert_eq!(git(&to, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(fs::read_to_string(to.join("a.txt")).unwrap(), "three\n");
+        assert_eq!(fs::read_to_string(to.join("dir/b.txt")).unwrap(), "b\n");
+        assert!(to.join("new.txt").is_file());
+        // Its history is there, through the checkout's objects.
+        let range = format!("{}..HEAD", base.trim());
+        let diff = git(&to, &["diff", "--stat", &range]).unwrap();
+        assert!(diff.contains("a.txt"), "{diff}");
+        assert!(git(&to, &["diff", "HEAD"]).unwrap().contains("+three"));
+        // What's done in it stays in it.
+        fs::write(to.join("a.txt"), "broken\n").unwrap();
+        git(&to, &["add", "--all"]).unwrap();
+        git(
+            &to,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "mutation",
+            ],
+        )
+        .unwrap();
+        assert_eq!(fingerprint(&repo).unwrap(), before);
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "three\n");
+        let _ = fs::remove_dir_all(to.parent().unwrap());
+    }
+
     pub fn repo_with(files: &[(&str, &str)]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tb-acr-{}", new_id()));
         fs::create_dir_all(&dir).unwrap();

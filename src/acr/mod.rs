@@ -583,6 +583,34 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
     })
 }
 
+/// Where reviewers that can change files get their copies of the checkout.
+fn copies_root(paths: &Paths) -> PathBuf {
+    paths.state.join("acr-copies")
+}
+
+/// The bridges that reviewers who can change files go through: each must
+/// let them work in the copies.
+fn copy_bridges(cfg: &Config) -> Result<Vec<String>> {
+    let mut bridges = Vec::new();
+    for lens in &cfg.lenses {
+        let b = cfg.binding(Role::Reviewer, Some(lens))?;
+        let bridge = b.agent.split('@').next().unwrap_or(&b.agent).to_string();
+        if b.changes_files() && !bridges.contains(&bridge) {
+            bridges.push(bridge);
+        }
+    }
+    Ok(bridges)
+}
+
+/// Lets those bridges work in the copies, which needs a bridge restart only
+/// the first time.
+fn allow_copies(paths: &Paths, cfg: &Config) -> Result<()> {
+    for bridge in copy_bridges(cfg)? {
+        crate::setup::acr_dir(paths, &copies_root(paths), &bridge)?;
+    }
+    Ok(())
+}
+
 /// What a run holds to, kept with it: its non-issues are read once, at the
 /// start, so resuming can't pick up a list that's changed since.
 fn setting<'a>(
@@ -607,6 +635,7 @@ fn setting<'a>(
         work_dir: dir,
         description: None,
         converge: false,
+        copies: Some(copies_root(paths)),
     })
 }
 
@@ -804,6 +833,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             cfg.check_bindings()?;
             cfg.check_local(&this_machine(paths)?)?;
             change::checked_out(&target.repo, target.head.as_deref())?;
+            allow_copies(paths, &cfg)?;
             let description = description_of(&target, post_pr)?;
             let id = new_id();
             let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
@@ -954,15 +984,22 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         .collect();
     names.sort();
     names.dedup();
+    // A reviewer that can change files works in a copy of its own, which
+    // its bridge must let it into, so it's checked there.
+    let reviewers: Vec<&str> = cfg
+        .lenses
+        .iter()
+        .filter_map(|l| cfg.binding_name(Role::Reviewer, Some(l)).ok())
+        .collect();
+    let in_copy = |name: &str, b: &config::Binding| b.changes_files() && reviewers.contains(&name);
     let mut chosen: Vec<(&String, &config::Binding)> = Vec::new();
     for name in names {
         let Some(b) = cfg.allowed_bindings.get(name) else {
             continue;
         };
-        if !chosen
-            .iter()
-            .any(|(_, c)| c.agent == b.agent && c.tools == b.tools)
-        {
+        if !chosen.iter().any(|(n, c)| {
+            c.agent == b.agent && c.tools == b.tools && in_copy(n, c) == in_copy(name, b)
+        }) {
             chosen.push((name, b));
         }
     }
@@ -978,6 +1015,8 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             allowed.bridges.push(bridge);
         }
     }
+    allow_copies(paths, &cfg)?;
+    let copies = copies_root(paths).join(format!("check-{}", new_id()));
     let caller = BridgeCaller::new(paths)?;
     for (name, b) in chosen {
         // Without a list, it gets whatever its bridge gives, a shell maybe.
@@ -989,7 +1028,15 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             timeout: Some(trial::CHECK_SECS),
             ..b.clone()
         };
-        let prompt = trial::check_prompt(&s.tree, &canary.path, bash, None);
+        let in_copy = in_copy(name, b);
+        let tree = if in_copy {
+            let copy = copies.join(s.tree.file_name().unwrap_or_default());
+            change::copy_of(&s.tree, &copy)?;
+            copy
+        } else {
+            s.tree.clone()
+        };
+        let prompt = trial::check_prompt(&tree, &canary.path, bash, None);
         let started = std::time::Instant::now();
         let answer = caller.call(&Call {
             role: Role::Reviewer,
@@ -998,11 +1045,21 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
             prompt: &prompt,
             artifact: None,
             writes: false,
-            repo: &s.tree,
+            repo: &tree,
         });
         let wrong = answer.map(|a| trial::check_answer(&a.text, &key.head, &canary.secret, bash));
-        report(&format!("{name} through {}", b.agent), started, wrong);
+        let place = if in_copy {
+            ", in a copy of its own"
+        } else {
+            ""
+        };
+        report(
+            &format!("{name} through {}{place}", b.agent),
+            started,
+            wrong,
+        );
     }
+    let _ = fs::remove_dir_all(&copies);
     // A review to convergence's steelman, which writes in the copy.
     if let Some(b) = cfg.allowed_bindings.get(STEELMAN_BINDING) {
         let bridge = b.agent.split('@').next().unwrap_or(&b.agent).to_string();
@@ -1088,6 +1145,7 @@ fn pipeline_run(
         }
     }
     change::checked_out(&target.repo, target.head.as_deref())?;
+    allow_copies(paths, &cfg)?;
     let id = new_id();
     let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
     let mut s = setting(paths, &cfg, &id, Some(list))?;

@@ -1053,6 +1053,27 @@ pub fn acr_repo(paths: &Paths, repo: &Path, allow: bool, agent: &str) -> Result<
     Ok(())
 }
 
+/// Lets ACR's `agent` work in `dir` and anything under it, as it does in a
+/// repository it may review: where reviewers that can change files get
+/// their copies. Restarts the bridge only if that's new. Returns whether it
+/// was.
+pub fn acr_dir(paths: &Paths, dir: &Path, agent: &str) -> Result<bool> {
+    fs::create_dir_all(dir)?;
+    let shown = dir.canonicalize()?.to_string_lossy().into_owned();
+    let mut doc = read_config(paths)?;
+    let workdirs = acr_workdirs(&mut doc, agent)?;
+    if workdirs.iter().any(|v| v.as_str() == Some(&shown)) {
+        return Ok(false);
+    }
+    workdirs.push(shown.as_str());
+    write_config(paths, &doc)?;
+    if bridge_job(paths, agent).is_some() {
+        bridge_install(paths, agent, false)?;
+    }
+    println!("ACR's reviewers may now work in copies under {shown}, through {agent}.");
+    Ok(true)
+}
+
 /// Sets up ACR on this machine: a token for headless Claude Code, the
 /// bridge it runs through, ACR's bindings, and the bridge's service. Each
 /// part is left alone if it's there already, so running it again is safe.

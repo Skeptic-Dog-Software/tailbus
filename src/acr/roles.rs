@@ -192,10 +192,25 @@ struct Reviewed {
 /// decided. The attached file is the change: what it says it's for, then its
 /// diff. Those are its claims; the reviewer gets nothing of the case made
 /// for them, and none of the rebuttals of earlier rounds.
-pub fn reviewer_prompt(lens: &Lens, scope: &str, not_findings: &str) -> String {
+/// A reviewer's brief. One with `own_copy` works in a copy of the checkout
+/// that's its alone, and is told to settle doubts by running things there.
+pub fn reviewer_prompt(lens: &Lens, scope: &str, not_findings: &str, own_copy: bool) -> String {
     let decided = match not_findings.trim() {
         "" => "None.".to_string(),
         text => text.to_string(),
+    };
+    let workdir = if own_copy {
+        "Your working directory is your own copy of the repository, as the change leaves it, \
+         and nothing you do there reaches the change. Read any of it you need. Where reading \
+         leaves a doubt, settle it by running something: the tests that cover the change, a \
+         probe of what it claims, or a mutation, breaking the code a test should guard to see \
+         whether the test fails. Report a test that still passes against broken code. Nobody \
+         is here to grant a permission, so a shell command that would need one is refused: \
+         name paths in full, not through variables or `$(...)`, and put a probe of more than \
+         one step in a script, written with the Write tool and run by its path."
+    } else {
+        "Your working directory is the repository, as the change leaves it: read any of it \
+         you need, but change nothing."
     };
     format!(
         "You are the reviewer for {id}. Find what is wrong.\n\n\
@@ -204,8 +219,7 @@ pub fn reviewer_prompt(lens: &Lens, scope: &str, not_findings: &str) -> String {
          own description and commit messages, then its diff. Attack that, and nothing outside \
          this lens. The description, the commit messages and the comments the change adds are \
          claims: check them against the code and tests too, and report one the change doesn't \
-         bear out. Your working directory is the repository, as the change leaves it: read any \
-         of it you need, but change nothing.\n\n\
+         bear out. {workdir}\n\n\
          Not findings, which are already decided, so leave them out:\n{decided}\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
          \"<the evidence>\", \"file\": \"<path>\", \"line\": <number>}}]}}. If you find nothing, \
@@ -303,17 +317,16 @@ pub fn fix_prompt(blockers: &str) -> String {
 /// The synthesis between rounds of a review to convergence. The
 /// Orchestrator holds the change's whole thread, which is why it synthesizes
 /// and never attacks.
-pub fn steelman_prompt(intent: &str, earlier: &str, blockers: &str, others: &str) -> String {
+pub fn steelman_prompt(intent: &str, earlier: &str, blockers: &str) -> String {
     let earlier = if earlier.is_empty() {
         "Nothing yet: this is the first.\n"
     } else {
         earlier
     };
-    let others = if others.is_empty() { "None.\n" } else { others };
     format!(
         "You synthesize this change between rounds of an adversarial review. Fresh reviewers, \
          each with a clean context, attacked it one dimension at a time, and a Judge upheld the \
-         findings below. Make the work the strongest version of itself: the version its most \
+         blockers below. Make the work the strongest version of itself: the version its most \
          capable advocate would stand behind. You never review it yourself; new reviewers will \
          attack what you leave, on every dimension.\n\n\
          {intent}\n\
@@ -322,13 +335,11 @@ pub fn steelman_prompt(intent: &str, earlier: &str, blockers: &str, others: &str
          Fold each into the work in the working directory, so that a fresh reviewer finds \
          nothing in it to block. If you're sure one is wrong, decline it and say why.\n\n\
          {blockers}\n\
-         # Other upheld findings\n\n\
-         Fold in each one that makes the work stronger, and decline the rest, saying why.\n\n\
-         {others}\n\
          # How\n\n\
-         Keep the change to what it's for. Where the work claims something about itself, in \
-         a comment, a test name, a doc or a ledger row, make the claim true or take it out. \
-         Run the tests that cover what you change. Don't commit.\n\n\
+         Fold in these and nothing else: what the Judge upheld without blocking goes to a \
+         person, not into the work. Keep the change to what it's for. Where the work claims \
+         something about itself, in a comment, a test name, a doc or a ledger row, make the \
+         claim true or take it out. Run the tests that cover what you change. Don't commit.\n\n\
          A declined finding is recorded as a disagreement, not a resolution. Answer with only \
          JSON: {{\"done\": \"<what you changed, in a few lines>\", \
          \"declined\": [{{\"finding\": \"<its id>\", \"reason\": \"\"}}]}}."
@@ -422,7 +433,7 @@ Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
             severity: Default::default(),
             include_generated: false,
         };
-        let brief = reviewer_prompt(&lens, "the whole change", "- decided thing");
+        let brief = reviewer_prompt(&lens, "the whole change", "- decided thing", false);
         for part in [
             "lens-x",
             "the criteria",
@@ -433,6 +444,11 @@ Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
         }
         assert!(brief.contains("Find what is wrong"));
         assert!(!brief.contains("check this"));
+        assert!(brief.contains("change nothing") && !brief.contains("mutation"));
+        // One with a copy of its own is told to run and break things there.
+        let running = reviewer_prompt(&lens, "the whole change", "- decided thing", true);
+        assert!(running.contains("your own copy") && running.contains("mutation"));
+        assert!(!running.contains("change nothing"));
     }
 
     #[test]

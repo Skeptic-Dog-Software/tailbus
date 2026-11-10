@@ -377,6 +377,20 @@ pub struct Binding {
     pub subscription: bool,
 }
 
+/// The tools that can change files: a shell, and the writing ones.
+const CHANGING_TOOLS: [&str; 3] = ["Bash", "Write", "Edit"];
+
+impl Binding {
+    /// Whether it names a tool that can change files. A reviewer that has
+    /// one works in a copy of its own, to run and break things in, and never
+    /// in the checkout.
+    pub fn changes_files(&self) -> bool {
+        self.tools
+            .as_ref()
+            .is_some_and(|t| t.iter().any(|t| CHANGING_TOOLS.contains(&t.as_str())))
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserConfig {

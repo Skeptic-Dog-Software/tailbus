@@ -561,7 +561,7 @@ confirmed when its latest round has no blockers. The method is in
 | --- | --- | --- |
 | Sizer | Classifies the change and picks the tier | A small, fast model: one quick call |
 | Orchestrator | Settles plain-language triggers, and fixes blockers | A strong model: few calls, and it writes |
-| Reviewer | Attacks one lens, in a fresh session with read-only tools | A mid-size model thinking hard: most of the calls |
+| Reviewer | Attacks one lens, in a fresh session. With read-only tools it reads the checkout; with a shell or a writing tool it gets a copy of its own, to run tests, probes and mutations in | A mid-size model thinking hard: most of the calls |
 | Judge | Checks findings against the code, rates them, and merges a lens's reviewers into one result. It repairs nothing, but may write and run a script, in its own scratch space, to test a claim | A strong model: it decides what blocks |
 
 tailbus names no model or provider. Each role's binding comes from
@@ -594,9 +594,13 @@ nothing else set up for it.
 **To convergence.** `tailbus acr trial <key> --arm converge` runs the
 pipeline as the essay ACR comes from prescribes, with nobody in the loop.
 Fresh reviewers attack. The Orchestrator then steelmans the change: it folds
-in every finding the Judge upheld, and any it declines is recorded, with its
-reason, as a disagreement. Every lens then attacks the new version, and this
-repeats until one round has no blocker in any lens. The Orchestrator here is
+in the blockers the Judge upheld, and any it declines is recorded, with its
+reason, as a disagreement. What the Judge upheld without blocking is
+reported, not folded in, so the change doesn't grow past what it's for.
+Every lens then attacks the new version, and this repeats until one round
+has no blocker in any lens. Each round's version is checked again for the
+lenses it needs, without what was ruled out before: one a fix's code now
+triggers joins, and records when and why, and one that has run stays on. The Orchestrator here is
 the `steelman` binding, which needs `writes: true`. A review stops at 20
 rounds, a cap none should reach. The result gives the rounds, the tokens each
 took, and a patch of what the steelmans left, kept for 30 days in
@@ -734,8 +738,13 @@ where the session might act on them.
 one: every binding it uses must reach an agent on the machine with the code,
 or it refuses to start, and a bridge refuses a review from another machine.
 Other machines can still ask a bridge anything else. Every call runs in the repository, so reviewers read
-the code itself, with their read-only tools, and nothing is copied. The
-bridge must list the repository in `options.workdirs`. Reviewers read the
+the code itself. A reviewer whose binding names `Bash`, `Write` or `Edit` is
+the exception: it works in its own copy of the checkout, made for its round
+and removed after it, under `acr-copies/` in tailbus's state folder. A copy
+has its own git repository, reading the checkout's history through git's
+alternates, so nothing done in it reaches the checkout. The
+bridge must list the repository in `options.workdirs`, and ACR adds the
+copies' folder there the first time a reviewer needs one. Reviewers read the
 checkout, so a review of a commit (`--head`) needs that commit checked out
 with nothing changed on top; without `--head`, it's the working tree. Only a
 binding with `writes: true` may apply an Orchestrator's fixes, and after a

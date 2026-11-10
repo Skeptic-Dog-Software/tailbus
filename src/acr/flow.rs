@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::RunUsage;
@@ -144,6 +144,10 @@ pub struct LensResult {
     /// What the Orchestrator did about its blockers.
     pub done: Vec<String>,
     pub outcome: Outcome,
+    /// For a lens a later round's version of the change brought in: when,
+    /// and what of it did.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub joined: String,
 }
 
 impl LensResult {
@@ -257,7 +261,6 @@ pub struct Steelman {
     /// The round whose findings it folded in.
     pub round: u32,
     pub blockers: Vec<String>,
-    pub others: Vec<String>,
     pub done: String,
     pub declined: Vec<roles::Declined>,
 }
@@ -274,12 +277,15 @@ pub struct Setting<'a> {
     pub description: Option<String>,
     /// Review to convergence, as the essay ACR comes from prescribes: build,
     /// attack, steelman, attack again, until the attackers agree. After each
-    /// round with a blocker, the Orchestrator folds in every finding the
-    /// Judge upheld, not only the blockers, and then every lens is attacked
-    /// again by fresh reviewers, since a fix for one can break another. It
-    /// ends when one round, on one version of the change, has no blocker in
-    /// any lens.
+    /// round with a blocker, the Orchestrator folds in the blockers the Judge
+    /// upheld, and then every lens is attacked again by fresh reviewers,
+    /// since a fix for one can break another. It ends when one round, on one
+    /// version of the change, has no blocker in any lens.
     pub converge: bool,
+    /// Where a reviewer whose binding can change files gets a copy of the
+    /// checkout of its own, for the round. Without it, every reviewer works
+    /// in the checkout.
+    pub copies: Option<PathBuf>,
 }
 
 /// A person's answer at a gate.
@@ -496,7 +502,16 @@ fn choose_lenses(
         .iter()
         .find(|t| t.id == run.tier)
         .ok_or_else(|| anyhow!("no tier {}", run.tier))?;
-    let candidates = plan::select(cfg, tier, change)?;
+    // Asked again each round, of the change as it is then, since fixes can
+    // take it where a lens it didn't need at first applies. It's judged
+    // afresh, without what was ruled out before, which may no longer hold.
+    // A lens that has run stays on, so the version it ends at is one every
+    // lens that attacked agrees on.
+    let later = run.round > 1;
+    let candidates: Vec<(&Lens, Why)> = plan::select(cfg, tier, change)?
+        .into_iter()
+        .filter(|(lens, _)| !run.lenses.contains_key(&lens.id))
+        .collect();
     let described: Vec<(&str, &str)> = candidates
         .iter()
         .filter_map(|(lens, why)| match why {
@@ -504,9 +519,11 @@ fn choose_lenses(
             _ => None,
         })
         .collect();
+    // What always escalates is asked once, at the start.
+    let escalating: &[String] = if later { &[] } else { &cfg.always_escalate };
     let mut wanted: Option<Vec<String>> = None;
-    if !described.is_empty() || !cfg.always_escalate.is_empty() {
-        let prompt = roles::orchestrator_prompt(&described, &cfg.always_escalate);
+    if !described.is_empty() || !escalating.is_empty() {
+        let prompt = roles::orchestrator_prompt(&described, escalating);
         let answer = ask(run, s, caller, Role::Orchestrator, &prompt, Some(artifact))
             .and_then(|text| roles::read_selected(&text));
         match answer {
@@ -529,6 +546,16 @@ fn choose_lenses(
         if described && wanted.as_ref().is_some_and(|w| !w.contains(&lens.id)) {
             continue;
         }
+        let joined = if later {
+            let what = match &why {
+                Why::Matched(what) => format!("its {what} matched"),
+                Why::Required => "its tier requires it".to_string(),
+                Why::Description(_) => "the Orchestrator chose it from its description".to_string(),
+            };
+            format!("round {}: {what}", run.round)
+        } else {
+            String::new()
+        };
         run.lenses.insert(
             lens.id.clone(),
             LensResult {
@@ -537,6 +564,7 @@ fn choose_lenses(
                 rounds: Vec::new(),
                 done: Vec::new(),
                 outcome: Outcome::Open,
+                joined,
             },
         );
     }
@@ -614,20 +642,42 @@ fn attack(
         .values()
         .filter(|l| l.outcome == Outcome::Open)
         .collect();
+    // Copies for this round, gone when it ends, however it ends.
+    let copies = Copies(
+        s.copies
+            .as_ref()
+            .map(|root| root.join(format!("{}-r{}", run.id, run.round))),
+    );
+    if let Some(root) = &s.copies {
+        prune_copies(root);
+    }
+    let name = run
+        .repo
+        .file_name()
+        .map_or_else(|| "repo".into(), |n| n.to_owned());
     let mut briefs = Vec::new();
     for result in open {
         let lens = lens_of(cfg, &result.id)?;
-        let prompt = roles::reviewer_prompt(lens, &scope, &s.not_findings);
-        for _ in 0..run.fan_out {
-            briefs.push((lens, prompt.clone()));
+        let binding = cfg.binding(Role::Reviewer, Some(lens))?;
+        let own = binding.changes_files() && copies.0.is_some();
+        let prompt = roles::reviewer_prompt(lens, &scope, &s.not_findings, own);
+        for n in 1..=run.fan_out {
+            let repo = match &copies.0 {
+                Some(dir) if own => {
+                    let copy = dir.join(format!("{}-{n}", lens.id)).join(&name);
+                    super::change::copy_of(&run.repo, &copy)
+                        .with_context(|| format!("making {}'s reviewer a copy", lens.id))?;
+                    copy
+                }
+                _ => run.repo.clone(),
+            };
+            briefs.push((lens, prompt.clone(), repo));
         }
     }
-    let repo = run.repo.clone();
-    let repo = repo.as_path();
     let answers: Vec<_> = thread::scope(|scope| {
         let handles: Vec<_> = briefs
             .iter()
-            .map(|(lens, prompt)| {
+            .map(|(lens, prompt, repo)| {
                 scope.spawn(move || -> Result<(Usage, Vec<Raw>)> {
                     let artifact = artifacts.for_lens(lens);
                     let name = cfg.binding_name(Role::Reviewer, Some(lens))?;
@@ -639,7 +689,7 @@ fn attack(
                         prompt,
                         artifact: Some(artifact),
                         writes: false,
-                        repo,
+                        repo: repo.as_path(),
                     };
                     let answer = caller.call(&call)?;
                     let usage = usage(cfg, &call, input_bytes(prompt, Some(artifact)), &answer);
@@ -655,8 +705,9 @@ fn attack(
             })
             .collect()
     });
+    drop(copies);
     let mut by_lens: BTreeMap<String, Vec<Result<Vec<Raw>>>> = BTreeMap::new();
-    for ((lens, _), answer) in briefs.iter().zip(answers) {
+    for ((lens, _, _), answer) in briefs.iter().zip(answers) {
         let result = answer.map(|(mut usage, findings)| {
             usage.round = run.round;
             run.usage.push(usage);
@@ -665,6 +716,40 @@ fn attack(
         by_lens.entry(lens.id.clone()).or_default().push(result);
     }
     Ok(by_lens)
+}
+
+/// A round's reviewer copies, removed when it's dropped.
+struct Copies(Option<PathBuf>);
+
+impl Drop for Copies {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// How long a reviewer's copy may outlive its round: only one whose review
+/// was killed is left past it.
+const COPY_HOURS: u64 = 24;
+
+/// Removes the copies of killed reviews.
+fn prune_copies(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let limit = std::time::Duration::from_secs(COPY_HOURS * 3600);
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > limit);
+        if old {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Turns a Judge's ratings into a lens's findings for this round.
@@ -716,6 +801,9 @@ fn rate(run: &mut Run, cfg: &Config, lens: &Lens, ratings: Vec<roles::Rating>) -
 fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller) -> Result<()> {
     let cfg = s.cfg;
     let artifacts = write_artifact(s, change, run.round)?;
+    if run.round > 1 {
+        choose_lenses(run, s, change, caller, &artifacts.diff)?;
+    }
     // Only an Orchestrator may change the checkout.
     let before = caller.fingerprint(&run.repo);
     let reviews = attack(run, s, caller, &artifacts)?;
@@ -856,13 +944,9 @@ fn fix(
             })
             .collect()
     };
+    // Only blockers: what's upheld without blocking goes to a person, since
+    // folding it in grows the change, and gives the next round more to attack.
     let folded = latest(FindingState::Folded);
-    // Upheld, but not blocking.
-    let others = if run.converge {
-        latest(FindingState::Logged)
-    } else {
-        Vec::new()
-    };
     let list = |findings: &[(String, Finding)]| -> String {
         findings
             .iter()
@@ -881,7 +965,7 @@ fn fix(
             .iter()
             .map(|m| format!("- After round {}: {}\n", m.round, m.done))
             .collect();
-        roles::steelman_prompt(&intent, &earlier, &list(&folded), &list(&others))
+        roles::steelman_prompt(&intent, &earlier, &list(&folded))
     } else {
         roles::fix_prompt(&list(&folded))
     };
@@ -913,7 +997,6 @@ fn fix(
                 let lens_of = |finding: &str| {
                     folded
                         .iter()
-                        .chain(&others)
                         .find(|(_, f)| f.id == finding)
                         .map(|(lens, _)| lens.clone())
                 };
@@ -930,7 +1013,6 @@ fn fix(
                 run.steelmans.push(Steelman {
                     round: run.round,
                     blockers: folded.iter().map(|(_, f)| f.id.clone()).collect(),
-                    others: others.iter().map(|(_, f)| f.id.clone()).collect(),
                     done: fixed.done.clone(),
                     declined: fixed.declined.clone(),
                 });
@@ -1229,6 +1311,8 @@ lenses:
         with_diff: Mutex<Vec<Role>>,
         /// What each of them got in it.
         sent: Mutex<Vec<(Role, String)>>,
+        /// Where each call worked, and whether the change's file was there.
+        repos: Mutex<Vec<(Role, PathBuf, bool)>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -1241,6 +1325,7 @@ lenses:
                 changes: Default::default(),
                 with_diff: Mutex::new(Vec::new()),
                 sent: Mutex::new(Vec::new()),
+                repos: Mutex::new(Vec::new()),
             }
         }
 
@@ -1263,6 +1348,11 @@ lenses:
                 let text = fs::read_to_string(path).unwrap_or_default();
                 self.sent.lock().unwrap().push((call.role, text));
             }
+            self.repos.lock().unwrap().push((
+                call.role,
+                call.repo.to_path_buf(),
+                call.repo.join("a.src").is_file(),
+            ));
             if self.tamper == Some(call.role) {
                 self.changes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1352,6 +1442,7 @@ lenses:
             work_dir: std::env::temp_dir().join(format!("tb-acr-run-{}", new_id())),
             description: None,
             converge: false,
+            copies: None,
         }
     }
 
@@ -1636,7 +1727,94 @@ lenses:
     }
 
     #[test]
-    fn a_steelman_folds_what_was_upheld_and_its_declines_are_disagreements() {
+    fn a_reviewer_that_can_change_files_works_in_a_copy_of_its_own() {
+        use super::super::change::tests::repo_with;
+        let mut cfg = plain("exception", 1, 1);
+        let name = cfg.bindings[&Role::Reviewer].clone();
+        cfg.allowed_bindings.get_mut(&name).unwrap().tools =
+            Some(vec!["Read".into(), "Bash".into()]);
+        let repo = repo_with(&[("a.src", "let x = 1;\n")]);
+        let root = std::env::temp_dir().join(format!("tb-acr-copies-{}", new_id()));
+        let mut s = setting(&cfg);
+        s.copies = Some(root.clone());
+        let fake = Fake::new(defect_in("alpha", 99));
+        let c = change(&["a.src"]);
+        let mut run = start("r", &repo, "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        let repos = fake.repos.lock().unwrap();
+        let reviewers: Vec<_> = repos.iter().filter(|r| r.0 == Role::Reviewer).collect();
+        assert_eq!(reviewers.len(), 2);
+        for (_, dir, had) in &reviewers {
+            assert!(dir.starts_with(&root), "{}", dir.display());
+            assert!(had, "{} held the change", dir.display());
+        }
+        assert_ne!(reviewers[0].1, reviewers[1].1, "each its own");
+        // Every other role works in the checkout.
+        let checkout = repo.canonicalize().unwrap();
+        assert!(
+            repos
+                .iter()
+                .filter(|r| r.0 != Role::Reviewer)
+                .all(|r| r.1 == checkout)
+        );
+        drop(repos);
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.0 == Role::Reviewer && c.3.contains("your own copy"))
+        );
+        drop(calls);
+        // The round's copies go with it.
+        assert!(!root.join("r-r1").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lens_a_later_version_of_the_change_needs_joins_and_none_leaves() {
+        let extra =
+            r#"  - {id: gamma, criteria: "gamma criteria", triggers: {paths: ["**/*.db"]}}"#;
+        let cfg = config("exception", 20, 1, extra, "");
+        let fixed = Mutex::new(false);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && !*fixed.lock().unwrap() => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                Role::Orchestrator if prompt.contains("You synthesize") => {
+                    *fixed.lock().unwrap() = true;
+                    r#"{"done": "moved it into the store"}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let mut s = setting(&cfg);
+        s.converge = true;
+        let first = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &first, &fake).unwrap();
+        assert!(!run.lenses.contains_key("gamma"));
+        // The steelman's version touches only the store: no lens that ran
+        // matches it now, and gamma does.
+        let moved = change(&["store.db"]);
+        drive(&mut run, &s, &fake, &|fixed| {
+            Ok(if fixed { moved.clone() } else { first.clone() })
+        })
+        .unwrap();
+        assert_eq!(run.status, Status::Confirmed);
+        assert_eq!(run.round, 2);
+        let gamma = &run.lenses["gamma"];
+        assert_eq!(gamma.rounds.len(), 1);
+        assert_eq!(gamma.joined, "round 2: its path store.db matched");
+        for id in ["alpha", "beta"] {
+            assert_eq!(run.lenses[id].rounds.len(), 2, "{id} stays on");
+            assert!(run.lenses[id].joined.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_steelman_folds_only_blockers_and_its_declines_are_disagreements() {
         let cfg = plain("exception", 20, 1);
         let fixed = Mutex::new(false);
         let fake = Fake::new(|role, prompt: &str| {
@@ -1650,7 +1828,7 @@ lenses:
                 Role::Judge => rating("Low"),
                 Role::Orchestrator if prompt.contains("You synthesize") => {
                     *fixed.lock().unwrap() = true;
-                    r#"{"done": "fixed alpha", "declined": [{"finding": "beta-r1-1", "reason": "it's a style call"}]}"#
+                    r#"{"done": "fixed alpha", "declined": [{"finding": "alpha-r1-1", "reason": "it's a style call"}]}"#
                         .to_string()
                 }
                 _ => NOTHING.to_string(),
@@ -1661,27 +1839,25 @@ lenses:
         // beta's Low finding never blocks, so round 2 ends it.
         assert_eq!(run.round, 2);
         assert_eq!(run.steelmans.len(), 1);
-        assert_eq!(run.steelmans[0].others, ["beta-r1-1"]);
+        assert_eq!(run.steelmans[0].blockers, ["alpha-r1-1"]);
         let calls = fake.calls.lock().unwrap();
         let steelman = calls
             .iter()
             .find(|c| c.3.contains("You synthesize"))
             .unwrap();
-        assert!(steelman.3.contains("alpha-r1-1") && steelman.3.contains("beta-r1-1"));
+        // What's upheld without blocking goes to a person, not into the work.
+        assert!(steelman.3.contains("alpha-r1-1") && !steelman.3.contains("beta-r1-1"));
         drop(calls);
         let d = run
             .disagreements
             .iter()
-            .find(|d| d.finding == "beta-r1-1")
+            .find(|d| d.finding == "alpha-r1-1")
             .unwrap();
-        assert_eq!(d.lens, "beta");
+        assert_eq!(d.lens, "alpha");
         assert!(d.sides[1].contains("style call"));
-        // What the last round found is reported, not folded: the change it
-        // ends at is the one every lens attacked.
-        assert_eq!(
-            run.lenses["beta"].rounds[1].findings[0].state,
-            FindingState::Logged
-        );
+        for round in &run.lenses["beta"].rounds {
+            assert_eq!(round.findings[0].state, FindingState::Logged);
+        }
     }
 
     #[test]
