@@ -58,6 +58,11 @@ pub struct Key {
     /// relative path is from the key's own file.
     #[serde(default)]
     pub patch: Option<PathBuf>,
+    /// Whether a builder reviews every dimension, where it may otherwise skip
+    /// one the change can't affect: an audit has to cover what the review it
+    /// audits left out.
+    #[serde(default)]
+    pub every_dimension: bool,
 }
 
 /// A commit, which YAML reads as a number when it's all digits.
@@ -523,6 +528,12 @@ fn claude(paths: &Paths, config: &Path, workdir: &Path, ask: &Ask) -> Result<Str
         .current_dir(workdir)
         .env("CLAUDE_CONFIG_DIR", config)
         .env("CLAUDE_CODE_OAUTH_TOKEN", token.trim())
+        // Its subagents run in the background, and a headless session that
+        // has ended its turn otherwise kills them after a while, mid-review.
+        .env(
+            "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
+            limit.as_millis().to_string(),
+        )
         .env("TMPDIR", &tmp)
         .stdin(Stdio::piped())
         .stdout(fs::File::create(&out)?)
@@ -653,6 +664,11 @@ fn builder_prompt(
         }
         _ => "Size each reviewer as the skill says.",
     };
+    let every = if key.every_dimension {
+        " Review every one of them, skipping none."
+    } else {
+        ""
+    };
     format!(
         "You built this change. It's the range {base}..HEAD in this working directory, where \
          HEAD is {head}.\n\n\
@@ -660,9 +676,14 @@ fn builder_prompt(
          Your reviewers get the same, ahead of the diff.\n\n\
          Review it with the acr skill: load it with the Skill tool and follow it. The \
          dimensions, each with this repository's criteria for it where it has them, which \
-         set its bar:\n{dimensions}\n\n{sizing}\n\n\
+         set its bar:{every}\n{dimensions}\n\n{sizing}\n\n\
          Run round 1 only: brief the reviewers, run them, and judge what they find. Fix \
-         nothing, and change nothing in this working directory.\n\n\
+         nothing, and change nothing in this working directory. Wait until every reviewer \
+         has reported before you judge, or end.\n\n\
+         Nobody is here to grant a permission, so a shell command that would need one is \
+         refused. Tell your reviewers so: name paths in full, not through variables or \
+         `$(...)`, and put a probe of more than one step in a script, written with the Write \
+         tool in their scratch space and run by its path.\n\n\
          Then write your judged findings as JSON to {result}, in this shape:\n\
          {{\"reviewers\": [{{\"dimension\": \"\", \"model\": \"\", \"effort\": \"\"}}],\n \
          \"findings\": [{{\"dimension\": \"\", \"title\": \"\", \"detail\": \"\", \"file\": \"\", \
@@ -1097,6 +1118,7 @@ mod tests {
             dimensions: vec!["correctness".into()],
             findings: Vec::new(),
             patch: None,
+            every_dimension: false,
         };
         let past = Key {
             base: fixed.clone(),
@@ -1365,6 +1387,7 @@ mod tests {
             dimensions: vec!["correctness".into(), "regression-safety".into()],
             findings: Vec::new(),
             patch: None,
+            every_dimension: false,
         };
         let criteria = [(
             "correctness".to_string(),
@@ -1392,5 +1415,18 @@ mod tests {
         // The same account of the change the pipeline's roles get.
         assert!(sized.contains(&intent.trim_end()[..intent.trim_end().len().min(400)]));
         assert!(sized.contains("Sends a welcome email once.") && sized.contains("Send it once"));
+        assert!(!sized.contains("skipping none"));
+        let every = Key {
+            every_dimension: true,
+            ..key.clone()
+        };
+        let audit = builder_prompt(
+            &every,
+            Arm::Sized,
+            Path::new("/s/result.json"),
+            &[],
+            &intent,
+        );
+        assert!(audit.contains("Review every one of them, skipping none."));
     }
 }
