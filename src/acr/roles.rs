@@ -302,6 +302,12 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          is on task: rate it as you would any other, and say in its reason that it's \
          pre-existing. It's High or above only if the change claims to fix it, or makes it \
          worse.\n\n\
+         Where the lens's criteria say when a finding blocks, a finding that meets that \
+         condition is High at least. A claim the change makes about itself that the code or \
+         tests don't bear out is High when someone relying on it would ship a defect or skip a \
+         test: a test that can't catch what its name, its comments or the change say it \
+         checks; a comment, doc or ledger line that misstates what the code does. It's Low \
+         only when it would mislead no one.\n\n\
          Decided non-issues:\n{not_findings}\n\n\
          Set split when the reviewers disagree about a finding. Set values_call when rejecting it \
          comes down to values, not fact. Give both sides in `sides` when you set either.\n\n\
@@ -387,6 +393,24 @@ mod tests {
     fn finds_json_among_other_words() {
         let text = "Here you go:\n```json\n{\"findings\": []}\n```\nDone.";
         assert!(read_findings(text).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_judge_holds_a_lens_blocking_condition_and_false_claims() {
+        let lens = Lens {
+            id: "mutation".into(),
+            criteria: "It blocks when the tests claim the behaviour is covered.".into(),
+            attack: None,
+            triggers: Default::default(),
+            binding: None,
+            severity: Default::default(),
+            include_generated: false,
+        };
+        let prompt = judge_prompt(&lens, &[Vec::new()], "").unwrap();
+        assert!(prompt.contains("It blocks when the tests claim the behaviour is covered."));
+        assert!(prompt.contains("a finding that meets that condition is High at least"));
+        assert!(prompt.contains("a test that can't catch what its name"));
+        assert!(prompt.contains("pre-existing"));
     }
 
     #[test]
