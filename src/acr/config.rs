@@ -350,7 +350,9 @@ pub struct Binding {
     /// How hard it thinks, such as `high`, if its bridge allows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// The tools a call may use. Roles that only read must name these.
+    /// The tools a call may use. Roles that only read must name these, and
+    /// one that writes should too if its agent refuses any tool it isn't
+    /// named, as some headless agents do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     /// Seconds a call can take.

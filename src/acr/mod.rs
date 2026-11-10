@@ -418,8 +418,11 @@ impl Caller for BridgeCaller {
             );
         }
         let options = RunOptions {
-            // An Orchestrator's fixes use what its bridge gives it.
-            tools: if call.writes { None } else { b.tools.clone() },
+            // The binding's tools, writing ones too: some headless agents
+            // may use only the tools they're named, and refuse a write they
+            // would otherwise have to ask about. Without
+            // a list, an Orchestrator's fixes get what its bridge gives.
+            tools: b.tools.clone(),
             session: Some("fresh".into()),
             timeout: b.timeout,
             // Every role works in the repository, so reviewers read the
