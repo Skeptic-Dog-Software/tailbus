@@ -61,6 +61,12 @@ so running it again is safe:
 review here, and restart the bridge; `--bridge` names a bridge other than
 `claude-acr`, such as one set up by hand.
 
+**Setting up a repository's review.** A repository's review config says what's
+wrong in each lens, how to attack it, and how to work in the repository on
+this machine. [docs/acr-repo-setup.md](docs/acr-repo-setup.md) walks through
+writing one for a repository you don't know yet, and checking it against
+real work.
+
 **Updates wait.** `tailbus service install` and `tailbus bridge install`,
 which an update runs, first wait for bridge runs and ACR reviews under way to
 finish, up to half an hour, so an update never throws a call away. `--now`
