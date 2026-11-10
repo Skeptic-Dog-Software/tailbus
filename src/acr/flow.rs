@@ -668,11 +668,52 @@ fn attack(
         Some(head) => format!("the change from {} to {head}", run.base),
         None => format!("the working tree against {}", run.base),
     };
-    let open: Vec<&LensResult> = run
+    let open: Vec<String> = run
         .lenses
         .values()
         .filter(|l| l.outcome == Outcome::Open)
+        .map(|l| l.id.clone())
         .collect();
+    let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Each open lens's brief for this change, from one call, before any
+    // reviewer starts.
+    let briefs: BTreeMap<String, String> = if cfg.stages.contains(&Kind::Brief) && !open.is_empty()
+    {
+        let lenses: Vec<stages::ToBrief> = open
+            .iter()
+            .map(|id| {
+                lens_of(cfg, id).map(|l| stages::ToBrief {
+                    id: &l.id,
+                    criteria: &l.criteria,
+                    attack: l.attack.as_deref(),
+                })
+            })
+            .collect::<Result<_>>()?;
+        let prompt = stages::briefer_prompt(&scope, &lenses, cfg.runbook.as_deref());
+        match ask(
+            run,
+            s,
+            caller,
+            Role::Orchestrator,
+            &prompt,
+            Some(&artifacts.diff),
+        )
+        .and_then(|text| stages::read_briefs(&text))
+        {
+            Ok(briefs) => briefs,
+            Err(e) => {
+                for id in &open {
+                    notes
+                        .entry(id.clone())
+                        .or_default()
+                        .push(format!("no brief: {e:#}"));
+                }
+                BTreeMap::new()
+            }
+        }
+    } else {
+        BTreeMap::new()
+    };
     // Copies for this round, gone when it ends, however it ends.
     let copies = Copies(
         s.copies
@@ -691,12 +732,18 @@ fn attack(
         .command
         .clone()
         .or_else(|| stages::test_command(&run.repo));
-    let mut briefs: Vec<(&Lens, Brief)> = Vec::new();
-    for result in open {
-        let lens = lens_of(cfg, &result.id)?;
+    let mut asks: Vec<(&Lens, Brief)> = Vec::new();
+    for id in &open {
+        let lens = lens_of(cfg, id)?;
         let binding = cfg.binding(Role::Reviewer, Some(lens))?;
         let own = binding.changes_files() && copies.0.is_some();
         let stage = stages::of_lens(&lens.id, &cfg.stages);
+        // A reviewer that can run things gets the runbook too.
+        let guide = stages::guide(
+            lens.attack.as_deref(),
+            briefs.get(&lens.id).map(String::as_str),
+            cfg.runbook.as_deref().filter(|_| own),
+        );
         // A mutation reviewer only proposes, so one is enough.
         let fan_out = if stage == Some(Kind::Mutation) {
             1
@@ -714,8 +761,8 @@ fn attack(
                 _ => run.repo.clone(),
             };
             let brief = match stage {
-                None | Some(Kind::Context) => Brief::Review {
-                    prompt: roles::reviewer_prompt(lens, &scope, &s.not_findings, own),
+                None | Some(Kind::Context) | Some(Kind::Brief) => Brief::Review {
+                    prompt: roles::reviewer_prompt(lens, &scope, &s.not_findings, own, &guide),
                     repo,
                 },
                 Some(Kind::Claims) => Brief::Review {
@@ -724,6 +771,7 @@ fn attack(
                         &scope,
                         &s.not_findings,
                         own,
+                        &guide,
                     ),
                     repo,
                 },
@@ -732,12 +780,21 @@ fn attack(
                         .into(),
                 ),
                 Some(Kind::Probes) => Brief::Review {
-                    prompt: stages::probes_prompt(&scope, &s.not_findings, command.as_deref()),
+                    prompt: stages::probes_prompt(
+                        &scope,
+                        &s.not_findings,
+                        command.as_deref(),
+                        &guide,
+                    ),
                     repo,
                 },
                 Some(Kind::Mutation) => match (&copies.0, &command) {
                     (Some(dir), Some(command)) => Brief::Mutate {
-                        prompt: stages::mutants_prompt(&scope, cfg.tests.mutants.unwrap_or(12)),
+                        prompt: stages::mutants_prompt(
+                            &scope,
+                            cfg.tests.mutants.unwrap_or(12),
+                            &guide,
+                        ),
                         repo,
                         runs: stages::mutation_dir(dir, &lens.id, n),
                         command: command.clone(),
@@ -750,7 +807,7 @@ fn attack(
                     ),
                 },
             };
-            briefs.push((lens, brief));
+            asks.push((lens, brief));
         }
     }
     let limit = std::time::Duration::from_secs(cfg.tests.timeout.unwrap_or(900));
@@ -759,7 +816,7 @@ fn attack(
     let checkout = checkout.as_path();
     type Done = (Option<Usage>, Vec<Raw>, Option<String>);
     let answers: Vec<Result<Done>> = thread::scope(|scope| {
-        let handles: Vec<_> = briefs
+        let handles: Vec<_> = asks
             .iter()
             .map(|(lens, brief)| {
                 scope.spawn(move || -> Result<Done> {
@@ -811,8 +868,7 @@ fn attack(
     });
     drop(copies);
     let mut by_lens: BTreeMap<String, Vec<Result<Vec<Raw>>>> = BTreeMap::new();
-    let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for ((lens, _), answer) in briefs.iter().zip(answers) {
+    for ((lens, _), answer) in asks.iter().zip(answers) {
         let result = answer.map(|(usage, findings, note)| {
             if let Some(mut usage) = usage {
                 usage.round = run.round;
@@ -1837,6 +1893,55 @@ lenses:
         drop(calls);
         // Each round's tokens are kept apart.
         assert!(run.usage.iter().any(|u| u.round == 3));
+    }
+
+    #[test]
+    fn the_brief_stage_briefs_each_lens_and_only_runners_get_the_runbook() {
+        let top = "stages: [brief]\nrunbook: Run tests with scripts/test.sh.";
+        let extra = r#"  - {id: gamma, criteria: "gamma criteria", attack: "Run it in another time zone.", triggers: {paths: ["**/*.src"]}}"#;
+        let cfg = config("exception", 1, 1, extra, top);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Orchestrator if prompt.contains("You brief the reviewers") => {
+                    assert!(prompt.contains(
+                        "- gamma: gamma criteria\n  How it's attacked: Run it in another time zone."
+                    ));
+                    assert!(prompt.contains("Run tests with scripts/test.sh."));
+                    r#"{"briefs": {"alpha": "Break the lookup in a.src.", "gamma": "Try midnight."}}"#
+                        .to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                _ => NOTHING.to_string(),
+            })
+        });
+        let (run, _) = go(&cfg, &["a.src"], &fake);
+        assert_eq!(run.status, Status::Confirmed);
+        let calls = fake.calls.lock().unwrap();
+        let brief_of = |id: &str| {
+            calls
+                .iter()
+                .find(|c| c.0 == Role::Reviewer && c.3.contains(&format!("reviewer for {id}.")))
+                .map(|c| c.3.clone())
+                .unwrap()
+        };
+        let alpha = brief_of("alpha");
+        assert!(
+            alpha.contains("# Where to attack in this change")
+                && alpha.contains("Break the lookup in a.src.")
+        );
+        let gamma = brief_of("gamma");
+        assert!(gamma.contains("# How to attack in this lens\n\nRun it in another time zone."));
+        assert!(gamma.contains("Try midnight."));
+        // beta had no brief, and these reviewers can't run things, so none
+        // gets the runbook.
+        assert!(!brief_of("beta").contains("# Where to attack"));
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.0 != Role::Reviewer || !c.3.contains("scripts/test.sh"))
+        );
+        drop(calls);
+        assert_eq!(fake.count(Role::Orchestrator), 1, "the brief, once a round");
     }
 
     #[test]

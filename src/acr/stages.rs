@@ -35,7 +35,7 @@ use super::roles::Raw;
 /// The lens a stage runs as, if it runs as one.
 pub fn lens_id(stage: Stage) -> Option<&'static str> {
     match stage {
-        Stage::Context => None,
+        Stage::Brief | Stage::Context => None,
         Stage::Claims => Some("claims"),
         Stage::Mutation => Some("mutation"),
         Stage::Probes => Some("probes"),
@@ -50,7 +50,7 @@ pub fn of_lens(id: &str, on: &[Stage]) -> Option<Stage> {
 /// What wrong means for a stage's lens, which its Judge rates by.
 pub fn criteria(stage: Stage) -> &'static str {
     match stage {
-        Stage::Context => "",
+        Stage::Brief | Stage::Context => "",
         Stage::Claims => {
             "A claim the change makes about itself is false, or the code and tests don't bear \
              it out: a comment, a test's name or header, a doc or ledger line, a commit message \
@@ -68,6 +68,85 @@ pub fn criteria(stage: Stage) -> &'static str {
              failure that a user would meet blocks."
         }
     }
+}
+
+// ------------------------------------------------------------------ brief
+
+/// A lens, as the brief stage is told of it.
+pub struct ToBrief<'a> {
+    pub id: &'a str,
+    pub criteria: &'a str,
+    pub attack: Option<&'a str>,
+}
+
+/// The brief stage's prompt: one call writes every open lens a brief for
+/// this change.
+pub fn briefer_prompt(scope: &str, lenses: &[ToBrief], runbook: Option<&str>) -> String {
+    let list: String = lenses
+        .iter()
+        .map(|l| {
+            let attack = l
+                .attack
+                .map(|a| format!("\n  How it's attacked: {}", a.trim()))
+                .unwrap_or_default();
+            format!("- {}: {}{attack}\n", l.id, l.criteria.trim())
+        })
+        .collect();
+    let runbook = runbook
+        .map(|r| format!("# How to work in this repository\n\n{}\n\n", r.trim()))
+        .unwrap_or_default();
+    format!(
+        "You brief the reviewers of a change, one per lens, before they attack it. You don't \
+         review it yourself, and you have no case to make for it: you didn't write it. Scope: \
+         {scope}. The change is the attached file: what it says it's for, then its diff. Your \
+         working directory is the repository as the change leaves it: read the code the change \
+         touches, what calls it and what it calls, and its tests, enough to know where it could \
+         be wrong. Change nothing.\n\n\
+         For each lens below, write its reviewer a brief for this change. Name the parts of \
+         the change to attack in that lens: functions, branches, data, tests, docs. For each, \
+         say what to settle and how to settle it here: what to run, what to break and see \
+         caught, which scenarios and edges to try, which callers and old tests to check. Ask \
+         questions to settle, not conclusions: the reviewer decides what's wrong. Be specific \
+         to this change, since a reviewer already has its lens's criteria and techniques. A \
+         few sharp lines beat a long list.\n\n\
+         # The lenses\n\n{list}\n\
+         {runbook}\
+         Answer with only JSON: {{\"briefs\": {{\"<lens id>\": \"<the brief>\"}}}}, with a brief \
+         for every lens above."
+    )
+}
+
+#[derive(Deserialize)]
+struct Briefs {
+    briefs: std::collections::BTreeMap<String, String>,
+}
+
+pub fn read_briefs(text: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    Ok(super::roles::json_in::<Briefs>(text)?.briefs)
+}
+
+/// What a reviewer gets besides its lens's criteria: how to attack in the
+/// lens, where to attack in this change, from the brief stage, and, if it
+/// can run things, how to work in this repository.
+pub fn guide(attack: Option<&str>, brief: Option<&str>, runbook: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(a) = attack.filter(|a| !a.trim().is_empty()) {
+        out.push_str(&format!("# How to attack in this lens\n\n{}\n\n", a.trim()));
+    }
+    if let Some(b) = brief.filter(|b| !b.trim().is_empty()) {
+        out.push_str(&format!(
+            "# Where to attack in this change\n\nFrom a brief written for this change by \
+             someone who read it but didn't write it: leads, not findings.\n\n{}\n\n",
+            b.trim()
+        ));
+    }
+    if let Some(r) = runbook.filter(|r| !r.trim().is_empty()) {
+        out.push_str(&format!(
+            "# How to work in this repository\n\n{}\n\n",
+            r.trim()
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------- context
@@ -392,7 +471,13 @@ fn added_lines(diff: &str) -> Vec<(String, u64, String)> {
 }
 
 /// A claims reviewer's brief.
-pub fn claims_prompt(claims: &[Claim], scope: &str, not_findings: &str, own_copy: bool) -> String {
+pub fn claims_prompt(
+    claims: &[Claim],
+    scope: &str,
+    not_findings: &str,
+    own_copy: bool,
+    guide: &str,
+) -> String {
     let list: String = claims
         .iter()
         .enumerate()
@@ -414,6 +499,7 @@ pub fn claims_prompt(claims: &[Claim], scope: &str, not_findings: &str, own_copy
          it adds, a test's name, a commit message, or its description. Check each against the \
          code and the tests. {how}\n\n\
          # The claims\n\n{list}\n\
+         {guide}\
          Report each claim that's false, or that the code and tests don't bear out: what it \
          says, where, and the evidence. A true claim isn't a finding.\n\n\
          Not findings, which are already decided, so leave them out:\n{decided}\n\n\
@@ -435,7 +521,12 @@ fn decided(not_findings: &str) -> String {
 
 /// A prober's brief: it writes scenarios as tests and runs them, in its own
 /// copy.
-pub fn probes_prompt(scope: &str, not_findings: &str, command: Option<&str>) -> String {
+pub fn probes_prompt(
+    scope: &str,
+    not_findings: &str,
+    command: Option<&str>,
+    guide: &str,
+) -> String {
     let command = match command {
         Some(c) => format!(
             "This repository's tests run with `{}`, from its root.",
@@ -452,6 +543,7 @@ pub fn probes_prompt(scope: &str, not_findings: &str, command: Option<&str>) -> 
          after a reopen or a restart; at a boundary, such as midnight, a month's end, the first \
          or last item, or an empty or missing value; and after something it depends on was \
          changed or deleted. Run each. {command}\n\n\
+         {guide}\
          A scenario that fails, or shows wrong behaviour, is a finding: give its test code and \
          what it printed. One that passes isn't. Nobody is here to grant a permission, so a \
          shell command that would need one is refused: name paths in full, not through \
@@ -492,7 +584,7 @@ pub fn read_mutants(text: &str) -> Result<Vec<Mutant>> {
 }
 
 /// A mutation reviewer's brief: propose the breaks; the pipeline runs them.
-pub fn mutants_prompt(scope: &str, count: u32) -> String {
+pub fn mutants_prompt(scope: &str, count: u32, guide: &str) -> String {
     format!(
         "You find where a change's tests are weak, by proposing small breaks in its code that a \
          test should catch. Scope: {scope}. The change is the attached file: what it says it's \
@@ -507,6 +599,7 @@ pub fn mutants_prompt(scope: &str, count: u32) -> String {
          For each: the file; `find`, text copied exactly from that file, long enough to occur \
          only once in it; `replace`, what it becomes; and `why`, the behaviour a test should \
          catch.\n\n\
+         {guide}\
          Answer with only JSON: {{\"mutants\": [{{\"file\": \"<path>\", \"find\": \"\", \
          \"replace\": \"\", \"why\": \"\", \"tests\": [\"<test file>\"]}}]}}."
     )

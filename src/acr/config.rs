@@ -138,7 +138,13 @@ pub struct Triggers {
 pub struct Lens {
     /// Stable, so results can be compared over time.
     pub id: String,
+    /// What's wrong, in this lens: the bar its reviewers and Judge hold to.
     pub criteria: String,
+    /// How to attack in this lens: the techniques that find what the
+    /// criteria call wrong, such as running new tests in another time zone
+    /// or in random order. Every reviewer of the lens gets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack: Option<String>,
     pub triggers: Triggers,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
@@ -247,12 +253,22 @@ pub struct Policy {
     /// How the repository's tests run, for the mutation stage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tests: Option<Tests>,
+    /// How to work in this repository on this machine: setting up a copy,
+    /// running its tests and probes, guarding a command that could hang,
+    /// and where dependency and SDK sources are. Every role that can run
+    /// things gets it, and the brief stage too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runbook: Option<String>,
 }
 
 /// What a careful reviewer does by habit, made part of every round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Stage {
+    /// Before each round's reviewers, the Orchestrator writes each lens a
+    /// brief for this change: where in it to attack, and how. It reads the
+    /// change and the code, with no case of its own to make for it.
+    Brief,
     /// Every role gets what the repository's history says about the
     /// changed files: earlier commits to them, docs and tests that mention
     /// them, and where the functions the change touches are used.
@@ -383,6 +399,7 @@ impl Policy {
         };
         self.stages = later.stages.or(self.stages);
         self.tests = later.tests.or(self.tests);
+        self.runbook = later.runbook.or(self.runbook);
         self
     }
 }
@@ -486,6 +503,8 @@ pub struct Config {
     pub stages: Vec<Stage>,
     #[serde(default)]
     pub tests: Tests,
+    #[serde(default)]
+    pub runbook: Option<String>,
 }
 
 /// The framework's own defaults. They name no binding, model or provider:
@@ -560,6 +579,7 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         outside: false,
         stages: merged.stages.unwrap_or_default(),
         tests: merged.tests.unwrap_or_default(),
+        runbook: merged.runbook,
     };
     config.check()?;
     with_stage_lenses(config)
@@ -582,6 +602,7 @@ fn with_stage_lenses(mut config: Config) -> Result<Config> {
                 paths: vec!["**".into()],
                 ..Triggers::default()
             },
+            attack: None,
             binding: None,
             severity: BTreeMap::new(),
             include_generated: false,
@@ -1237,6 +1258,7 @@ mod tests {
             costs: Some(Costs::default()),
             stages: Some(Vec::new()),
             tests: Some(Tests::default()),
+            runbook: Some(String::new()),
         })
         .unwrap();
         let mut ours: Vec<String> = repo.as_object().unwrap().keys().cloned().collect();

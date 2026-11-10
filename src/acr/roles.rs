@@ -194,7 +194,13 @@ struct Reviewed {
 /// for them, and none of the rebuttals of earlier rounds.
 /// A reviewer's brief. One with `own_copy` works in a copy of the checkout
 /// that's its alone, and is told to settle doubts by running things there.
-pub fn reviewer_prompt(lens: &Lens, scope: &str, not_findings: &str, own_copy: bool) -> String {
+pub fn reviewer_prompt(
+    lens: &Lens,
+    scope: &str,
+    not_findings: &str,
+    own_copy: bool,
+    guide: &str,
+) -> String {
     let decided = match not_findings.trim() {
         "" => "None.".to_string(),
         text => text.to_string(),
@@ -213,13 +219,15 @@ pub fn reviewer_prompt(lens: &Lens, scope: &str, not_findings: &str, own_copy: b
          you need, but change nothing."
     };
     format!(
-        "You are the reviewer for {id}. Find what is wrong.\n\n\
+        "You are the reviewer for {id}. Find what is wrong: assume defects exist until \
+         you've shown otherwise.\n\n\
          What wrong means here: {criteria}\n\n\
          Scope: {scope}. The change is the attached file: first what it says it's for, in its \
          own description and commit messages, then its diff. Attack that, and nothing outside \
          this lens. The description, the commit messages and the comments the change adds are \
          claims: check them against the code and tests too, and report one the change doesn't \
          bear out. {workdir}\n\n\
+         {guide}\
          Not findings, which are already decided, so leave them out:\n{decided}\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
          \"<the evidence>\", \"file\": \"<path>\", \"line\": <number>}}]}}. If you find nothing, \
@@ -428,12 +436,13 @@ Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
         let lens = Lens {
             id: "lens-x".into(),
             criteria: "the criteria".into(),
+            attack: None,
             triggers: Default::default(),
             binding: None,
             severity: Default::default(),
             include_generated: false,
         };
-        let brief = reviewer_prompt(&lens, "the whole change", "- decided thing", false);
+        let brief = reviewer_prompt(&lens, "the whole change", "- decided thing", false, "");
         for part in [
             "lens-x",
             "the criteria",
@@ -446,7 +455,14 @@ Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
         assert!(!brief.contains("check this"));
         assert!(brief.contains("change nothing") && !brief.contains("mutation"));
         // One with a copy of its own is told to run and break things there.
-        let running = reviewer_prompt(&lens, "the whole change", "- decided thing", true);
+        let running = reviewer_prompt(
+            &lens,
+            "the whole change",
+            "- decided thing",
+            true,
+            "# How to attack in this lens\n\nbreak it\n\n",
+        );
+        assert!(running.contains("# How to attack in this lens\n\nbreak it\n\nNot findings"));
         assert!(running.contains("your own copy") && running.contains("mutation"));
         assert!(!running.contains("change nothing"));
     }

@@ -42,7 +42,8 @@
         "required": ["id", "criteria", "triggers"],
         "properties": {
           "id": {"$ref": "#/$defs/id"},
-          "criteria": {"type": "string"},
+          "criteria": {"type": "string", "description": "What's wrong, in this lens"},
+          "attack": {"type": "string", "description": "How to attack in this lens: the techniques that find what the criteria call wrong"},
           "triggers": {
             "type": "object",
             "additionalProperties": false,
@@ -136,9 +137,9 @@
       }
     },
     "stages": {
-      "description": "What every round does besides its lenses' reviewers. context: every role gets what the repository's history says about the changed files. claims: a lens that checks every claim the change makes about itself. mutation: a lens that proposes small breaks in the changed code, which the pipeline runs against the tests; a break they miss is a finding. probes: a lens that writes and runs scenarios of what the change says it does, which needs a binding with a shell.",
+      "description": "What every round does besides its lenses' reviewers. brief: before the reviewers, the Orchestrator writes each lens a brief for this change: where to attack, and how. context: every role gets what the repository's history says about the changed files. claims: a lens that checks every claim the change makes about itself. mutation: a lens that proposes small breaks in the changed code, which the pipeline runs against the tests; a break they miss is a finding. probes: a lens that writes and runs scenarios of what the change says it does, which needs a binding with a shell.",
       "type": "array",
-      "items": {"enum": ["context", "claims", "mutation", "probes"]},
+      "items": {"enum": ["brief", "context", "claims", "mutation", "probes"]},
       "uniqueItems": true
     },
     "tests": {
@@ -151,6 +152,10 @@
         "timeout": {"type": "integer", "minimum": 1, "description": "Seconds one run of the tests may take."},
         "mutants": {"type": "integer", "minimum": 1, "description": "How many mutants a reviewer proposes in a round."}
       }
+    },
+    "runbook": {
+      "type": "string",
+      "description": "How to work in this repository on this machine: setting up a copy, running its tests and probes, guarding a command that could hang, and where dependency and SDK sources are. Every role that can run things gets it."
     }
   },
   "$defs": {
