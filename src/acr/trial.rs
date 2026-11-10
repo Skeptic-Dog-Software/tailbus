@@ -52,6 +52,12 @@ pub struct Key {
     /// its own review, and which is scored once that review is done.
     #[serde(default)]
     pub findings: Vec<KeyFinding>,
+    /// A patch the copy gets on top of the head, as one more commit: what
+    /// another review left, such as a review to convergence's, so that a
+    /// design can audit it. The change is then the base to that commit. A
+    /// relative path is from the key's own file.
+    #[serde(default)]
+    pub patch: Option<PathBuf>,
 }
 
 /// A commit, which YAML reads as a number when it's all digits.
@@ -420,6 +426,40 @@ pub(super) fn scratch(paths: &Paths, key: &Key) -> Result<Scratch> {
         git(&["-C", &tree, "-c", &storage, "lfs", "checkout"], &[])?;
     }
     Ok(s)
+}
+
+/// The trial's copy of the change, with the key's patch committed on top of
+/// its head if it has one. Returns the key with that commit as its head.
+pub(super) fn copy(paths: &Paths, mut key: Key) -> Result<(Key, Scratch)> {
+    let s = scratch(paths, &key)?;
+    let Some(patch) = key.patch.clone() else {
+        return Ok((key, s));
+    };
+    let on = format!("putting {} on {}", patch.display(), key.head);
+    let git = |args: &[&str]| super::change::git(&s.tree, args).context(on.clone());
+    git(&[
+        "apply",
+        "--index",
+        "--whitespace=nowarn",
+        &patch.to_string_lossy(),
+    ])?;
+    // The copy's own name for its author, so nobody's settings sign or check
+    // a commit only the copy holds.
+    git(&[
+        "-c",
+        "user.name=review",
+        "-c",
+        "user.email=review@localhost",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "--no-verify",
+        "-m",
+        "Fixes from review",
+    ])?;
+    key.head = git(&["rev-parse", "HEAD"])?.trim().to_owned();
+    Ok((key, s))
 }
 
 /// The settings that keep a trial's Claude Code file tools, and its
@@ -919,10 +959,15 @@ pub(super) fn check_session(
 
 /// Runs one design on one change, and scores it.
 pub(super) fn read_key(key_path: &Path) -> Result<Key> {
-    serde_yaml_ng::from_str(
+    let mut key: Key = serde_yaml_ng::from_str(
         &fs::read_to_string(key_path).with_context(|| format!("reading {}", key_path.display()))?,
     )
-    .with_context(|| format!("in {}", key_path.display()))
+    .with_context(|| format!("in {}", key_path.display()))?;
+    if let Some(patch) = key.patch.take() {
+        let dir = key_path.parent().unwrap_or(Path::new(""));
+        key.patch = Some(dir.join(patch));
+    }
+    Ok(key)
 }
 
 /// What a key is called in results: its file's name.
@@ -934,8 +979,7 @@ fn key_name(key_path: &Path) -> String {
 }
 
 pub fn run(paths: &Paths, key_path: &Path, arm: Arm, pipeline: Pipeline) -> Result<Outcome> {
-    let key = resolved(read_key(key_path)?)?;
-    let s = scratch(paths, &key)?;
+    let (key, s) = copy(paths, resolved(read_key(key_path)?)?)?;
     let started = Instant::now();
     let mut ran = match arm {
         Arm::OneSize | Arm::Sized => builder_led(paths, &s, &key, arm),
@@ -1052,6 +1096,7 @@ mod tests {
             context: "c".into(),
             dimensions: vec!["correctness".into()],
             findings: Vec::new(),
+            patch: None,
         };
         let past = Key {
             base: fixed.clone(),
@@ -1092,6 +1137,65 @@ mod tests {
         let tree = s.tree.clone();
         drop(s);
         assert!(!tree.exists(), "the copy goes when the trial ends");
+    }
+
+    #[test]
+    fn a_keys_patch_is_one_more_commit_on_its_head_in_the_copy() {
+        use super::super::change::tests::{branch, commit, repo_with};
+        let repo = repo_with(&[("a.txt", "one\n")]);
+        branch(&repo, "work");
+        commit(&repo, &[("a.txt", "two\n")], "the change");
+        let head = rev(&repo, "HEAD");
+        // What a review to convergence leaves: a change to a file the change
+        // made, and a new file.
+        fs::write(repo.join("a.txt"), "three\n").unwrap();
+        fs::write(repo.join("b.txt"), "new\n").unwrap();
+        super::super::change::git(&repo, &["add", "--all"]).unwrap();
+        let patch =
+            super::super::change::git(&repo, &["diff", "--cached", "--binary", &head]).unwrap();
+        super::super::change::git(&repo, &["reset", "--quiet", "--hard"]).unwrap();
+        let dir = std::env::temp_dir().join(format!("tb-trial-patch-{}", new_id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("converged.patch"), patch).unwrap();
+        let key_path = dir.join("key.yaml");
+        fs::write(
+            &key_path,
+            format!(
+                "repo: {}\nbase: main\nhead: {head}\ncontext: c\ndimensions: [correctness]\npatch: converged.patch\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+        let paths = Paths {
+            state: dir.join("state"),
+            config: dir.join("config.toml"),
+        };
+        let key = read_key(&key_path).unwrap();
+        assert_eq!(
+            key.patch.as_deref(),
+            Some(dir.join("converged.patch").as_path())
+        );
+        let (key, s) = copy(&paths, resolved(key).unwrap()).unwrap();
+        assert_ne!(key.head, head);
+        assert_eq!(rev(&s.tree, "HEAD"), key.head);
+        assert_eq!(rev(&s.tree, "HEAD^"), head);
+        assert_eq!(fs::read_to_string(s.tree.join("a.txt")).unwrap(), "three\n");
+        assert_eq!(fs::read_to_string(s.tree.join("b.txt")).unwrap(), "new\n");
+        // Clean, as a reviewed commit has to be.
+        let status = super::super::change::git(&s.tree, &["status", "--porcelain"]).unwrap();
+        assert!(status.is_empty(), "{status}");
+        let commits = super::super::change::commits(&s.tree, &key.base, &key.head).unwrap();
+        assert_eq!(commits.len(), 2);
+        // And a key without one is the head as it was.
+        let plain = Key {
+            patch: None,
+            ..read_key(&key_path).unwrap()
+        };
+        let (plain, s) = copy(&paths, resolved(plain).unwrap()).unwrap();
+        assert_eq!(plain.head, head);
+        assert_eq!(rev(&s.tree, "HEAD"), head);
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1260,6 +1364,7 @@ mod tests {
             context: "Sends a welcome email once.".into(),
             dimensions: vec!["correctness".into(), "regression-safety".into()],
             findings: Vec::new(),
+            patch: None,
         };
         let criteria = [(
             "correctness".to_string(),

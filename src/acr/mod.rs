@@ -908,8 +908,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
 /// `tailbus acr check`: prints how each session did. Returns whether all did
 /// as they should.
 fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
-    let key = trial::resolved(trial::read_key(key_path)?)?;
-    let s = trial::scratch(paths, &key)?;
+    let (key, s) = trial::copy(paths, trial::resolved(trial::read_key(key_path)?)?)?;
     let canary = trial::Canary::new(paths)?;
     let mut ok = true;
     let mut report = |what: &str, started: std::time::Instant, wrong: Result<Vec<String>>| {

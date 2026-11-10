@@ -600,7 +600,10 @@ repeats until one round has no blocker in any lens. The Orchestrator here is
 the `steelman` binding, which needs `writes: true`. A review stops at 20
 rounds, a cap none should reach. The result gives the rounds, the tokens each
 took, and a patch of what the steelmans left, kept for 30 days in
-`acr-bench/converged/` so it can be audited.
+`acr-bench/converged/` so it can be audited. To audit one, give a copy of
+its key a `patch:` with that file: the trial's copy then has the patch
+committed on top of the head, and any design reviews the change as the
+convergence left it.
 
 `run` and `resume` exit 0 when every lens is confirmed or waived, 3 when they're
 waiting for a person, 4 on an escalation, and 1 if the review ended with
