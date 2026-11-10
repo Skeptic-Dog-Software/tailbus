@@ -609,6 +609,14 @@ fn copy_bridges(cfg: &Config) -> Result<Vec<String>> {
     Ok(bridges)
 }
 
+/// Lets a bridge work in any trial's copy, which needs a restart only the
+/// first time: after that, a trial's copy is already allowed, and no trial
+/// restarts a bridge that other agents' runs are going through.
+fn allow_trials(paths: &Paths, bridge: &str) -> Result<()> {
+    crate::setup::acr_dir(paths, &paths.state.join("acr-trials"), bridge)?;
+    Ok(())
+}
+
 /// Lets those bridges work in the copies, which needs a bridge restart only
 /// the first time.
 fn allow_copies(paths: &Paths, cfg: &Config) -> Result<()> {
@@ -1018,6 +1026,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
     for (_, b) in &chosen {
         let bridge = b.agent.split('@').next().unwrap_or(&b.agent).to_string();
         if !allowed.bridges.contains(&bridge) {
+            allow_trials(paths, &bridge)?;
             crate::setup::acr_repo(paths, &s.tree, true, &bridge)?;
             allowed.bridges.push(bridge);
         }
@@ -1071,6 +1080,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
     if let Some(b) = cfg.allowed_bindings.get(STEELMAN_BINDING) {
         let bridge = b.agent.split('@').next().unwrap_or(&b.agent).to_string();
         if !allowed.bridges.contains(&bridge) {
+            allow_trials(paths, &bridge)?;
             crate::setup::acr_repo(paths, &s.tree, true, &bridge)?;
             allowed.bridges.push(bridge);
         }
@@ -1283,6 +1293,7 @@ fn pipeline_arm(
         bridges: Vec::new(),
     };
     for bridge in &bridges {
+        allow_trials(paths, bridge)?;
         crate::setup::acr_repo(paths, tree, true, bridge)?;
         allowed.bridges.push(bridge.clone());
     }

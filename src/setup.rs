@@ -1028,6 +1028,19 @@ pub fn acr_repo(paths: &Paths, repo: &Path, allow: bool, agent: &str) -> Result<
     let mut doc = read_config(paths)?;
     let workdirs = acr_workdirs(&mut doc, agent)?;
     let there = workdirs.iter().any(|v| v.as_str() == Some(&shown));
+    // A folder the bridge allows takes in what's under it, with no restart:
+    // a trial's copy under the trials' folder, say, while another agent's
+    // runs are going through the bridge.
+    if allow
+        && !there
+        && let Some(dir) = workdirs
+            .iter()
+            .filter_map(|v| v.as_str())
+            .find(|d| repo.starts_with(d))
+    {
+        println!("ACR may already review {shown}, inside {dir}.");
+        return Ok(());
+    }
     match (allow, there) {
         (true, true) => {
             println!("ACR may already review {shown}.");
@@ -1370,6 +1383,16 @@ mod tests {
         assert!(acr_repo(&paths, &inner, true, ACR_AGENT).is_err());
         acr_repo(&paths, &repo, false, ACR_AGENT).unwrap();
         assert!(workdirs().is_empty());
+        // A repository inside a folder already allowed needs nothing more.
+        assert!(acr_dir(&paths, &dir, ACR_AGENT).unwrap());
+        assert!(!acr_dir(&paths, &dir, ACR_AGENT).unwrap());
+        acr_repo(&paths, &repo, true, ACR_AGENT).unwrap();
+        assert_eq!(workdirs(), [dir.canonicalize().unwrap().to_string_lossy()]);
+        acr_repo(&paths, &repo, false, ACR_AGENT).unwrap();
+        assert_eq!(workdirs().len(), 1);
+        let mut doc = read_config(&paths).unwrap();
+        acr_workdirs(&mut doc, ACR_AGENT).unwrap().clear();
+        write_config(&paths, &doc).unwrap();
         // Another bridge, such as one set up by hand, with no workdirs yet.
         let mut text = fs::read_to_string(&paths.config).unwrap();
         text.push_str("\n[bridges.other]\nowner = \"o\"\ncommand = \"/bin/sh\"\nworking_directory = \"/\"\nhome = \"/tmp\"\npath = \"/bin\"\n");
