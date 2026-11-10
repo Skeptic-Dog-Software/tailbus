@@ -545,7 +545,8 @@ pub fn probes_prompt(
          changed or deleted. Run each. {command}\n\n\
          {guide}\
          A scenario that fails, or shows wrong behaviour, is a finding: give its test code and \
-         what it printed. One that passes isn't. Nobody is here to grant a permission, so a \
+         what it printed. One that passes isn't. Wrong behaviour that was there before the \
+         change, in what it touches, is a finding too: say it's pre-existing. Nobody is here to grant a permission, so a \
          shell command that would need one is refused: name paths in full, not through \
          variables or `$(...)`, and put anything of more than one step in a script, written \
          with the Write tool and run by its path.\n\n\

@@ -226,7 +226,9 @@ pub fn reviewer_prompt(
          own description and commit messages, then its diff. Attack that, and nothing outside \
          this lens. The description, the commit messages and the comments the change adds are \
          claims: check them against the code and tests too, and report one the change doesn't \
-         bear out. {workdir}\n\n\
+         bear out. Report what's wrong in the code the change touches or relies on even if it \
+         was wrong before the change, and say it's pre-existing: that it isn't the change's \
+         doing doesn't make it not a finding. {workdir}\n\n\
          {guide}\
          Not findings, which are already decided, so leave them out:\n{decided}\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
@@ -296,6 +298,10 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          - Medium: real defect in a narrow case\n\
          - Low: nit or unlikely edge case\n\
          - Rejected: off task, noise, or a decided non-issue, with the reason\n\n\
+         A defect that was there before the change, in code the change touches or relies on, \
+         is on task: rate it as you would any other, and say in its reason that it's \
+         pre-existing. It's High or above only if the change claims to fix it, or makes it \
+         worse.\n\n\
          Decided non-issues:\n{not_findings}\n\n\
          Set split when the reviewers disagree about a finding. Set values_call when rejecting it \
          comes down to values, not fact. Give both sides in `sides` when you set either.\n\n\
