@@ -782,6 +782,8 @@ max_concurrent = 3
 # A fresh config for each run: none of your settings, plugins or MCP
 # servers, and its transcript where usage is read.
 CLAUDE_CONFIG_DIR = "{{SESSION_DIR}}"
+# {BG_WAIT_NOTE}
+{BG_WAIT} = "0"
 
 [bridges.{ACR_AGENT}.secrets]
 CLAUDE_CODE_OAUTH_TOKEN = {token}
@@ -807,11 +809,42 @@ model = "message.model"
 "#,
         owner = q(owner),
         claude = p(claude),
+        BG_WAIT = BG_WAIT,
+        BG_WAIT_NOTE = BG_WAIT_NOTE,
         home = p(home),
         token = p(token),
         confine = p(confine),
         path = q(path),
     )
+}
+
+/// Headless Claude Code stops a session's background work, a test run say,
+/// some minutes after the session ends its turn, unless this says to wait.
+/// "0" waits as long as the work takes; the bridge's own cap still ends
+/// every run.
+const BG_WAIT: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
+const BG_WAIT_NOTE: &str = "A session's background work, such as a test run, lives until it's done: \
+     otherwise it's stopped some minutes after the session's turn ends, and \
+     what it found is lost. The bridge's timeout still ends every run.";
+
+/// Adds the background wait to an existing ACR bridge's environment, if it
+/// isn't there. Returns whether it added it.
+fn bg_wait_bridge(doc: &mut toml_edit::DocumentMut) -> Result<bool> {
+    let bridge = doc
+        .get_mut("bridges")
+        .and_then(|b| b.get_mut(ACR_AGENT))
+        .and_then(|a| a.as_table_like_mut())
+        .context("there's no ACR bridge")?;
+    let env = bridge
+        .entry("env")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_like_mut()
+        .context("its env isn't a table")?;
+    if env.contains_key(BG_WAIT) {
+        return Ok(false);
+    }
+    env.insert(BG_WAIT, toml_edit::value("0"));
+    Ok(true)
 }
 
 /// Adds `--settings <confine>` to an existing ACR bridge's arguments, if it
@@ -1134,6 +1167,9 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
         if confine_bridge(&mut doc, &confine)? {
             println!("Its reviewers now run confined to the code under review.");
         }
+        if bg_wait_bridge(&mut doc)? {
+            println!("Its sessions' background work now lives until it's done.");
+        }
     } else {
         let home = paths.state.join(ACR_AGENT).join("home");
         fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
@@ -1241,6 +1277,34 @@ mod tests {
         );
         // The sandbox stops token sessions at startup when reads are blocked.
         assert!(v.get("sandbox").is_none());
+    }
+
+    #[test]
+    fn an_acr_bridge_lets_background_work_finish() {
+        let fresh = acr_bridge(
+            "o",
+            Path::new("/bin/claude"),
+            Path::new("/h"),
+            Path::new("/t"),
+            Path::new("/c.json"),
+            "/bin",
+        );
+        let doc: toml_edit::DocumentMut = fresh.parse().unwrap();
+        assert_eq!(
+            doc["bridges"][ACR_AGENT]["env"][BG_WAIT].as_str(),
+            Some("0")
+        );
+        let mut old: toml_edit::DocumentMut =
+            "[bridges.claude-acr]\nargs = [\"-p\"]\n[bridges.claude-acr.env]\nA = \"b\"\n"
+                .parse()
+                .unwrap();
+        assert!(bg_wait_bridge(&mut old).unwrap());
+        assert!(!bg_wait_bridge(&mut old).unwrap());
+        assert_eq!(old["bridges"]["claude-acr"]["env"]["A"].as_str(), Some("b"));
+        assert_eq!(
+            old["bridges"]["claude-acr"]["env"][BG_WAIT].as_str(),
+            Some("0")
+        );
     }
 
     #[test]

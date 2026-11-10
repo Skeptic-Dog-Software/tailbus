@@ -645,6 +645,17 @@ pub enum Fate {
     Survived(String),
     /// It couldn't be applied, as its text isn't in the file just once.
     Unusable,
+    /// Its tests ran past the limit, as they may on a busy machine: no
+    /// verdict either way.
+    TimedOut,
+}
+
+/// How a run of the tests ended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Ran {
+    Passed,
+    Failed,
+    TimedOut,
 }
 
 /// Runs each mutant in a copy of its own, from one copy where the tests
@@ -667,13 +678,19 @@ pub fn run_mutants(r: &Runner, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)>
             }
         }
     }
-    let (ok, out) = run_tests(&base, r.command, &named, r.limit, &r.dir.join("base.log"))?;
-    if !ok {
-        bail!(
+    let (ran, out) = run_tests(&base, r.command, &named, r.limit, &r.dir.join("base.log"))?;
+    match ran {
+        Ran::Passed => {}
+        Ran::Failed => bail!(
             "the tests fail before any break, so no mutant can be judged ({}): {}",
             command_line(r.command, &named),
             clip(&out, 1500)
-        );
+        ),
+        Ran::TimedOut => bail!(
+            "the tests ran past {} s before any break, so no mutant can be judged ({})",
+            r.limit.as_secs(),
+            command_line(r.command, &named)
+        ),
     }
     let next = AtomicUsize::new(0);
     let fates: Mutex<Vec<(usize, Fate)>> = Mutex::new(Vec::new());
@@ -706,12 +723,13 @@ pub fn run_mutants(r: &Runner, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)>
     fates.sort_by_key(|(i, _)| *i);
     let _ = fs::remove_dir_all(r.dir.join("base"));
     let mut found = Vec::new();
-    let (mut killed, mut survived, mut unusable) = (0, 0, 0);
+    let (mut killed, mut survived, mut unusable, mut timed_out) = (0, 0, 0, 0);
     for (i, fate) in fates {
         let m = &mutants[i];
         match fate {
             Fate::Killed => killed += 1,
             Fate::Unusable => unusable += 1,
+            Fate::TimedOut => timed_out += 1,
             Fate::Survived(out) => {
                 survived += 1;
                 let tests = if m.tests.is_empty() {
@@ -737,10 +755,16 @@ pub fn run_mutants(r: &Runner, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)>
             }
         }
     }
-    let summary = format!(
+    let mut summary = format!(
         "{} mutants: {killed} caught, {survived} missed, {unusable} unusable",
         mutants.len()
     );
+    if timed_out > 0 {
+        summary.push_str(&format!(
+            ", {timed_out} timed out (past {} s, so no verdict)",
+            r.limit.as_secs()
+        ));
+    }
     Ok((found, summary))
 }
 
@@ -764,11 +788,11 @@ fn one_mutant(
             return Ok(Fate::Unusable);
         }
         fs::write(&path, text.replacen(&m.find, &m.replace, 1))?;
-        let (ok, out) = run_tests(&copy, r.command, tests, r.limit, &dir.join("run.log"))?;
-        Ok(if ok {
-            Fate::Survived(out)
-        } else {
-            Fate::Killed
+        let (ran, out) = run_tests(&copy, r.command, tests, r.limit, &dir.join("run.log"))?;
+        Ok(match ran {
+            Ran::Passed => Fate::Survived(out),
+            Ran::Failed => Fate::Killed,
+            Ran::TimedOut => Fate::TimedOut,
         })
     })();
     let _ = fs::remove_dir_all(&dir);
@@ -783,15 +807,15 @@ fn command_line(command: &str, tests: &[String]) -> String {
     command.replace("{tests}", &quoted.join(" "))
 }
 
-/// Runs the tests in `dir`. Returns whether they passed, and the end of
-/// what they printed. One that runs past `limit` is stopped, and fails.
+/// Runs the tests in `dir`. Returns how they ended, and the end of what they
+/// printed. A run past `limit` is stopped.
 fn run_tests(
     dir: &Path,
     command: &str,
     tests: &[String],
     limit: Duration,
     log: &Path,
-) -> Result<(bool, String)> {
+) -> Result<(Ran, String)> {
     if let Some(parent) = log.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -825,7 +849,12 @@ fn run_tests(
         start += 1;
     }
     let tail = text[start..].to_string();
-    Ok((status.is_some_and(|s| s.success()), tail))
+    let ran = match status {
+        None => Ran::TimedOut,
+        Some(s) if s.success() => Ran::Passed,
+        Some(_) => Ran::Failed,
+    };
+    Ok((ran, tail))
 }
 
 /// Where a lens's mutants run, for one reviewer in one round.
@@ -987,6 +1016,27 @@ mod tests {
         assert!(fs::read_dir(&dir).map_or(true, |d| {
             d.flatten().all(|e| e.path().extension().is_some())
         }));
+        // A run past the limit gives no verdict, rather than counting as caught.
+        let hangs = vec![Mutant {
+            file: "lib.sh".into(),
+            find: "add() { echo".into(),
+            replace: "add() { sleep 30; echo".into(),
+            why: "add returns".into(),
+            tests: vec!["t.sh".into()],
+        }];
+        let quick = Runner {
+            repo: &repo,
+            dir: &dir,
+            command: "sh {tests}",
+            parallel: 1,
+            limit: Duration::from_secs(3),
+        };
+        let (found, summary) = run_mutants(&quick, &hangs).unwrap();
+        assert!(found.is_empty());
+        assert_eq!(
+            summary,
+            "1 mutants: 0 caught, 0 missed, 0 unusable, 1 timed out (past 3 s, so no verdict)"
+        );
         // Tests that fail before any break judge nothing.
         let failing = Runner {
             command: "false",
