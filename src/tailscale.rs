@@ -264,6 +264,99 @@ mod tests {
         assert!(machine_of("").is_err());
     }
 
+    /// A Tailscale CLI that answers `status` and `whois` with these, so
+    /// the tests never reach the real tailnet.
+    fn fake_cli(status: &str, whois: &str) -> (Tailscale, PathBuf) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "tailbus-fake-cli-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("status.json"), status).unwrap();
+        std::fs::write(dir.join("whois.json"), whois).unwrap();
+        let cli = dir.join("tailscale");
+        std::fs::write(
+            &cli,
+            "#!/bin/sh\nhere=$(dirname \"$0\")\ncase \"$1\" in\n  status) cat \"$here/status.json\" ;;\n  \
+             whois) cat \"$here/whois.json\" ;;\n  *) exit 2 ;;\nesac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (Tailscale::find(Some(&cli)), dir)
+    }
+
+    const ME_AND_PEERS: &str = r#"{
+        "BackendState": "Running",
+        "Self": {"DNSName": "laptop.example.ts.net.", "TailscaleIPs": ["100.64.0.1"], "Online": true, "UserID": 7},
+        "Peer": {
+            "a": {"DNSName": "server.example.ts.net.", "TailscaleIPs": ["100.64.0.2"], "Online": true, "UserID": 7},
+            "b": {"DNSName": "shared.other.ts.net.", "TailscaleIPs": ["100.64.0.3"], "Online": true, "UserID": 9}
+        },
+        "User": {"7": {"LoginName": "me@example.com"}, "9": {"LoginName": "dana@example.org"}}
+    }"#;
+
+    #[test]
+    fn each_peer_has_its_own_owner_not_this_machines() {
+        let whois = r#"{"Node": {"Name": "shared.other.ts.net."}, "UserProfile": {"LoginName": "dana@example.org"}}"#;
+        let (ts, dir) = fake_cli(ME_AND_PEERS, whois);
+        let status = ts.status().unwrap();
+        assert_eq!(status.machine, "laptop");
+        assert_eq!(status.owner, "me@example.com");
+        assert_eq!(status.ipv4, Some(Ipv4Addr::new(100, 64, 0, 1)));
+        let owner = |machine: &str| {
+            status
+                .peers
+                .iter()
+                .find(|p| p.machine == machine)
+                .map(|p| p.owner.clone())
+        };
+        // Only this owner's own machines count as theirs: a machine shared
+        // in from someone else must not get their permission prompts.
+        assert_eq!(owner("server").as_deref(), Some("me@example.com"));
+        assert_eq!(owner("shared").as_deref(), Some("dana@example.org"));
+        let who = ts.whois("100.64.0.3".parse().unwrap()).unwrap();
+        assert_eq!(
+            (who.machine.as_str(), who.owner.as_str()),
+            ("shared", "dana@example.org")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn status_is_refused_until_tailscale_is_running() {
+        for state in ["Starting", "Stopped", "NeedsLogin", ""] {
+            let status = ME_AND_PEERS.replace(r#""Running""#, &format!("{state:?}"));
+            let (ts, dir) = fake_cli(&status, "{}");
+            let e = ts.status().expect_err(state);
+            assert!(
+                format!("{e:#}").contains("isn't connected"),
+                "{state}: {e:#}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn acrbus_names_are_read_before_tailbus_ones() {
+        acrbus::config::set_app(&crate::TAILBUS);
+        let name = "PREFIX_ORDER_TEST";
+        // SAFETY: no other test reads or writes these two variables.
+        unsafe {
+            std::env::set_var(format!("ACRBUS_{name}"), "new");
+            std::env::set_var(format!("TAILBUS_{name}"), "old");
+        }
+        assert_eq!(acrbus::config::env_var(name).as_deref(), Some("new"));
+        // A session started before the split still has only its own.
+        unsafe { std::env::remove_var(format!("ACRBUS_{name}")) };
+        assert_eq!(acrbus::config::env_var(name).as_deref(), Some("old"));
+        unsafe { std::env::remove_var(format!("TAILBUS_{name}")) };
+        assert_eq!(acrbus::config::env_var(name), None);
+    }
+
     #[test]
     fn reads_a_stopped_tailscale() {
         // As Tailscale reports itself while it's starting after a reboot.
