@@ -707,9 +707,20 @@ Rejected.
 | --- | --- | --- |
 | Critical | Wrong result, data loss, security hole | Blocks |
 | High | Real defect in a realistic case | Blocks |
-| Medium | Real defect in a narrow case | Blocks unless waived |
+| Medium | Real defect in a narrow case | Never blocks, and is logged |
 | Low | Nit or unlikely edge case | Never blocks, and is logged |
-| Rejected | Off task, noise, decided non-issue | Dropped, keeping the reason |
+| Rejected | Not a real defect, or a decided non-issue | Dropped, keeping the reason |
+
+The Judge also states facts about each finding: whether it was there before
+the change, whether the change claims to fix it or makes it worse, whether
+it's a test the change adds that can't fail when what it pins breaks, and
+whether it's a claim that would mislead someone into a defect. Fixed rules
+decide from them: a weak pin, a misleading claim, or an old defect the
+change claims to fix or makes worse is High at least; an old defect
+otherwise is logged, and a Critical one goes to a person. A finding the
+Judge places in a line the change adds isn't old, whatever the Judge says.
+The rules only raise or route: anything they don't cover keeps the Judge's
+severity.
 
 **The human gate.** `per-round` asks what's folded in each round, `ends` asks
 about the scope and the final result, and `exception` asks only about

@@ -3245,7 +3245,7 @@ lenses:
         for (severity, status, state) in [
             ("Critical", Status::Waiting, FindingState::Open),
             ("High", Status::Waiting, FindingState::Open),
-            ("Medium", Status::Waiting, FindingState::Open),
+            ("Medium", Status::Confirmed, FindingState::Logged),
             ("Low", Status::Confirmed, FindingState::Logged),
             ("Rejected", Status::Confirmed, FindingState::Dropped),
         ] {
@@ -3347,7 +3347,11 @@ lenses:
 
     #[test]
     fn the_diff_settles_that_a_finding_in_an_added_line_isnt_pre_existing() {
-        let changed = stages::changed_lines("+++ b/test/a_test.dart\n@@ -0,0 +5,2 @@\n+x\n+y\n");
+        let changed = stages::changed_lines(
+            "+++ b/test/a_test.dart\n@@ -3,1 +5,3 @@\n-moved();\n+x\n+y\n+  moved();\n",
+        );
+        // A line the diff only moves isn't new.
+        assert!(!changed["test/a_test.dart"].contains(&7));
         let rating = |line: u64| -> roles::Rating {
             roles::read_ratings(&format!(
                 r#"{{"findings": [{{"title": "t", "severity": "Low", "file": "test/a_test.dart", "line": {line}, "pre_existing": true, "worsens": true}}]}}"#
@@ -3403,7 +3407,7 @@ lenses:
         );
         assert_eq!(
             rated(r#"{"title": "t", "severity": "Medium"}"#),
-            (Severity::Medium, Action::BlocksUnlessWaived)
+            (Severity::Medium, Action::NeverBlocks)
         );
     }
 
@@ -3461,22 +3465,23 @@ lenses:
     }
 
     #[test]
-    fn a_medium_can_be_waived() {
-        let cfg = plain("per-round", 3, 1);
+    fn a_medium_a_lens_makes_block_can_be_waived() {
+        let extra = r#"  - {id: gamma, criteria: "gamma criteria", triggers: {paths: ["**/*.src"]}, severity: {Medium: blocks-unless-waived}}"#;
+        let cfg = config("per-round", 3, 1, extra, "");
         let fake = Fake::new(|role, prompt: &str| match role {
-            Role::Reviewer if prompt.contains("alpha") => Ok(ONE.into()),
+            Role::Reviewer if prompt.contains("reviewer for gamma") => Ok(ONE.into()),
             Role::Reviewer => Ok(CLEAN.into()),
             Role::Judge => Ok(rating("Medium")),
             _ => Ok(NOTHING.into()),
         });
         let (mut run, c) = go(&cfg, &["a.src"], &fake);
-        let id = run.lenses["alpha"].rounds[0].findings[0].id.clone();
+        let id = run.lenses["gamma"].rounds[0].findings[0].id.clone();
         let waive = Decision {
             waive: vec![id],
             ..Decision::default()
         };
         resume(&mut run, &cfg, &c, &fake, waive).unwrap();
-        assert_eq!(run.lenses["alpha"].outcome, Outcome::Waived);
+        assert_eq!(run.lenses["gamma"].outcome, Outcome::Waived);
         assert_eq!(run.status, Status::Confirmed);
     }
 

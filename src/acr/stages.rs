@@ -1088,11 +1088,20 @@ pub struct Gap {
 /// The lines a change adds, by file.
 pub type ChangedLines = std::collections::BTreeMap<String, std::collections::BTreeSet<u64>>;
 
-/// The lines a diff adds, by file.
+/// The lines a diff adds, by file, leaving out ones it only moves: a line
+/// whose text the diff also removes somewhere is old code in a new place.
 pub fn changed_lines(diff: &str) -> ChangedLines {
+    let removed: std::collections::BTreeSet<&str> = diff
+        .lines()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .map(|l| l[1..].trim())
+        .filter(|l| !l.is_empty())
+        .collect();
     let mut lines: ChangedLines = Default::default();
-    for (f, n, _) in added_lines(diff) {
-        lines.entry(f).or_default().insert(n);
+    for (f, n, text) in added_lines(diff) {
+        if !removed.contains(text.trim()) {
+            lines.entry(f).or_default().insert(n);
+        }
     }
     lines
 }

@@ -95,8 +95,11 @@ impl Severity {
     pub fn default_action(self) -> Action {
         match self {
             Severity::Critical | Severity::High => Action::Blocks,
-            Severity::Medium => Action::BlocksUnlessWaived,
-            Severity::Low => Action::NeverBlocks,
+            // A narrow-case defect is logged, as the full in-session method
+            // rules: its blockers are realistic-case defects, weak pins and
+            // misleading claims, which the Judge's facts raise to High. A
+            // lens's `severity` can still make a Medium block.
+            Severity::Medium | Severity::Low => Action::NeverBlocks,
             Severity::Rejected => Action::Drop,
         }
     }
@@ -1248,10 +1251,7 @@ mod tests {
     fn severity_means_the_same_everywhere() {
         assert_eq!(Severity::Critical.default_action(), Action::Blocks);
         assert_eq!(Severity::High.default_action(), Action::Blocks);
-        assert_eq!(
-            Severity::Medium.default_action(),
-            Action::BlocksUnlessWaived
-        );
+        assert_eq!(Severity::Medium.default_action(), Action::NeverBlocks);
         assert_eq!(Severity::Low.default_action(), Action::NeverBlocks);
         assert_eq!(Severity::Rejected.default_action(), Action::Drop);
         let text = |s: &str| {
