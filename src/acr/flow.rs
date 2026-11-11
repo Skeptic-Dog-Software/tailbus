@@ -1515,8 +1515,8 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
     };
     // What the gate found, for every reviewer this round.
     let mut gate_text = String::new();
-    // The test gate first: a gap that blocks ends the round before any
-    // reviewer runs.
+    // The test gate first. A gap that blocks ends the round before any
+    // reviewer runs only if `tests.gate` is `stop`.
     if let Some(id) = stages::lens_id(Kind::Gate).filter(|id| {
         cfg.stages.contains(&Kind::Gate)
             && run
@@ -2711,9 +2711,12 @@ lenses:
         );
     }
 
-    fn gated(mode: &str) -> (Run, Vec<(Role, String, bool, String)>) {
+    fn gated(mode: Option<&str>) -> (Run, Vec<(Role, String, bool, String)>) {
         use super::super::change::tests::repo_with;
-        let top = format!("stages: [gate]\ntests: {{command: 'true', gate: {mode}}}");
+        let top = match mode {
+            Some(mode) => format!("stages: [gate]\ntests: {{command: 'true', gate: {mode}}}"),
+            None => "stages: [gate]\ntests: {command: 'true'}".to_string(),
+        };
         let cfg = config("exception", 1, 1, "", &top);
         assert!(cfg.lenses.iter().any(|l| l.id == "tests"));
         let repo = repo_with(&[("a.src", "let x = 1;\n")]);
@@ -2742,7 +2745,7 @@ lenses:
 
     #[test]
     fn a_test_gap_that_blocks_stops_the_round_before_the_reviewers() {
-        let (run, calls) = gated("stop");
+        let (run, calls) = gated(Some("stop"));
         let gate = &run.lenses["tests"].rounds[0];
         assert_eq!(gate.findings.len(), 1);
         assert!(gate.findings[0].blocks());
@@ -2759,11 +2762,17 @@ lenses:
     }
 
     #[test]
-    fn a_warning_gate_lets_the_reviewers_run() {
-        let (run, calls) = gated("warn");
-        assert!(run.lenses["tests"].rounds[0].findings[0].blocks());
-        assert_eq!(calls.iter().filter(|c| c.0 == Role::Reviewer).count(), 3);
-        assert_eq!(run.lenses["alpha"].rounds.len(), 1);
+    fn a_warning_gate_lets_the_reviewers_run_and_is_the_default() {
+        for mode in [Some("warn"), None] {
+            let (run, calls) = gated(mode);
+            assert!(run.lenses["tests"].rounds[0].findings[0].blocks());
+            assert_eq!(
+                calls.iter().filter(|c| c.0 == Role::Reviewer).count(),
+                3,
+                "{mode:?}"
+            );
+            assert_eq!(run.lenses["alpha"].rounds.len(), 1, "{mode:?}");
+        }
     }
 
     #[test]

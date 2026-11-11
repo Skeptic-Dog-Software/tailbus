@@ -630,9 +630,10 @@ make what a careful reviewer does by habit part of every round:
 - `gate`: first, before any reviewer. Are the change's tests enough?
   Changed lines no test runs, from a coverage report (`tests.coverage`,
   `tests.report`), and mutants of the changed code every test passes. The
-  gaps are the `tests` lens's findings; one that blocks ends the round
-  there, sparing the reviewers until the tests are written (`tests.gate:
-  warn` lets them run anyway). The gate runs the mutants itself.
+  gaps are the `tests` lens's findings, and every reviewer is told them.
+  The reviewers run anyway: `tests.gate: stop` makes a gap that blocks end
+  the round there instead, sparing their tokens but putting off what they'd
+  find for a round. The gate runs the mutants itself.
 - `brief`: before the reviewers, the Orchestrator writes each lens a brief
   for this change: where to attack, and how.
 - `test-writing`: between rounds of a review to convergence, after the

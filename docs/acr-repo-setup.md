@@ -131,10 +131,12 @@ tests:
 
 - **`gate`** runs first in every round. It finds changed lines no test runs
   (from the coverage report) and mutants of the changed code every test
-  passes. A gap that blocks ends the round before the brief or any
-  reviewer, so reviewers attack only code whose tests are enough. Set
-  `tests.coverage` to a command that writes an lcov report. Most test tools
-  have a flag for that.
+  passes, and tells every reviewer what it found. Set `tests.coverage` to
+  a command that writes an lcov report. Most test tools have a flag for
+  that. `tests.gate: stop` makes a gap that blocks end the round before
+  any reviewer runs. Leave it unset, which is `warn`: in one trial, `stop`
+  saved 14M tokens, but the reviewers it stopped found 19 of the 28 defects
+  a full review had found in its first round when they were let run.
 - **`test-writing`** works between rounds of a review to convergence. After
   the steelman's fixes, a fresh writer pins each fixed blocker with a test.
   Each pin must fail on the code from before the fixes and pass after.

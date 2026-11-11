@@ -331,8 +331,8 @@ pub struct Tests {
     /// Where that report is, from the root: `coverage/lcov.info` if unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report: Option<String>,
-    /// What a gap that blocks does: `stop` the round before the reviewers,
-    /// the default, or `warn` and let them run.
+    /// What a gap that blocks does: `warn`, the default, and let the
+    /// reviewers run, or `stop` the round before them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateMode>,
     /// Other ways the gate runs the change's own tests, each once, such as
@@ -359,10 +359,12 @@ pub struct Variant {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GateMode {
-    /// The round ends before any reviewer runs.
-    #[default]
+    /// The round ends before any reviewer runs. It spares the reviewers'
+    /// tokens, but what they'd have found waits a round, after the tests
+    /// have been rewritten once already.
     Stop,
-    /// The reviewers run anyway.
+    /// The reviewers run anyway, each told what the gate found.
+    #[default]
     Warn,
 }
 
