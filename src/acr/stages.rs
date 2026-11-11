@@ -644,11 +644,12 @@ pub fn mutants_prompt(scope: &str, count: u32, guide: &str) -> String {
          for, then its diff. Your working directory is the repository, as the change leaves \
          it: read what you need, and change nothing. The pipeline applies each break you \
          propose in a copy of its own and runs the tests you name, so don't run anything.\n\n\
-         Propose up to {count}, the most telling first, in the code the change adds or \
-         changes: a lookup by the wrong id or key; a condition flipped or dropped; a call or a \
-         write left out; a boundary moved by one; a value not cleared or not reset; an error \
-         swallowed; an order swapped. Each must still compile. Name the test files that should \
-         catch each: the change's own tests, and the existing tests of the code it touches.\n\n\
+         Propose {count}, the most telling first, in the code the change adds or changes: a \
+         lookup by the wrong id or key; a condition flipped or dropped; a call or a write left \
+         out; a boundary moved by one; a value not cleared or not reset; an error swallowed; an \
+         order swapped. Fewer only if the change has fewer places a break could go, and never \
+         pad the list with a break that changes nothing. Each must still compile. Name the test files that should catch each: the change's own tests, and the \
+         existing tests of the code it touches.\n\n\
          For each: the file; `find`, text copied exactly from that file, long enough to occur \
          only once in it; `replace`, what it becomes; and `why`, the behaviour a test should \
          catch.\n\n\
@@ -1395,6 +1396,18 @@ mod tests {
             "{pack}"
         );
         assert!(pack.contains("saveEdit:"), "{pack}");
+    }
+
+    #[test]
+    fn the_mutant_proposer_is_asked_for_the_full_count_and_no_padding() {
+        // One proposer, told "up to 12", gave one break and a placeholder
+        // that changed nothing.
+        let prompt = mutants_prompt("the change", 12, "");
+        assert!(
+            prompt.contains("Propose 12,") && !prompt.contains("up to"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("never pad the list"), "{prompt}");
     }
 
     #[test]
