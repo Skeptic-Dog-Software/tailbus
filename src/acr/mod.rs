@@ -1687,6 +1687,7 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
                 id: d.to_string(),
                 criteria: "(this repository's review config has no criteria for it)".into(),
                 attack: None,
+                blocker: None,
                 triggers: config::Triggers::default(),
                 binding: None,
                 severity: Default::default(),
@@ -1735,7 +1736,11 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
             };
             let flow::Ruled {
                 severity, action, ..
-            } = flow::ruling(&cfg, &lens, &flow::grounded(r, &lines));
+            } = flow::ruling(
+                &cfg,
+                &lens,
+                &flow::grounded(r, &lines, lens.blocker.as_deref()),
+            );
             let blocks = matches!(
                 action,
                 config::Action::Blocks | config::Action::BlocksUnlessWaived
@@ -1777,10 +1782,13 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
 /// decided non-issues, and its Judge, as its binding, prompt and rules.
 fn fingerprint(cfg: &Config, text: &str, decided: &str) -> Result<calibration::Fingerprint> {
     let judge = cfg.binding(Role::Judge, None)?;
+    // With a blocker definition, so the part of the prompt that gives it is
+    // fingerprinted too.
     let lens = config::Lens {
         id: "lens".into(),
         criteria: String::new(),
         attack: None,
+        blocker: Some("a blocker".into()),
         triggers: config::Triggers::default(),
         binding: None,
         severity: Default::default(),

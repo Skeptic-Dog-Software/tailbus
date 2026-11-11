@@ -84,9 +84,17 @@ lenses:
   - network denied, with a positive control;
   - claims checked against the code, line numbers included;
   - a generated-code regeneration compared with what's committed.
+- **`blocker`** says what blocks in this lens: its dimension's definition
+  of a blocker, set at calibration (§7) from the dimensions the
+  repository's full review used. Reviewers get it, and a finding the Judge
+  shows meets it, quoting the words it meets, blocks. Without one, the
+  Judge's severity and the general rules decide.
 - **`triggers`** choose the lens for a change: by paths, content patterns,
   or a plain-language description the Orchestrator judges. Each round
   checks them again, on the change as it is then.
+- **`elegance`** is a lens every repository gets, built in, with its own
+  criteria, attack and blocker. Give a lens with that id to word it for
+  this repository; it can't be left out.
 - **Keep everything about a particular change out of the config.** The brief
   stage writes that for each change.
 
@@ -230,10 +238,13 @@ notes when only the Judge has changed. `--uncalibrated` reviews it anyway.
    also reviews what earlier fixes added, and those findings don't belong:
    check each later-round finding with `git show <head>:<path>`. Every
    dimension must be a lens id in the config, spelled the same.
-3. **Run `tailbus acr calibrate <key>...` twice.** Each run is one Judge
+3. **Give each lens its dimension's `blocker`** (§3): the definition of a
+   blocker the full review used for that dimension, as its reviewers were
+   told it. A lens with none leaves blocking to the Judge's severity.
+4. **Run `tailbus acr calibrate <key>...` twice.** Each run is one Judge
    call per dimension and no reviewers, and each is recorded for the
    repository.
-4. **Read where the Judge and the key disagree.** The review's own rulings
+5. **Read where the Judge and the key disagree.** The review's own rulings
    aren't ground truth: on a judgment call, either side can be right. What
    to look for:
    - **Dropped findings**, ones the Judge rated Rejected. If one is a real
@@ -241,15 +252,15 @@ notes when only the Judge has changed. `--uncalibrated` reviews it anyway.
      not-findings entry that's too broad.
    - **Missed and overrated blockers.** Where the Judge is wrong because
      the config doesn't say what blocks in this repository, say it there:
-     in the lens's criteria, or with a lens's `severity`. For example, a
-     repository whose reviews block on a comment the change makes false
+     in the lens's `blocker`, its criteria, or its `severity`. For example,
+     a repository whose reviews block on a comment the change makes false
      should say so.
    - **The key itself.** A finding about code that isn't at `head`, or a
      blocker ruling the review's own record contradicts, is the key's
      mistake. Fix the key.
-5. **Accept it** with `tailbus acr calibration --repo <path> --accept`,
+6. **Accept it** with `tailbus acr calibration --repo <path> --accept`,
    once there are two runs on the current config and Judge. Change the
-   config later, and run steps 3 to 5 again on the keys you have.
+   config later, and run steps 4 to 6 again on the keys you have.
 
 ## 8. Measure what it finds
 

@@ -158,7 +158,7 @@ pub fn orchestrator_prompt(lenses: &[(&str, &str)], escalate: &[String]) -> Stri
         .collect();
     let escalate_list: String = escalate.iter().map(|e| format!("- {e}\n")).collect();
     format!(
-        "Read the attached change, which starts with what it says it's for, then its diff, \
+        "Read the attached change, which starts with what's said about it, then its diff, \
          and say which of these apply to it.\n\n\
          Lenses, each with when it applies:\n{lens_list}\n\
          Things that must go to a person:\n{escalate_list}\n\
@@ -196,7 +196,7 @@ pub(super) const WAIT: &str = "Run a long command in the foreground, with a time
      rereads everything you've read so far, which can cost more than the run.";
 
 /// A reviewer's whole brief: the lens, the scope, and what's already been
-/// decided. The attached file is the change: what it says it's for, then its
+/// decided. The attached file is the change: what's said about it, then its
 /// diff. Those are its claims; the reviewer gets nothing of the case made
 /// for them, and none of the rebuttals of earlier rounds.
 /// A reviewer's brief. One with `own_copy` works in a copy of the checkout
@@ -211,6 +211,11 @@ pub fn reviewer_prompt(
     let decided = match not_findings.trim() {
         "" => "None.".to_string(),
         text => text.to_string(),
+    };
+    // What blocks in this lens, from the repository's calibration.
+    let blocks = match lens.blocker.as_deref().map(str::trim) {
+        Some(b) if !b.is_empty() => format!("What blocks here: {b}\n\n"),
+        _ => String::new(),
     };
     let workdir = if own_copy {
         format!(
@@ -229,15 +234,16 @@ pub fn reviewer_prompt(
          you need, but change nothing."
             .to_string()
     };
+    let attached = super::change::ATTACHED;
     format!(
         "You are the reviewer for {id}. Find what is wrong: assume defects exist until \
          you've shown otherwise.\n\n\
          What wrong means here: {criteria}\n\n\
-         Scope: {scope}. The change is the attached file: first what it says it's for, in its \
-         own description and commit messages, then its diff. Attack that, and nothing outside \
-         this lens. The description, the commit messages and the comments the change adds are \
-         claims: check them against the code and tests too, and report one the change doesn't \
-         bear out. Report what's wrong in the code the change touches or relies on even if it \
+         {blocks}\
+         Scope: {scope}. {attached} Attack that, and nothing outside \
+         this lens. What's said about it, and the comments and docs the change adds, are claims \
+         to check, not to take on trust: check them against the code and tests too, and \
+         report one they don't bear out. Report what's wrong in the code the change touches or relies on even if it \
          was wrong before the change, and say it's pre-existing: that it isn't the change's \
          doing doesn't make it not a finding. {workdir}\n\n\
          {guide}\
@@ -313,6 +319,13 @@ pub struct Rating {
     /// rules hold the fact only when the change adds that text.
     #[serde(default, deserialize_with = "lenient::strings")]
     pub misleading_claim: Vec<String>,
+    /// It's a blocker by the lens's own definition of one.
+    #[serde(default, deserialize_with = "lenient::flag")]
+    pub meets_blocker: bool,
+    /// For `meets_blocker`, the words of the definition it meets. The rules
+    /// hold the fact only when the definition has them.
+    #[serde(default, deserialize_with = "lenient::strings")]
+    pub blocker_clause: Vec<String>,
     /// A deliberate break of the code, a mutant, that changes nothing a
     /// user or caller could see. Only ever about a mutant.
     #[serde(
@@ -333,9 +346,25 @@ struct Judged {
 }
 
 pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Result<String> {
+    let attached = super::change::ATTACHED;
+    // The lens's own definition of a blocker, from the repository's
+    // calibration, and the fact that says a finding meets it.
+    let (blocker, blocker_keys) = match lens.blocker.as_deref().map(str::trim) {
+        Some(b) if !b.is_empty() => (
+            format!(
+                "In this lens, a blocker is: {b}\nState `meets_blocker`, true if a finding is a \
+                 blocker by that definition, and copy into `blocker_clause` the words of the \
+                 definition it meets: a fact without its quote counts as false. A defect that was \
+                 there before the change, which the change neither claims to fix nor makes worse, \
+                 doesn't block whatever it meets.\n\n"
+            ),
+            ", \"meets_blocker\", \"blocker_clause\"",
+        ),
+        _ => (String::new(), ""),
+    };
     Ok(format!(
         "Judge these findings from {n} reviewer(s) of the {id} lens. Its criteria: {criteria}\n\n\
-         The change is the attached file: what it says it's for, then its diff. Your working \
+         {attached} Your working \
          directory is the repository, as the change leaves it. Check each finding against the \
          code. Change nothing in the \
          repository: you repair nothing. To test a claim, you may write and run a script, but \
@@ -367,6 +396,7 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          (a mutant) that the tests passed: true if that break changes nothing a user or caller \
          could see, and false for every other finding. Fixed rules decide from these facts what \
          blocks: rate the severity for what the defect costs on its own.\n\n\
+         {blocker}\
          Decided non-issues:\n{not_findings}\n\n\
          Set split when the reviewers disagree about a finding. Set values_call when rejecting it \
          comes down to values, not fact. Give both sides in `sides` when you set either.\n\n\
@@ -374,7 +404,7 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          Answer with only JSON: {{\"findings\": [{{\"title\", \"detail\", \"file\", \"line\", \
          \"severity\", \"real_defect\", \"on_task\", \"reason\", \"split\", \"values_call\", \
          \"sides\", \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \"weak_pin_test\", \
-         \"misleads\", \"misleading_claim\", \"equivalent_mutant\"}}]}}.",
+         \"misleads\", \"misleading_claim\", \"equivalent_mutant\"{blocker_keys}}}]}}.",
         n = reviews.len(),
         id = lens.id,
         criteria = lens.criteria,
@@ -489,6 +519,7 @@ mod tests {
             id: "mutation".into(),
             criteria: "It blocks when the tests claim the behaviour is covered.".into(),
             attack: None,
+            blocker: None,
             triggers: Default::default(),
             binding: None,
             severity: Default::default(),
@@ -557,6 +588,7 @@ Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
             id: "lens-x".into(),
             criteria: "the criteria".into(),
             attack: None,
+            blocker: None,
             triggers: Default::default(),
             binding: None,
             severity: Default::default(),

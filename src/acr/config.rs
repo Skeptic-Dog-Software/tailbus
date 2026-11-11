@@ -148,6 +148,13 @@ pub struct Lens {
     /// or in random order. Every reviewer of the lens gets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attack: Option<String>,
+    /// What blocks in this lens: its dimension's definition of a blocker,
+    /// set when the repository is calibrated, from the dimensions its full
+    /// review used. Reviewers get it, and a finding the Judge shows meets
+    /// it, quoting the words it meets, blocks. Left out, the Judge's
+    /// severity and the general rules decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
     pub triggers: Triggers,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
@@ -645,7 +652,45 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         runbook: merged.runbook,
     };
     config.check()?;
-    with_stage_lenses(config)
+    with_stage_lenses(with_universal_lenses(config))
+}
+
+/// The lens every repository gets, whatever its dimensions: elegance.
+/// A repository can give its own `elegance` lens to word it for its code,
+/// but not leave it out.
+pub const ELEGANCE: &str = "elegance";
+const ELEGANCE_CRITERIA: &str = "The change is as simple as the problem it solves allows: it \
+     works at the right level, in the code's own idiom, with nothing it doesn't need: no \
+     duplicated logic, dead code, or layer, option or wrapper nothing needs, and no special case \
+     standing in for a missing general rule. Its names and structure say what it does, so a \
+     reader can see it's right.";
+const ELEGANCE_ATTACK: &str = "Is there a smaller change that does the same? Search the code \
+     for what it re-implements. For each new branch, flag, parameter, wrapper or layer: what \
+     needs it, and would the code be simpler without it? Is a special case covering for a rule \
+     that should be general? Read it as a newcomer would: do its names and structure say what it \
+     does without its comments? Compare it with how nearby code solves the same kind of problem.";
+const ELEGANCE_BLOCKER: &str = "a shape that will cost the change's readers or its next change: \
+     logic duplicated where it must stay in step, a special case that hides a missing general \
+     rule, a layer, option or abstraction nothing needs, or a structure that hides whether the \
+     change is right; not taste in naming or formatting.";
+
+fn with_universal_lenses(mut config: Config) -> Config {
+    if !config.lenses.iter().any(|l| l.id == ELEGANCE) {
+        config.lenses.push(Lens {
+            id: ELEGANCE.to_string(),
+            criteria: ELEGANCE_CRITERIA.to_string(),
+            attack: Some(ELEGANCE_ATTACK.to_string()),
+            blocker: Some(ELEGANCE_BLOCKER.to_string()),
+            triggers: Triggers {
+                paths: vec!["**".into()],
+                ..Triggers::default()
+            },
+            binding: None,
+            severity: BTreeMap::new(),
+            include_generated: false,
+        });
+    }
+    config
 }
 
 /// The config with a lens for each stage that runs as one. They apply to
@@ -671,6 +716,7 @@ fn with_stage_lenses(mut config: Config) -> Result<Config> {
                 ..Triggers::default()
             },
             attack: None,
+            blocker: None,
             binding: None,
             severity: BTreeMap::new(),
             include_generated: false,
@@ -924,11 +970,33 @@ mod tests {
     }
 
     #[test]
+    fn every_repository_gets_elegance_worded_its_own_way_if_it_likes() {
+        // Built in, with a blocker of its own, for every change.
+        let cfg = resolved(GO).unwrap();
+        let lens = cfg.lenses.iter().find(|l| l.id == ELEGANCE).unwrap();
+        assert!(lens.blocker.is_some() && lens.attack.is_some());
+        assert_eq!(lens.triggers.paths, ["**"]);
+        // A repository's own elegance lens is used in its place, not beside
+        // it.
+        let own = GO.replacen(
+            "lenses:\n",
+            "lenses:\n  - id: elegance\n    criteria: \"our own words\"\n    triggers: {paths: [\"**/*.go\"]}\n",
+            1,
+        );
+        let cfg = resolved(&own).unwrap();
+        let ours: Vec<&Lens> = cfg.lenses.iter().filter(|l| l.id == ELEGANCE).collect();
+        assert_eq!(ours.len(), 1);
+        assert_eq!(ours[0].criteria, "our own words");
+    }
+
+    #[test]
     fn the_go_example_is_valid() {
         let cfg = resolved(GO).unwrap();
         assert_eq!(cfg.human_gate, HumanGate::PerRound);
         assert_eq!(cfg.review_scope, ReviewScope::BottomOfStack);
-        assert_eq!(cfg.lenses.len(), 5);
+        // Its five, and elegance, which every repository gets.
+        assert_eq!(cfg.lenses.len(), 6);
+        assert!(cfg.lenses.iter().any(|l| l.id == ELEGANCE));
         assert_eq!(cfg.tiers.last().unwrap().fan_out, 3);
         assert_eq!(cfg.not_findings.as_deref(), Some("not-findings.md"));
     }

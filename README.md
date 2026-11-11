@@ -559,7 +559,12 @@ repository. It holds no knowledge of one: every lens, path and language comes
 from `.acr/config.yaml`. Reviewers attack one lens each from a clean context,
 a Judge rates what they find, the Orchestrator fixes the blockers, and only
 the lenses with blockers are attacked again, by new reviewers. A lens is
-confirmed when its latest round has no blockers. The method is in
+confirmed when its latest round has no blockers. Every role gets what's said
+about the change, its description and commit messages, its builder's
+statement and what earlier commits and docs say, as claims to check, not to
+take on trust. A lens's `blocker` gives its dimension's definition of a
+blocker, set when the repository is calibrated, and every repository also
+gets a built-in `elegance` lens. The method is in
 [the ACR skill](plugin/skills/acr/SKILL.md). All four roles go through
 [bridges](#headless-agents).
 

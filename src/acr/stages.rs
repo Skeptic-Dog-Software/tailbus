@@ -105,10 +105,11 @@ pub fn briefer_prompt(scope: &str, lenses: &[ToBrief], runbook: Option<&str>) ->
     let runbook = runbook
         .map(|r| format!("# How to work in this repository\n\n{}\n\n", r.trim()))
         .unwrap_or_default();
+    let attached = super::change::ATTACHED;
     format!(
         "You brief the reviewers of a change, one per lens, before they attack it. You don't \
          review it yourself, and you have no case to make for it: you didn't write it. Scope: \
-         {scope}. The change is the attached file: what it says it's for, then its diff. Your \
+         {scope}. {attached} Your \
          working directory is the repository as the change leaves it: read the code the change \
          touches, what calls it and what it calls, and its tests, enough to know where it could \
          be wrong. Change nothing.\n\n\
@@ -154,14 +155,11 @@ pub fn read_builder_brief(path: &Path) -> Result<BuilderBrief> {
     serde_yaml_ng::from_str(&text).with_context(|| format!("in the brief {}", path.display()))
 }
 
-/// The builder's scope statement, for every role, ahead of the diff.
+/// The builder's scope statement, for every role, among what's said about
+/// the change ([`super::change::SAID`]): claims to check like the rest.
 pub fn scope_section(brief: &BuilderBrief) -> String {
     match brief.scope.as_deref().filter(|s| !s.trim().is_empty()) {
-        Some(scope) => format!(
-            "# What the change's builder says it does\n\nThe builder's own account: claims to \
-             check against the code, not to take on trust.\n\n{}\n\n",
-            scope.trim()
-        ),
+        Some(scope) => format!("## What its builder says it does\n\n{}\n\n", scope.trim()),
         None => String::new(),
     }
 }
@@ -177,7 +175,8 @@ pub fn guide(attack: Option<&str>, brief: Option<&str>, runbook: Option<&str>) -
     if let Some(b) = brief.filter(|b| !b.trim().is_empty()) {
         out.push_str(&format!(
             "# Where to attack in this change\n\nFrom a brief written for this change: leads, \
-             not findings.\n\n{}\n\n",
+             not findings, and what it says about the change is a claim to check, not to take \
+             on trust.\n\n{}\n\n",
             b.trim()
         ));
     }
@@ -197,11 +196,22 @@ const PACK_MAX: usize = 16 * 1024;
 /// The most changed files a pack covers.
 const PACK_FILES: usize = 15;
 
-/// What the repository's history says about the changed files: earlier
-/// commits to them, docs and tests that mention them, and where the
-/// functions the change touches are used. Gathered from git at the base and
-/// in the checkout, so nothing in it comes from after the change.
-pub fn context_pack(repo: &Path, base: &str, change: &Change) -> String {
+/// The context pack, in two parts. `said` is what earlier commits and the
+/// docs say about the changed files: people's accounts, so it goes among
+/// what's said about the change ([`super::change::SAID`]), as claims to
+/// check. `leads` is where the tests and the touched functions' callers
+/// are: pointers into the code, not anyone's claims.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pack {
+    pub said: String,
+    pub leads: String,
+}
+
+/// Earlier commits to the changed files, docs and tests that mention them,
+/// and where the functions the change touches are used. Gathered from git at
+/// the base and in the checkout, so nothing in it comes from after the
+/// change.
+pub fn context_pack(repo: &Path, base: &str, change: &Change) -> Pack {
     let left_out: Vec<&str> = change.generated.iter().map(|g| g.path.as_str()).collect();
     let files: Vec<&String> = change
         .files
@@ -209,10 +219,7 @@ pub fn context_pack(repo: &Path, base: &str, change: &Change) -> String {
         .filter(|f| !left_out.contains(&f.as_str()))
         .take(PACK_FILES)
         .collect();
-    let mut out = String::from(
-        "# What the repository's history says about the changed files\n\n\
-         Gathered from git, not written by anyone: leads to follow, not findings.\n\n",
-    );
+    let mut out = String::new();
 
     let mut earlier = String::new();
     for f in &files {
@@ -239,7 +246,7 @@ pub fn context_pack(repo: &Path, base: &str, change: &Change) -> String {
     }
     section(
         &mut out,
-        "Earlier commits to them, before this change",
+        "Earlier commits to the changed files, before this change",
         &earlier,
     );
 
@@ -257,8 +264,10 @@ pub fn context_pack(repo: &Path, base: &str, change: &Change) -> String {
             docs.push_str(&format!("- {}\n", clip(line, 240)));
         }
     }
-    section(&mut out, "Docs that mention them", &docs);
+    section(&mut out, "Docs that mention the changed files", &docs);
+    let said = capped(out);
 
+    let mut out = String::new();
     let mut tests = String::new();
     for f in &files {
         let stem = stem(f);
@@ -275,7 +284,7 @@ pub fn context_pack(repo: &Path, base: &str, change: &Change) -> String {
             tests.push_str(&format!("{f}: {}\n", named.join(", ")));
         }
     }
-    section(&mut out, "Tests that mention them", &tests);
+    section(&mut out, "Tests that mention the changed files", &tests);
 
     let mut used = String::new();
     for name in changed_functions(&change.diff) {
@@ -293,16 +302,33 @@ pub fn context_pack(repo: &Path, base: &str, change: &Change) -> String {
         "Where the functions the change touches are used",
         &used,
     );
+    let leads = capped(out);
+    Pack {
+        said,
+        leads: if leads.is_empty() {
+            leads
+        } else {
+            format!(
+                "# Leads in the repository\n\nGathered from git: where to look, not findings.\n\n{leads}"
+            )
+        },
+    }
+}
 
-    if out.len() > PACK_MAX {
-        let mut end = PACK_MAX;
+/// Half the pack's limit, for each of its parts.
+fn capped(mut out: String) -> String {
+    let max = PACK_MAX / 2;
+    if out.len() > max {
+        let mut end = max;
         while !out.is_char_boundary(end) {
             end -= 1;
         }
         out.truncate(end);
         out.push_str("\n…(cut here: the pack has a size limit)\n");
     }
-    out.push('\n');
+    if !out.is_empty() {
+        out.push('\n');
+    }
     out
 }
 
@@ -543,9 +569,9 @@ pub fn claims_prompt(
         "Read the repository, as the change leaves it, to check each, but change nothing."
             .to_string()
     };
+    let attached = super::change::ATTACHED;
     format!(
-        "You check what a change claims about itself. Scope: {scope}. The change is the \
-         attached file: what it says it's for, then its diff.\n\n\
+        "You check what a change claims about itself. Scope: {scope}. {attached}\n\n\
          Each item below is a claim the change makes: a doc or ledger line it adds, a comment \
          it adds, a test's name, a commit message, or its description. Check each against the \
          code and the tests. {how}\n\n\
@@ -585,9 +611,9 @@ pub fn probes_prompt(
         ),
         None => "Find how this repository runs its tests from its own files.".to_string(),
     };
+    let attached = super::change::ATTACHED;
     format!(
-        "You probe a change by running it. Scope: {scope}. The change is the attached file: \
-         what it says it's for, then its diff. Your working directory is your own copy of the \
+        "You probe a change by running it. Scope: {scope}. {attached} Your working directory is your own copy of the \
          repository, as the change leaves it, and nothing you do there reaches the change.\n\n\
          Write small scenarios, as tests in this repository's own test framework, of what the \
          change says it does and the edges around it: doing it twice, or in another order; \
@@ -638,10 +664,10 @@ pub fn read_mutants(text: &str) -> Result<Vec<Mutant>> {
 
 /// A mutation reviewer's brief: propose the breaks; the pipeline runs them.
 pub fn mutants_prompt(scope: &str, count: u32, guide: &str) -> String {
+    let attached = super::change::ATTACHED;
     format!(
         "You find where a change's tests are weak, by proposing small breaks in its code that a \
-         test should catch. Scope: {scope}. The change is the attached file: what it says it's \
-         for, then its diff. Your working directory is the repository, as the change leaves \
+         test should catch. Scope: {scope}. {attached} Your working directory is the repository, as the change leaves \
          it: read what you need, and change nothing. The pipeline applies each break you \
          propose in a copy of its own and runs the tests you name, so don't run anything.\n\n\
          Propose {count}, the most telling first, in the code the change adds or changes: a \
@@ -1119,15 +1145,9 @@ pub fn changed_lines(diff: &str) -> ChangedLines {
 /// marks, case and spacing evened out. A quote can skip words with "...",
 /// and one too short to tell apart from any other line never matches.
 pub fn adds_text(changed: &ChangedLines, quote: &str) -> bool {
-    let parts: Vec<String> = quote
-        .split("...")
-        .flat_map(|p| p.split('\u{2026}'))
-        .map(plain_words)
-        .filter(|p| !p.is_empty())
-        .collect();
-    if parts.iter().map(|p| p.chars().count()).sum::<usize>() < 8 {
+    let Some(parts) = quote_parts(quote) else {
         return false;
-    }
+    };
     changed.values().any(|lines| {
         let text = plain_words(
             &lines
@@ -1138,6 +1158,28 @@ pub fn adds_text(changed: &ChangedLines, quote: &str) -> bool {
         );
         parts.iter().all(|p| text.contains(p.as_str()))
     })
+}
+
+/// Whether `text` has the words `quote` gives, evened out as `adds_text`
+/// evens them out: for a quote from a lens's own definition of a blocker.
+pub fn quotes_text(text: &str, quote: &str) -> bool {
+    let Some(parts) = quote_parts(quote) else {
+        return false;
+    };
+    let text = plain_words(text);
+    parts.iter().all(|p| text.contains(p.as_str()))
+}
+
+/// A quote's parts, split where it skips words with "...", evened out; none
+/// if it's too short to tell apart from any other text.
+fn quote_parts(quote: &str) -> Option<Vec<String>> {
+    let parts: Vec<String> = quote
+        .split("...")
+        .flat_map(|p| p.split('\u{2026}'))
+        .map(plain_words)
+        .filter(|p| !p.is_empty())
+        .collect();
+    (parts.iter().map(|p| p.chars().count()).sum::<usize>() >= 8).then_some(parts)
 }
 
 fn uncommented(line: &str) -> &str {
@@ -1385,17 +1427,25 @@ mod tests {
             diff: "@@ -1 +1 @@ void saveEdit() {\n+void saveEdit() { x(); }\n".into(),
             ..Change::default()
         };
-        let pack = context_pack(&repo, base.trim(), &change);
-        assert!(pack.contains("Earlier commits to them") && pack.contains("lib/editor.dart:"));
+        let Pack { said, leads } = context_pack(&repo, base.trim(), &change);
+        // What people wrote, earlier commits and docs, is said about the
+        // change: claims, under SAID's frame, with no heading of its own.
         assert!(
-            pack.contains("docs/notes.md:1:editor.dart saves edits"),
-            "{pack}"
+            said.contains("## Earlier commits to the changed files")
+                && said.contains("lib/editor.dart:")
+                && said.contains("docs/notes.md:1:editor.dart saves edits")
+                && !said.contains("\n# ")
+                && !said.starts_with("# "),
+            "{said}"
         );
+        // Where the tests and callers are is a lead.
         assert!(
-            pack.contains("lib/editor.dart: test/editor_test.dart"),
-            "{pack}"
+            leads.starts_with("# Leads in the repository")
+                && leads.contains("lib/editor.dart: test/editor_test.dart")
+                && leads.contains("saveEdit:")
+                && !leads.contains("docs/notes.md"),
+            "{leads}"
         );
-        assert!(pack.contains("saveEdit:"), "{pack}");
     }
 
     #[test]

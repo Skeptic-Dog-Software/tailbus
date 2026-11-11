@@ -61,17 +61,30 @@ pub fn commits(repo: &Path, base: &str, tip: &str) -> Result<Vec<Commit>> {
         .collect())
 }
 
+/// How every role is told what the attached change is: what's said about
+/// it, then its diff.
+pub const ATTACHED: &str = "The change is the attached file: first what's said about it, \
+     claims to check and not to take on trust, then its diff.";
+
+/// The head of what's said about a change, which every role gets ahead of
+/// the diff: its description and commit messages, here, then its builder's
+/// statement and what earlier commits and the docs say, all under it.
+/// Knowing why a change was made saves a reviewer from rediscovering it, so
+/// all of it is given, but as claims, never as facts.
+pub const SAID: &str = "# What's said about this change: claims to check, not to take on \
+     trust\n\n\
+     Everything before the diff is someone's account of the change: its own description and \
+     commit messages, what its builder says it does, and what earlier commits and the \
+     repository's docs say about the files it touches. The comments and docs the change adds \
+     are claims too. Use them to learn what the change is for, but none of it is a fact until \
+     the code and tests show it. A claim they don't bear out is a finding, and so is a change \
+     in behaviour that none of them mention.\n\n";
+
 /// What a change says it's for, in its own words: its description, such as
-/// its pull request's, and its commit messages. Every role gets this ahead
-/// of the diff. With the comments the change adds, these are its claims: the
-/// author's account of it, to check, never to take on trust.
+/// its pull request's, and its commit messages, under [`SAID`].
 pub fn intent(description: Option<&str>, commits: &[Commit]) -> String {
-    let mut out = String::from(
-        "# What this change says it's for\n\n\
-         In its own words: its description and its commit messages. With the comments it \
-         adds, these are claims to check against the code and tests, not facts.\n\n\
-         ## Its description\n\n",
-    );
+    let mut out = String::from(SAID);
+    out.push_str("## Its description\n\n");
     match description.map(str::trim).filter(|d| !d.is_empty()) {
         Some(text) => {
             out.push_str(text);
@@ -628,7 +641,10 @@ pub mod tests {
             "{text}"
         );
         assert!(fix < text.find("Test the edit").unwrap(), "{text}");
-        assert!(text.contains("claims to check"), "{text}");
+        assert!(
+            text.starts_with(SAID) && SAID.contains("claims to check, not to take on trust"),
+            "{text}"
+        );
         let bare = intent(None, &[]);
         assert!(
             bare.contains("None was given.") && bare.contains("None.\n"),

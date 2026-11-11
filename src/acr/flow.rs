@@ -491,8 +491,12 @@ fn write_artifact(s: &Setting, run: &Run, change: &Change, round: u32) -> Result
     if let Some(brief) = &s.builder_brief {
         intent.push_str(&stages::scope_section(brief));
     }
+    // What earlier commits and the docs say is said about the change too;
+    // where its tests and callers are is a lead, after it.
     if s.cfg.stages.contains(&Kind::Context) {
-        intent.push_str(&stages::context_pack(&run.repo, &run.base, change));
+        let pack = stages::context_pack(&run.repo, &run.base, change);
+        intent.push_str(&pack.said);
+        intent.push_str(&pack.leads);
     }
     if let Some(fix) = run
         .fix
@@ -1302,7 +1306,7 @@ fn write_tests(
     (pins, written.done)
 }
 
-/// A round's reviewer copies, removed when it's dropped./// A round's reviewer copies, removed when it's dropped./// A round's reviewer copies, removed when it's dropped.
+/// A round's reviewer copies, removed when it's dropped.
 struct Copies(Option<PathBuf>);
 
 impl Drop for Copies {
@@ -1346,15 +1350,21 @@ fn prune_copies(root: &Path) {
 ///   makes worse: logged, never blocking. A Critical one also goes to a
 ///   person, so it's never silent.
 ///
-/// And three raise it to High at least: a test the change adds that can't
+/// And four raise it to High at least: a test the change adds that can't
 /// fail when what it pins breaks; a claim that would lead someone to ship a
-/// defect; a pre-existing defect the change claims to fix or makes worse.
+/// defect; a pre-existing defect the change claims to fix or makes worse;
+/// and a defect of the change's own that meets the lens's definition of a
+/// blocker, which the repository's calibration set.
 /// A real finding outside the reviewer's own lens is rated like any other.
 pub(super) fn ruling(cfg: &Config, lens: &Lens, r: &roles::Rating) -> Ruled {
     if !r.relevant || r.equivalent || r.severity == Severity::Rejected {
         return Ruled::plain(Severity::Rejected, Action::Drop);
     }
-    if r.weak_pin || r.misleads || (r.pre_existing && (r.claims_fix || r.worsens)) {
+    if r.weak_pin
+        || r.misleads
+        || (r.pre_existing && (r.claims_fix || r.worsens))
+        || (r.meets_blocker && !r.pre_existing)
+    {
         let severity = if r.severity == Severity::Critical {
             Severity::Critical
         } else {
@@ -1381,7 +1391,12 @@ pub(super) fn rules_source() -> String {
     );
     let stages = super::calibration::source_of(
         include_str!("stages.rs"),
-        &["pub fn changed_lines(", "pub fn adds_text("],
+        &[
+            "pub fn changed_lines(",
+            "pub fn adds_text(",
+            "pub fn quotes_text(",
+            "fn quote_parts(",
+        ],
     );
     format!("{flow}\n{stages}")
 }
@@ -1405,10 +1420,16 @@ impl Ruled {
     }
 }
 
-/// Facts the diff settles, whatever the Judge said: a finding in a line the
-/// change adds isn't pre-existing, and a weak pin or a misleading claim
-/// holds only when its quote is something the change adds.
-pub(super) fn grounded(mut r: roles::Rating, changed: &stages::ChangedLines) -> roles::Rating {
+/// Facts the diff and the config settle, whatever the Judge said: a finding
+/// in a line the change adds isn't pre-existing; a weak pin or a misleading
+/// claim holds only when its quote is something the change adds; and a
+/// finding meets the lens's definition of a blocker only when its quote is
+/// words of that definition.
+pub(super) fn grounded(
+    mut r: roles::Rating,
+    changed: &stages::ChangedLines,
+    blocker: Option<&str>,
+) -> roles::Rating {
     if let (Some(file), Some(line)) = (r.file.as_deref(), r.line)
         && changed
             .get(file)
@@ -1419,6 +1440,8 @@ pub(super) fn grounded(mut r: roles::Rating, changed: &stages::ChangedLines) -> 
     let quoted = |quotes: &[String]| quotes.iter().any(|q| stages::adds_text(changed, q));
     r.weak_pin = r.weak_pin && quoted(&r.weak_pin_test);
     r.misleads = r.misleads && quoted(&r.misleading_claim);
+    r.meets_blocker = r.meets_blocker
+        && blocker.is_some_and(|b| r.blocker_clause.iter().any(|q| stages::quotes_text(b, q)));
     r
 }
 
@@ -1431,7 +1454,7 @@ fn rate(
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (n, rating) in ratings.into_iter().enumerate() {
-        let rating = grounded(rating, changed);
+        let rating = grounded(rating, changed, lens.blocker.as_deref());
         let Ruled {
             severity,
             action,
@@ -2181,7 +2204,12 @@ lenses:
 "#
         );
         let user = parse_user(USER).unwrap();
-        resolve(&user, parse_repo(&text).unwrap(), &Flags::default()).unwrap()
+        let mut cfg = resolve(&user, parse_repo(&text).unwrap(), &Flags::default()).unwrap();
+        // These tests count lenses and calls: the universal lens, which
+        // every real config gets, is tested on its own.
+        cfg.lenses
+            .retain(|l| l.id != super::super::config::ELEGANCE);
+        cfg
     }
 
     fn plain(gate: &str, rounds: u32, fan_out: u32) -> Config {
@@ -2472,7 +2500,7 @@ lenses:
         assert!(sent.iter().any(|(r, _)| *r == Role::Reviewer));
         for (role, text) in sent.iter() {
             assert!(
-                text.starts_with("# What this change says it's for"),
+                text.starts_with(super::super::change::SAID),
                 "{role:?}: {text}"
             );
             let said = text
@@ -2859,7 +2887,8 @@ lenses:
         let sent = fake.sent.lock().unwrap();
         assert!(
             sent.iter()
-                .all(|(_, text)| text.contains("# What the change's builder says it does"))
+                .all(|(_, text)| text.starts_with(super::super::change::SAID)
+                    && text.contains("## What its builder says it does"))
         );
         let _ = fs::remove_dir_all(&s.work_dir);
     }
@@ -2961,12 +2990,15 @@ lenses:
             "{}",
             failed("mutation")
         );
-        // Every role got the history pack ahead of the diff.
+        // Every role got the history pack ahead of the diff, among what's
+        // said about the change. This repository has no tests or callers to
+        // point to, so there are no leads.
         let sent = fake.sent.lock().unwrap();
-        assert!(
-            sent.iter()
-                .all(|(_, text)| text.contains("What the repository's history says"))
-        );
+        assert!(sent.iter().all(|(_, text)| {
+            let said = text.find("## Earlier commits to the changed files");
+            said.is_some_and(|at| text.starts_with(super::super::change::SAID) && at > 0)
+                && !text.contains("# Leads in the repository")
+        }));
     }
 
     #[test]
@@ -3332,7 +3364,7 @@ lenses:
             Severity::Rejected => 0,
         };
         let mut cases = 0;
-        for bits in 0u32..256 {
+        for bits in 0u32..512 {
             let fact = |i: u32| bits & (1 << i) != 0;
             for &severity in &severities {
                 let mut r: roles::Rating = serde_json::from_value(serde_json::json!({
@@ -3347,6 +3379,7 @@ lenses:
                 r.weak_pin = fact(5);
                 r.misleads = fact(6);
                 r.equivalent = fact(7);
+                r.meets_blocker = fact(8);
                 let ruled = ruling(&cfg, &lens, &r);
                 cases += 1;
                 let real = r.relevant && !r.equivalent && severity != Severity::Rejected;
@@ -3355,8 +3388,10 @@ lenses:
                 if !real {
                     continue;
                 }
-                let raised =
-                    r.weak_pin || r.misleads || (r.pre_existing && (r.claims_fix || r.worsens));
+                let raised = r.weak_pin
+                    || r.misleads
+                    || (r.pre_existing && (r.claims_fix || r.worsens))
+                    || (r.meets_blocker && !r.pre_existing);
                 if raised {
                     assert!(rank(ruled.severity) >= 3, "{r:?} -> {ruled:?}");
                     assert!(rank(ruled.severity) >= rank(severity));
@@ -3371,7 +3406,7 @@ lenses:
                 }
             }
         }
-        assert_eq!(cases, 256 * 5);
+        assert_eq!(cases, 512 * 5);
     }
 
     #[test]
@@ -3388,11 +3423,11 @@ lenses:
             .unwrap()
             .remove(0)
         };
-        assert!(!grounded(rating(6), &changed).pre_existing);
-        assert!(grounded(rating(40), &changed).pre_existing);
+        assert!(!grounded(rating(6), &changed, None).pre_existing);
+        assert!(grounded(rating(40), &changed, None).pre_existing);
         // So a new test's flaw isn't raised as a worsened old defect.
         let cfg = plain("exception", 3, 1);
-        let ruled = ruling(&cfg, &cfg.lenses[0], &grounded(rating(6), &changed));
+        let ruled = ruling(&cfg, &cfg.lenses[0], &grounded(rating(6), &changed, None));
         assert_eq!(ruled.severity, Severity::Low);
     }
 
@@ -3416,7 +3451,7 @@ lenses:
             ))
             .unwrap()
             .remove(0);
-            grounded(r, &changed)
+            grounded(r, &changed, None)
         };
         // The test's name, quoted with or without its marks and case.
         assert!(
@@ -3454,6 +3489,54 @@ lenses:
     }
 
     #[test]
+    fn a_finding_blocks_by_the_lenss_definition_only_quoting_it() {
+        let changed = stages::changed_lines("+++ b/lib/a.dart\n@@ -1,1 +1,1 @@\n+x\n");
+        let blocker = "a wrong result, a wrong or overstated claim, or a test that passes for \
+                       the wrong reason; not style";
+        let judged = |facts: &str, def: Option<&str>| -> roles::Rating {
+            let r = roles::read_ratings(&format!(
+                r#"{{"findings": [{{"title": "t", "severity": "Low", {facts}}}]}}"#
+            ))
+            .unwrap()
+            .remove(0);
+            grounded(r, &changed, def)
+        };
+        let meets = r#""meets_blocker": true, "blocker_clause": "a wrong or overstated claim""#;
+        assert!(judged(meets, Some(blocker)).meets_blocker);
+        // No quote, words the definition doesn't have, or a lens with no
+        // definition: false.
+        assert!(!judged(r#""meets_blocker": true"#, Some(blocker)).meets_blocker);
+        assert!(
+            !judged(
+                r#""meets_blocker": true, "blocker_clause": "anything that looks untidy""#,
+                Some(blocker)
+            )
+            .meets_blocker
+        );
+        assert!(!judged(meets, None).meets_blocker);
+        // Meeting it raises a Low to High, so it blocks; a defect that was
+        // there before the change stays logged.
+        let cfg = plain("exception", 3, 1);
+        let ruled = ruling(&cfg, &cfg.lenses[0], &judged(meets, Some(blocker)));
+        assert_eq!(ruled.severity, Severity::High);
+        let old = judged(&format!("{meets}, \"pre_existing\": true"), Some(blocker));
+        assert_eq!(
+            ruling(&cfg, &cfg.lenses[0], &old).action,
+            Action::NeverBlocks
+        );
+        // The Judge and the reviewers are given the definition; without
+        // one, neither is asked about it.
+        let mut lens = cfg.lenses[0].clone();
+        lens.blocker = Some(blocker.into());
+        let prompt = roles::judge_prompt(&lens, &[Vec::new()], "").unwrap();
+        assert!(prompt.contains(blocker) && prompt.contains("\"blocker_clause\""));
+        let plain_prompt = roles::judge_prompt(&cfg.lenses[0], &[Vec::new()], "").unwrap();
+        assert!(!plain_prompt.contains("meets_blocker"));
+        let review = roles::reviewer_prompt(&lens, "the change", "", false, "");
+        assert!(review.contains(&format!("What blocks here: {blocker}")));
+    }
+
+    #[test]
     fn a_calibration_fingerprints_every_rule() {
         let rules = rules_source();
         for f in [
@@ -3461,6 +3544,8 @@ lenses:
             "fn grounded(",
             "fn changed_lines(",
             "fn adds_text(",
+            "fn quotes_text(",
+            "fn quote_parts(",
         ] {
             assert!(
                 rules.contains(f),

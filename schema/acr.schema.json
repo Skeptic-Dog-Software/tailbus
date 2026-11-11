@@ -44,6 +44,7 @@
           "id": {"$ref": "#/$defs/id"},
           "criteria": {"type": "string", "description": "What's wrong, in this lens"},
           "attack": {"type": "string", "description": "How to attack in this lens: the techniques that find what the criteria call wrong"},
+          "blocker": {"type": "string", "description": "What blocks in this lens: its dimension's definition of a blocker, set when the repository is calibrated. Reviewers and the Judge get it, and a finding the Judge shows meets it blocks"},
           "triggers": {
             "type": "object",
             "additionalProperties": false,
