@@ -34,6 +34,9 @@ const SCORER_MODEL: &str = "claude-sonnet-5-5";
 /// Caps a trial should never reach: a whole review can take a while.
 const BUILDER_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 const SCORER_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Scorer sessions tried before a run is saved unscored. One reply that
+/// isn't JSON, a garbled one cut off, say, shouldn't cost the review.
+const SCORER_TRIES: usize = 2;
 
 /// What a change's in-session review found, as its builder ruled.
 #[derive(Debug, Clone, Deserialize)]
@@ -204,9 +207,9 @@ pub struct Outcome {
     pub tokens: Counts,
     /// The models the design's calls ran on.
     pub models: Vec<String>,
-    /// Against the key. None until the key has findings: a change reviewed
-    /// before anyone knew what was wrong with it is scored later, with
-    /// `tailbus acr rescore`.
+    /// Against the key. None until the key has findings, or when the
+    /// scorer failed (`failures` says so): either way the run is scored
+    /// later, with `tailbus acr rescore`.
     #[serde(default)]
     pub score: Option<Score>,
     pub findings: Vec<Found>,
@@ -776,9 +779,20 @@ fn builder_led(paths: &Paths, s: &Scratch, key: &Key, arm: Arm) -> Result<Ran> {
     })
 }
 
+/// The first of up to `tries` attempts that works, or the last one's error.
+/// Each attempt is told its number.
+fn first_ok<T>(tries: usize, mut attempt: impl FnMut(usize) -> Result<T>) -> Result<T> {
+    let mut last = None;
+    for n in 1..=tries {
+        match attempt(n) {
+            Ok(value) => return Ok(value),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no attempt was made")))
+}
+
 fn score(paths: &Paths, dir: &Path, key: &Key, found: &[Found]) -> Result<Score> {
-    let config = dir.join("scorer");
-    fs::create_dir_all(&config)?;
     let keyed: Vec<Value> = key
         .findings
         .iter()
@@ -810,19 +824,29 @@ fn score(paths: &Paths, dir: &Path, key: &Key, found: &[Found]) -> Result<Score>
         key = serde_json::to_string_pretty(&keyed)?,
         review = serde_json::to_string_pretty(&numbered)?,
     );
-    let answer = claude(
-        paths,
-        &config,
-        dir,
-        &Ask {
-            model: SCORER_MODEL,
-            effort: "high",
-            tools: "Read",
-            prompt: &prompt,
-            limit: SCORER_TIMEOUT,
-        },
-    )?;
-    let value = last_json(&answer).context("the scorer's answer isn't JSON")?;
+    // Each try is a session of its own, so a reply gone wrong isn't in the
+    // next one's context.
+    let value = first_ok(SCORER_TRIES, |n| {
+        let config = match n {
+            1 => dir.join("scorer"),
+            n => dir.join(format!("scorer-{n}")),
+        };
+        fs::create_dir_all(&config)?;
+        let answer = claude(
+            paths,
+            &config,
+            dir,
+            &Ask {
+                model: SCORER_MODEL,
+                effort: "high",
+                tools: "Read",
+                prompt: &prompt,
+                limit: SCORER_TIMEOUT,
+            },
+        )?;
+        last_json(&answer).context("the scorer's answer isn't JSON")
+    })
+    .with_context(|| format!("the scorer failed {SCORER_TRIES} times"))?;
     let mut per_finding = Vec::new();
     for f in &key.findings {
         let row = value["key"]
@@ -1072,11 +1096,20 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, pipeline: Pipeline) -> Resu
         None => None,
     };
     let seconds = started.elapsed().as_secs();
+    let mut failures = ran.failures;
     // New work has no findings yet: it's scored once its own review is done.
     let score = if key.findings.is_empty() {
         None
     } else {
-        Some(score(paths, &s.dir, &key, &ran.findings).map_err(|e| s.failed(paths, e))?)
+        match score(paths, &s.dir, &key, &ran.findings) {
+            Ok(score) => Some(score),
+            // The review is what cost the tokens, so it's saved unscored,
+            // for `rescore`, rather than lost with the scorer.
+            Err(e) => {
+                failures.push(unscored(&e, s.keep(paths).as_deref(), key_path));
+                None
+            }
+        }
     };
     Ok(Outcome {
         key: key_name(key_path),
@@ -1087,10 +1120,27 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, pipeline: Pipeline) -> Resu
         models: ran.models,
         score,
         findings: ran.findings,
-        failures: ran.failures,
+        failures,
         notes: ran.notes,
         converged,
     })
+}
+
+/// Says a run wasn't scored, why, where the scorer's sessions are kept, and
+/// how to score it.
+fn unscored(e: &anyhow::Error, kept: Option<&Path>, key_path: &Path) -> String {
+    let kept = kept
+        .map(|k| {
+            format!(
+                " (its sessions are kept in {} for {KEPT_DAYS} days)",
+                k.display()
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "not scored: {e:#}{kept}; score it with `tailbus acr rescore {} --results <file>`",
+        key_path.display()
+    )
 }
 
 /// What's checked for, in a final version: a defect someone found in an
@@ -1601,6 +1651,42 @@ mod tests {
         assert_eq!(value["tokens_by_round"][3], 2);
         let back: Outcome = serde_json::from_str(&line).unwrap();
         assert!(back.converged.is_some_and(|c| c.converged && c.run == "r1"));
+    }
+
+    #[test]
+    fn a_scorer_that_fails_is_tried_again_and_then_leaves_the_run_unscored() {
+        // The second try's answer is used.
+        let mut tried = Vec::new();
+        let got = first_ok(SCORER_TRIES, |n| {
+            tried.push(n);
+            if n == 1 {
+                bail!("the scorer's answer isn't JSON")
+            }
+            Ok(n)
+        })
+        .unwrap();
+        assert_eq!((got, tried), (2, vec![1, 2]));
+        // Every try failing gives the last error, and the run is saved with
+        // a note saying how to score it.
+        let mut tried = 0;
+        let err = first_ok::<()>(SCORER_TRIES, |n| {
+            tried += 1;
+            bail!("try {n} isn't JSON")
+        })
+        .unwrap_err();
+        assert_eq!(tried, SCORER_TRIES);
+        assert!(err.to_string().contains("try 2"), "{err}");
+        let note = unscored(
+            &err.context("the scorer failed 2 times"),
+            Some(Path::new("/kept/x")),
+            Path::new("/b/k.yaml"),
+        );
+        assert!(
+            note.starts_with("not scored: the scorer failed 2 times: try 2 isn't JSON")
+                && note.contains("/kept/x")
+                && note.contains("tailbus acr rescore /b/k.yaml --results"),
+            "{note}"
+        );
     }
 
     #[test]
