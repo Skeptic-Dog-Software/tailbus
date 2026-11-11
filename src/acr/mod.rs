@@ -193,6 +193,11 @@ pub enum AcrCmd {
         /// Add each result, as a line of JSON, to this file too.
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
+        /// End a pipeline design's run at its first failure: a reviewer,
+        /// Judge or stage that didn't finish its work, or a brief that
+        /// couldn't be written. What its sessions left is kept.
+        #[arg(long)]
+        stop_on_failure: bool,
     },
     /// Check that a trial on this key can run, before spending one on it.
     /// A session is started as a builder is, and one through each bridge and
@@ -730,6 +735,7 @@ fn setting<'a>(
         work_dir: dir,
         description: None,
         converge: false,
+        stop_on_failure: false,
         copies: Some(copies_root(paths)),
         builder_brief: None,
     })
@@ -1163,7 +1169,12 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 results.display()
             );
         }
-        AcrCmd::Trial { key, arm, out } => {
+        AcrCmd::Trial {
+            key,
+            arm,
+            out,
+            stop_on_failure,
+        } => {
             let arms = match arm {
                 Some(arm) => vec![arm],
                 None => vec![
@@ -1172,7 +1183,9 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                     trial::Arm::Separated,
                 ],
             };
-            let pipeline = |tree: &Path, key: &trial::Key, arm| pipeline_arm(paths, tree, key, arm);
+            let pipeline = |tree: &Path, key: &trial::Key, arm| {
+                pipeline_arm(paths, tree, key, arm, stop_on_failure)
+            };
             for arm in arms {
                 let outcome = trial::run(paths, &key, arm, &pipeline)?;
                 let line = serde_json::to_string(&outcome)?;
@@ -1378,7 +1391,7 @@ pub const STEELMAN_BINDING: &str = "steelman";
 /// One round of the pipeline, as a change first comes out, with nobody
 /// fixing anything and escalations taken as seen. Leaves nothing behind.
 fn one_round(paths: &Paths, target: &Target, description: Option<String>) -> Result<Run> {
-    pipeline_run(paths, target, description, false, false)
+    pipeline_run(paths, target, description, false, false, false)
 }
 
 /// The pipeline with nobody in the loop: one round, or to convergence. An
@@ -1389,6 +1402,7 @@ fn pipeline_run(
     description: Option<String>,
     converge: bool,
     keep_logs: bool,
+    stop_on_failure: bool,
 ) -> Result<Run> {
     let mut flags = flags(target);
     flags.max_rounds = Some(if converge { CONVERGE_CAP } else { 1 });
@@ -1412,6 +1426,7 @@ fn pipeline_run(
     let mut s = setting(paths, &cfg, &id, Some(list))?;
     s.description = description;
     s.converge = converge;
+    s.stop_on_failure = stop_on_failure;
     s.builder_brief = target
         .brief
         .as_deref()
@@ -1509,6 +1524,7 @@ fn pipeline_arm(
     tree: &Path,
     key: &trial::Key,
     arm: trial::Arm,
+    stop_on_failure: bool,
 ) -> Result<trial::Ran> {
     let converge = arm == trial::Arm::Converge;
     let target = Target {
@@ -1549,7 +1565,14 @@ fn pipeline_arm(
     }
     // The key's context, frozen before any review, stands in for the pull
     // request's description, which may have changed since.
-    let run = pipeline_run(paths, &target, Some(key.context.clone()), converge, true)?;
+    let run = pipeline_run(
+        paths,
+        &target,
+        Some(key.context.clone()),
+        converge,
+        true,
+        stop_on_failure,
+    )?;
     drop(allowed);
     let mut found = Vec::new();
     let mut failures: Vec<String> = run.escalations.iter().map(|e| e.reason.clone()).collect();

@@ -338,6 +338,10 @@ pub struct Setting<'a> {
     /// since a fix for one can break another. It ends when one round, on one
     /// version of the change, has no blocker in any lens.
     pub converge: bool,
+    /// End the run at the first failure: a reviewer, Judge or stage that
+    /// didn't finish its work, or a brief that couldn't be written. Without
+    /// it, a failure is recorded and the run goes on without that work.
+    pub stop_on_failure: bool,
     /// Where a reviewer whose binding can change files gets a copy of the
     /// checkout of its own, for the round. Without it, every reviewer works
     /// in the checkout.
@@ -1980,38 +1984,78 @@ pub fn drive(
     run.status = Status::Running;
     run.waiting = None;
     loop {
-        if unseen(run) {
-            pause(run, Gate::Escalation);
+        let known = failures(run).len();
+        let stepped = step(run, s, caller, reload)?;
+        if s.stop_on_failure {
+            let now = failures(run);
+            if now.len() > known {
+                run.status = Status::Stopped;
+                bail!(
+                    "stopped at the first failure, as asked:\n- {}",
+                    now[known..].join("\n- ")
+                );
+            }
+        }
+        if !stepped {
             return Ok(());
         }
-        match run.stage {
-            Stage::Scope => {
-                pause(run, Gate::Scope);
-                return Ok(());
-            }
-            Stage::Review => {
-                let fixed = run.lenses.values().any(|l| !l.done.is_empty());
-                review_round(run, s, &reload(fixed)?, caller)?;
-            }
-            Stage::Decide => {
-                pause(run, Gate::Fold);
-                return Ok(());
-            }
-            Stage::Fix => fix(run, s, caller, reload)?,
-            Stage::Final => {
-                pause(run, Gate::Final);
-                return Ok(());
-            }
-            Stage::Done => {
-                run.status = if all_settled(run) && !run.lenses.is_empty() {
-                    Status::Confirmed
-                } else {
-                    Status::Stopped
-                };
-                return Ok(());
+    }
+}
+
+/// Everything that didn't finish its work in a run so far, lens by lens and
+/// round by round: what `stop_on_failure` stops at.
+pub fn failures(run: &Run) -> Vec<String> {
+    let mut out = Vec::new();
+    for lens in run.lenses.values() {
+        for round in &lens.rounds {
+            let notes = round.notes.iter().filter(|n| n.starts_with("no brief:"));
+            for f in round.failures.iter().chain(notes) {
+                out.push(format!("{}, round {}: {f}", lens.id, round.round));
             }
         }
     }
+    out
+}
+
+/// One step of a run: false once it waits for a person or is done.
+fn step(
+    run: &mut Run,
+    s: &Setting,
+    caller: &dyn Caller,
+    reload: &dyn Fn(bool) -> Result<Change>,
+) -> Result<bool> {
+    if unseen(run) {
+        pause(run, Gate::Escalation);
+        return Ok(false);
+    }
+    match run.stage {
+        Stage::Scope => {
+            pause(run, Gate::Scope);
+            return Ok(false);
+        }
+        Stage::Review => {
+            let fixed = run.lenses.values().any(|l| !l.done.is_empty());
+            review_round(run, s, &reload(fixed)?, caller)?;
+        }
+        Stage::Decide => {
+            pause(run, Gate::Fold);
+            return Ok(false);
+        }
+        Stage::Fix => fix(run, s, caller, reload)?,
+        Stage::Final => {
+            pause(run, Gate::Final);
+            return Ok(false);
+        }
+        Stage::Done => {
+            run.status = if all_settled(run) && !run.lenses.is_empty() {
+                Status::Confirmed
+            } else {
+                Status::Stopped
+            };
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Applies a person's answer at a gate.
@@ -2391,6 +2435,7 @@ lenses:
             work_dir: std::env::temp_dir().join(format!("tb-acr-run-{}", new_id())),
             description: None,
             converge: false,
+            stop_on_failure: false,
             copies: None,
             builder_brief: None,
         }
@@ -3253,6 +3298,48 @@ lenses:
             assert_eq!(run.lenses["beta"].outcome, Outcome::Confirmed);
             assert!(run.escalations[0].reason.contains("wasn't fully reviewed"));
         }
+    }
+
+    #[test]
+    fn stop_on_failure_ends_the_run_at_the_first_reviewer_or_judge_failure() {
+        let cfg = plain("exception", 3, 1);
+        let mut s = setting(&cfg);
+        s.stop_on_failure = true;
+        let c = change(&["a.src"]);
+        let reviewer = Fake::new(|role, prompt: &str| match role {
+            Role::Reviewer if prompt.contains("alpha") => bail!("the bridge is down"),
+            Role::Reviewer => Ok(CLEAN.into()),
+            _ => Ok(NOTHING.into()),
+        });
+        let judge = Fake::new(|role, _: &str| match role {
+            Role::Reviewer => Ok(ONE.into()),
+            Role::Judge => Ok("couldn't say".into()),
+            _ => Ok(NOTHING.into()),
+        });
+        let stops = |fake: &dyn Caller, says: &str| {
+            let mut run = start("r", Path::new("."), "main", None, &s, &c, fake).unwrap();
+            let err = drive(&mut run, &s, fake, &|_| Ok(c.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with("stopped at the first failure") && err.contains(says),
+                "{err}"
+            );
+            assert_eq!(run.status, Status::Stopped);
+            assert!(
+                run.lenses.values().all(|l| l.rounds.len() == 1),
+                "no round after the failure"
+            );
+        };
+        stops(&reviewer, "the bridge is down");
+        stops(&judge, "the Judge");
+        // Without it, the same failure is recorded and the run goes on to
+        // a person.
+        s.stop_on_failure = false;
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &reviewer).unwrap();
+        drive(&mut run, &s, &reviewer, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.waiting, Some(Gate::Escalation));
+        assert!(failures(&run)[0].contains("alpha, round 1: "));
     }
 
     #[test]

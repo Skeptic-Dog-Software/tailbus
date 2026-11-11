@@ -595,7 +595,7 @@ on. Models are called only for judgment.
 | `tailbus acr carry --name <name> [--base <path>] --head <path>` | Carry work that isn't code, such as a design or a document, into a git repository ACR can review: the version before the work, if there is one, and the version to review, each a file or folder of text. |
 | `tailbus acr calibration [--repo <path>] [--accept]` | Where a repository's calibration stands. `--accept` accepts it, once it has two runs on the current config and Judge and you've read where they disagree. |
 | `tailbus acr residual <key> --patch <file> \| --commit <rev> [--also <results>]` | Whether the key's findings, and the blockers a saved run upheld, are still present in a final version: the key's head with a patch, or another commit, such as what was merged. Check both sides against the same list. |
-| `tailbus acr trial <key> --arm <design>` | Review the key's change blind, in a copy holding only its head's history, and score the result against the key. |
+| `tailbus acr trial <key> --arm <design>` | Review the key's change blind, in a copy holding only its head's history, and score the result against the key. `--stop-on-failure` ends the run at the first reviewer, Judge or stage that doesn't finish its work, keeping what its sessions left. |
 
 **What the change is for.** Every role gets, ahead of the diff, what the
 change says about itself: its description, from `--description <file>` or a
