@@ -872,6 +872,22 @@ information: names, hosts and other private details were replaced or
 removed throughout, so earlier commits don't show the code exactly as it
 was.
 
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
+
 ## Develop
 
 ```sh
@@ -879,9 +895,6 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
-
-CI runs these on the org's self-hosted runner, which isn't a Mac, so run
-them on a Mac before pushing.
 
 This repository is the tailbus program: `src/main.rs` names it and adds
 Tailscale (`src/tailscale.rs`) as its network. Everything else, the bus,
