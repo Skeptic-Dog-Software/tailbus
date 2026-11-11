@@ -294,6 +294,14 @@ pub struct Rating {
     /// ship a defect or skip a test.
     #[serde(default, deserialize_with = "lenient::flag")]
     pub misleads: bool,
+    /// For `weak_pin`, the test's name as the change writes it. The rules
+    /// hold the fact only when the change adds that text.
+    #[serde(default, deserialize_with = "lenient::strings")]
+    pub weak_pin_test: Vec<String>,
+    /// For `misleads`, the claim's own words, quoted from the change. The
+    /// rules hold the fact only when the change adds that text.
+    #[serde(default, deserialize_with = "lenient::strings")]
+    pub misleading_claim: Vec<String>,
     /// A deliberate break of the code, a mutant, that changes nothing a
     /// user or caller could see. Only ever about a mutant.
     #[serde(
@@ -340,7 +348,9 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          defect worse; `weak_pin`, it's a test the change adds or changes that can't fail when \
          what it's there to pin breaks; `misleads`, it's a claim the change makes, in a \
          comment, doc, ledger line or test name, that would lead someone relying on it to ship \
-         a defect or skip a test; `equivalent_mutant`, only for a deliberate break of the code \
+         a defect or skip a test; with `weak_pin` give the test's name in `weak_pin_test`, \
+         and with `misleads` the claim's exact words in `misleading_claim`, both copied from \
+         lines the change adds: a fact without its quote counts as false; `equivalent_mutant`, only for a deliberate break of the code \
          (a mutant) that the tests passed: true if that break changes nothing a user or caller \
          could see, and false for every other finding. Fixed rules decide from these facts what \
          blocks: rate the severity for what the defect costs on its own.\n\n\
@@ -350,8 +360,8 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          The reviewers' findings, one list each:\n{findings}\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\", \"detail\", \"file\", \"line\", \
          \"severity\", \"real_defect\", \"on_task\", \"reason\", \"split\", \"values_call\", \
-         \"sides\", \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \"misleads\", \
-         \"equivalent_mutant\"}}]}}.",
+         \"sides\", \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \"weak_pin_test\", \
+         \"misleads\", \"misleading_claim\", \"equivalent_mutant\"}}]}}.",
         n = reviews.len(),
         id = lens.id,
         criteria = lens.criteria,
@@ -474,6 +484,7 @@ mod tests {
         let prompt = judge_prompt(&lens, &[Vec::new()], "").unwrap();
         assert!(prompt.contains("It blocks when the tests claim the behaviour is covered."));
         assert!(prompt.contains("`weak_pin`"));
+        assert!(prompt.contains("a fact without its quote counts as false"));
         assert!(prompt.contains("`pre_existing`"));
         assert!(prompt.contains("Fixed rules decide from these facts"));
     }

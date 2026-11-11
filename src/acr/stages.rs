@@ -1086,10 +1086,11 @@ pub struct Gap {
 }
 
 /// The lines a change adds, by file.
-pub type ChangedLines = std::collections::BTreeMap<String, std::collections::BTreeSet<u64>>;
+pub type ChangedLines = std::collections::BTreeMap<String, std::collections::BTreeMap<u64, String>>;
 
-/// The lines a diff adds, by file, leaving out ones it only moves: a line
-/// whose text the diff also removes somewhere is old code in a new place.
+/// The lines a diff adds, by file and number, with their text, leaving out
+/// ones it only moves: a line whose text the diff also removes somewhere is
+/// old code in a new place.
 pub fn changed_lines(diff: &str) -> ChangedLines {
     let removed: std::collections::BTreeSet<&str> = diff
         .lines()
@@ -1100,10 +1101,59 @@ pub fn changed_lines(diff: &str) -> ChangedLines {
     let mut lines: ChangedLines = Default::default();
     for (f, n, text) in added_lines(diff) {
         if !removed.contains(text.trim()) {
-            lines.entry(f).or_default().insert(n);
+            lines.entry(f).or_default().insert(n, text);
         }
     }
     lines
+}
+
+/// Whether the change adds these words: a quote from it, found in one
+/// file's added lines read as a single text, with comment markers, quote
+/// marks, case and spacing evened out. A quote can skip words with "...",
+/// and one too short to tell apart from any other line never matches.
+pub fn adds_text(changed: &ChangedLines, quote: &str) -> bool {
+    let parts: Vec<String> = quote
+        .split("...")
+        .flat_map(|p| p.split('\u{2026}'))
+        .map(plain_words)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.iter().map(|p| p.chars().count()).sum::<usize>() < 8 {
+        return false;
+    }
+    changed.values().any(|lines| {
+        let text = plain_words(
+            &lines
+                .values()
+                .map(|l| uncommented(l))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        parts.iter().all(|p| text.contains(p.as_str()))
+    })
+}
+
+fn uncommented(line: &str) -> &str {
+    let line = line.trim_start();
+    ["///", "//!", "//", "/**", "/*", "<!--", "--", "#", "*"]
+        .iter()
+        .find_map(|m| line.strip_prefix(m))
+        .unwrap_or(line)
+}
+
+fn plain_words(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\'' | '"' | '`' | '\\' | '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}'
+            )
+        })
+        .collect::<String>()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether a mutant breaks a line the change adds, and is set against a
@@ -1121,7 +1171,7 @@ fn in_the_change(repo: &Path, m: &Mutant, diff: &str) -> bool {
     };
     let first = text[..at].matches('\n').count() as u64 + 1;
     let last = first + m.find.matches('\n').count() as u64;
-    let touched = (first..=last).any(|n| lines.contains(&n));
+    let touched = (first..=last).any(|n| lines.contains_key(&n));
     let own = changed_tests(diff);
     touched && m.tests.iter().any(|t| own.contains(t))
 }

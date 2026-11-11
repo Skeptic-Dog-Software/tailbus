@@ -1391,14 +1391,20 @@ impl Ruled {
     }
 }
 
-/// A fact the diff settles, whatever the Judge said: a finding in a line the
-/// change adds isn't pre-existing.
+/// Facts the diff settles, whatever the Judge said: a finding in a line the
+/// change adds isn't pre-existing, and a weak pin or a misleading claim
+/// holds only when its quote is something the change adds.
 pub(super) fn grounded(mut r: roles::Rating, changed: &stages::ChangedLines) -> roles::Rating {
     if let (Some(file), Some(line)) = (r.file.as_deref(), r.line)
-        && changed.get(file).is_some_and(|lines| lines.contains(&line))
+        && changed
+            .get(file)
+            .is_some_and(|lines| lines.contains_key(&line))
     {
         r.pre_existing = false;
     }
+    let quoted = |quotes: &[String]| quotes.iter().any(|q| stages::adds_text(changed, q));
+    r.weak_pin = r.weak_pin && quoted(&r.weak_pin_test);
+    r.misleads = r.misleads && quoted(&r.misleading_claim);
     r
 }
 
@@ -3351,7 +3357,7 @@ lenses:
             "+++ b/test/a_test.dart\n@@ -3,1 +5,3 @@\n-moved();\n+x\n+y\n+  moved();\n",
         );
         // A line the diff only moves isn't new.
-        assert!(!changed["test/a_test.dart"].contains(&7));
+        assert!(!changed["test/a_test.dart"].contains_key(&7));
         let rating = |line: u64| -> roles::Rating {
             roles::read_ratings(&format!(
                 r#"{{"findings": [{{"title": "t", "severity": "Low", "file": "test/a_test.dart", "line": {line}, "pre_existing": true, "worsens": true}}]}}"#
@@ -3365,6 +3371,63 @@ lenses:
         let cfg = plain("exception", 3, 1);
         let ruled = ruling(&cfg, &cfg.lenses[0], &grounded(rating(6), &changed));
         assert_eq!(ruled.severity, Severity::Low);
+    }
+
+    #[test]
+    fn a_weak_pin_or_misleading_claim_holds_only_with_a_quote_the_change_adds() {
+        let changed = stages::changed_lines(
+            &[
+                "+++ b/test/edit_test.dart",
+                "@@ -1,2 +1,4 @@",
+                "-  // old words that were here before",
+                "+  testWidgets('an edit keeps the rest of it', (t) async {",
+                "+  // Notices for the old date are",
+                "+  // cancelled when the date moves.",
+                "   unchanged context line about a claim",
+            ]
+            .join("\n"),
+        );
+        let judged = |facts: &str| -> roles::Rating {
+            let r = roles::read_ratings(&format!(
+                r#"{{"findings": [{{"title": "t", "severity": "Low", {facts}}}]}}"#
+            ))
+            .unwrap()
+            .remove(0);
+            grounded(r, &changed)
+        };
+        // The test's name, quoted with or without its marks and case.
+        assert!(
+            judged(r#""weak_pin": true, "weak_pin_test": "An edit keeps the rest of it""#).weak_pin
+        );
+        // A claim over two comment lines, and one that skips words.
+        assert!(
+            judged(
+                r#""misleads": true, "misleading_claim": "notices for the old date are cancelled""#
+            )
+            .misleads
+        );
+        assert!(
+            judged(r#""misleads": true, "misleading_claim": ["old date ... when the date moves"]"#)
+                .misleads
+        );
+        // No quote, a quote the change doesn't add, or one too short: false.
+        assert!(!judged(r#""weak_pin": true"#).weak_pin);
+        assert!(
+            !judged(r#""misleads": true, "misleading_claim": "old words that were here before""#)
+                .misleads
+        );
+        assert!(
+            !judged(r#""misleads": true, "misleading_claim": "unchanged context line""#).misleads
+        );
+        assert!(!judged(r#""weak_pin": true, "weak_pin_test": "edit""#).weak_pin);
+        // So the rules raise only what the change itself says.
+        let cfg = plain("exception", 3, 1);
+        let raised = |facts: &str| ruling(&cfg, &cfg.lenses[0], &judged(facts)).severity;
+        assert_eq!(raised(r#""misleads": true"#), Severity::Low);
+        assert_eq!(
+            raised(r#""misleads": true, "misleading_claim": "cancelled when the date moves""#),
+            Severity::High
+        );
     }
 
     #[test]
