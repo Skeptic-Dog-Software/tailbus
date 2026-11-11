@@ -588,19 +588,32 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The answer `agent` got to its message `id`, if it has one.
+    /// The answer `agent` got to its message `id`, if it has one. A
+    /// progress note on it isn't one.
     pub fn reply_for(&self, agent: &str, id: &str) -> Result<Option<Incoming>> {
         Ok(self
-            .db
-            .query_row(
-                &format!(
-                    "SELECT {INCOMING} FROM inbox WHERE agent = ?1 AND reply_to = ?2
-                     ORDER BY seq LIMIT 1"
-                ),
-                [agent, id],
-                incoming,
-            )
-            .optional()?)
+            .replies(agent, id)?
+            .into_iter()
+            .find(|m| !m.msg.is_progress()))
+    }
+
+    /// The latest progress note `agent` got on its message `id`.
+    pub fn latest_progress(&self, agent: &str, id: &str) -> Result<Option<Incoming>> {
+        Ok(self
+            .replies(agent, id)?
+            .into_iter()
+            .rev()
+            .find(|m| m.msg.is_progress()))
+    }
+
+    /// Everything `agent` got that answers or updates its message `id`,
+    /// oldest first.
+    fn replies(&self, agent: &str, id: &str) -> Result<Vec<Incoming>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {INCOMING} FROM inbox WHERE agent = ?1 AND reply_to = ?2 ORDER BY seq"
+        ))?;
+        let rows = stmt.query_map([agent, id], incoming)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn incoming(&self, id: &str) -> Result<Option<Incoming>> {

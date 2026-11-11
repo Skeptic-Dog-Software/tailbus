@@ -72,6 +72,10 @@ enum Cmd {
         /// otherwise.
         #[arg(long, conflicts_with = "expects_reply")]
         no_reply: bool,
+        /// A progress note on the request `--reply-to` names, which you're
+        /// still working on: it shows under the request without answering it.
+        #[arg(long, requires = "reply_to", conflicts_with = "expects_reply")]
+        progress: bool,
     },
     /// Send a request, wait for its reply, print it, and exit with its status.
     Call {
@@ -429,6 +433,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             reply_to,
             expects_reply,
             no_reply,
+            progress,
         } => {
             let expects_reply = match (expects_reply, no_reply) {
                 (true, _) => Some(true),
@@ -446,9 +451,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 Some(text) => text.to_string(),
             };
-            let sent: Sent = local::call(
-                &socket,
-                &Request::Send {
+            let request = match reply_to {
+                Some(reply_to) if progress => Request::Progress {
+                    agent: agent_name(cli.agent)?,
+                    reply_to,
+                    body,
+                },
+                reply_to => Request::Send {
                     agent: agent_name(cli.agent)?,
                     to,
                     body,
@@ -457,7 +466,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     pipe: None,
                     ext: None,
                 },
-            )?;
+            };
+            let sent: Sent = local::call(&socket, &request)?;
             println!("{}", format::sent(&sent));
         }
         Cmd::Recv {

@@ -141,6 +141,14 @@ pub enum Request {
     },
     /// The messages just received were handed on.
     Confirm,
+    /// A progress note on a request `agent` was sent and hasn't answered.
+    /// Its own request, so a daemon too old to know it says no rather than
+    /// taking it as the answer.
+    Progress {
+        agent: String,
+        reply_to: String,
+        body: String,
+    },
     Ack {
         agent: String,
         id: String,
@@ -378,6 +386,16 @@ pub struct Item {
     /// Sent: why it failed, or why it's still queued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Sent and still open: the latest progress note on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Progress>,
+}
+
+/// A progress note's time and text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Progress {
+    pub at: i64,
+    pub body: String,
 }
 
 impl From<Incoming> for Item {
@@ -395,6 +413,7 @@ impl From<Incoming> for Item {
             state: state.into(),
             owner: Some(m.owner),
             note: None,
+            progress: None,
         }
     }
 }
@@ -407,6 +426,7 @@ impl From<Outgoing> for Item {
             state: m.state.as_str().into(),
             owner: None,
             note: m.error,
+            progress: None,
         }
     }
 }

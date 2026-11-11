@@ -747,7 +747,9 @@ impl Bus {
             .into_iter()
             .filter(|m| !live.in_flight.contains(&m.msg.id))
             .filter(|m| {
-                let answers = m.msg.reply_to.as_ref();
+                // An answer goes to the call waiting on it. A progress note
+                // isn't one, so it comes here.
+                let answers = m.msg.reply_to.as_ref().filter(|_| !m.msg.is_progress());
                 !answers.is_some_and(|r| live.awaited.contains(r))
             })
             .take(max)
@@ -1190,6 +1192,38 @@ impl Bus {
         self.send_draft(from, to, body, draft)
     }
 
+    /// A progress note goes only on a request `from` was sent, not yet
+    /// answered: it says how the work is going, and the answer still comes.
+    fn check_progress(
+        &self,
+        from: &str,
+        reply_to: Option<&str>,
+        expects_reply: bool,
+        piped: bool,
+    ) -> Result<()> {
+        let Some(r) = reply_to else {
+            bail!("a progress note needs reply_to: the id of the request it's about");
+        };
+        if piped {
+            bail!("a /pipe step can't be a progress note");
+        }
+        if expects_reply {
+            bail!("a progress note asks nothing back: leave expects_reply off");
+        }
+        match self.db().incoming(r)? {
+            Some(m) if name_part(&m.msg.to) == from && m.msg.expects_reply => {
+                if m.acked_at.is_some() {
+                    bail!(
+                        "{r} is already answered or handled: a progress note goes on an open request"
+                    );
+                }
+                Ok(())
+            }
+            Some(_) => bail!("{r} isn't a request to {from}: a progress note goes on one"),
+            None => bail!("{from} has no request {r} to send progress on"),
+        }
+    }
+
     pub fn send_draft(&self, from: &str, to: &str, body: String, draft: Draft) -> Result<Sent> {
         let Draft {
             reply_to,
@@ -1218,6 +1252,11 @@ impl Bus {
         {
             bail!("{r:?} isn't a message ID");
         }
+        let progress = ext.as_ref().is_some_and(|e| e.progress);
+        if progress {
+            self.check_progress(from, reply_to.as_deref(), expects_reply, pipe.is_some())?;
+        }
+        let expects_reply = expects_reply && !progress;
         let mut to = to.trim().to_string();
         let mut body = body;
         let mut pipe = pipe;
@@ -1269,8 +1308,9 @@ impl Bus {
             self.stop_awaiting(&msg.id);
         }
         let (state, warning) = dispatched?;
-        // A reply acknowledges the message it answers.
-        if let Some(r) = &msg.reply_to {
+        // A reply acknowledges the message it answers. A progress note
+        // leaves it open.
+        if let Some(r) = msg.reply_to.as_ref().filter(|_| !progress) {
             let acked = self.db().ack(from, r, now)?;
             if let Acked::Now { sender } = acked {
                 self.receipt(&sender, r, SendState::Acknowledged)?;
@@ -2024,7 +2064,15 @@ impl Bus {
             outgoing: db
                 .open_outgoing(agent, now_ms() - DAY_MS)?
                 .into_iter()
-                .map(Item::from)
+                .map(|o| {
+                    let latest = db.latest_progress(agent, &o.msg.id).ok().flatten();
+                    let mut item = Item::from(o);
+                    item.progress = latest.map(|p| crate::local::Progress {
+                        at: p.msg.created_at,
+                        body: p.msg.body,
+                    });
+                    item
+                })
                 .collect(),
         })
     }
@@ -3393,6 +3441,61 @@ pub(crate) mod tests {
             open.iter().map(|i| i.msg.id.as_str()).collect::<Vec<_>>(),
             ["r"]
         );
+    }
+
+    #[test]
+    fn a_progress_note_leaves_its_request_open_until_the_answer() {
+        let bus = bus();
+        bus.db().add_agent("sim", 1).unwrap();
+        let ask = bus
+            .send("api", "sim", "review #694".into(), None, None, None)
+            .unwrap();
+        let note = |body: &str, on: &str| {
+            bus.send_draft(
+                "sim",
+                "",
+                body.into(),
+                Draft {
+                    reply_to: Some(on.into()),
+                    ext: Some(Box::new(crate::proto::Extras {
+                        progress: true,
+                        ..Default::default()
+                    })),
+                    ..Draft::default()
+                },
+            )
+        };
+        let first = note("round 1 done", &ask.id).unwrap();
+        assert_eq!(first.kind, "progress");
+        // The request is still open, with its latest progress, and a wait
+        // on it isn't over.
+        let open = bus.inbox("api").unwrap().outgoing;
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].progress.as_ref().unwrap().body, "round 1 done");
+        assert!(bus.db().reply_for("api", &ask.id).unwrap().is_none());
+        // It reaches api, and wakes it.
+        let found = bus.take("api", "s1", 10, true).unwrap();
+        assert_eq!(ids(&found), [first.id.as_str()]);
+        bus.unreserve(&found);
+        // The answer closes the request, and then progress is refused.
+        let answer = bus
+            .send(
+                "sim",
+                "api",
+                "done".into(),
+                Some(ask.id.clone()),
+                None,
+                None,
+            )
+            .unwrap();
+        let replied = bus.db().reply_for("api", &ask.id).unwrap().unwrap();
+        assert_eq!(replied.msg.id, answer.id);
+        assert!(bus.inbox("api").unwrap().outgoing.is_empty());
+        let err = note("more", &ask.id).unwrap_err().to_string();
+        assert!(err.contains("already answered"), "{err}");
+        // Only on a request to the one sending it.
+        let err = note("x", &answer.id).unwrap_err().to_string();
+        assert!(err.contains("isn't a request to sim"), "{err}");
     }
 
     #[test]

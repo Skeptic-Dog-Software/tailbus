@@ -145,7 +145,7 @@ The plugin gives each session these tools:
 
 | Tool | Does |
 | --- | --- |
-| `msg_send` | Send a request, or pass `reply_to` to answer one. |
+| `msg_send` | Send a request, or pass `reply_to` to answer one. With `progress` too, it's a progress note on a request you're still working on: it shows under the request, and in its sender's open messages, without answering it. |
 | `msg_recv` | Take your next messages. |
 | `msg_wait` | Wait for a message, such as an expected reply. |
 | `msg_ack` | Mark a request handled without answering it. |
@@ -286,7 +286,7 @@ installs `~/.claude/skills/pipe`, so `/pipe` works as typed.
 
 | Command | Does |
 | --- | --- |
-| `tailbus send sim@server "text"` | Send a request. Leave out the text to read it from stdin. `--reply-to <id>` answers a message, `--no-reply` asks for nothing back, and `--expects-reply` asks back on a reply. |
+| `tailbus send sim@server "text"` | Send a request. Leave out the text to read it from stdin. `--reply-to <id>` answers a message, `--no-reply` asks for nothing back, and `--expects-reply` asks back on a reply. `--reply-to <id> --progress` sends a progress note on a request you haven't answered yet. |
 | `tailbus recv [--wait]` | Take your messages. `--json` prints one per line, for scripts. |
 | `tailbus ack <id>` | Mark a request handled. |
 | `tailbus inbox` | List what's still open. |

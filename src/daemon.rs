@@ -398,6 +398,24 @@ fn serve_one(bus: &Bus, conn: &mut Conn, req: Request) -> Result<()> {
                 await_reply(bus, conn, &agent, &id, wait_secs)?;
             }
         }
+        Request::Progress {
+            agent,
+            reply_to,
+            body,
+        } => {
+            let draft = Draft {
+                reply_to: Some(reply_to),
+                expects_reply: Some(false),
+                pipe: None,
+                ext: Some(Box::new(crate::proto::Extras {
+                    progress: true,
+                    ..Default::default()
+                })),
+                awaited: false,
+            };
+            let sent = bus.send_draft(&agent, "", body, draft)?;
+            conn.write(&sent)?;
+        }
         Request::Await {
             agent,
             id,

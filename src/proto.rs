@@ -52,6 +52,10 @@ pub struct Extras {
     /// Asks a bridge to cancel the run with this ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel: Option<String>,
+    /// A progress note on a request its sender is still working on: it
+    /// shows under the request, and doesn't answer it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub progress: bool,
 }
 
 /// What a request asks of its run. These can only narrow what the agent's
@@ -316,16 +320,23 @@ impl Message {
     /// has to go by a route an old bus turns down. A reply's result is
     /// only extra detail, and goes the old way.
     pub fn needs_new_bus(&self) -> bool {
-        self.ext
-            .as_ref()
-            .is_some_and(|e| e.options.is_some() || e.cancel.is_some() || !e.attachments.is_empty())
+        self.ext.as_ref().is_some_and(|e| {
+            e.options.is_some() || e.cancel.is_some() || !e.attachments.is_empty() || e.progress
+        })
+    }
+
+    /// An update on a request, which doesn't answer it.
+    pub fn is_progress(&self) -> bool {
+        self.ext.as_ref().is_some_and(|e| e.progress)
     }
 
     /// What it is to its recipient: a request asks for an answer, while a
-    /// response (to one of the recipient's messages) or a notice needs
-    /// nothing back.
+    /// response (to one of the recipient's messages), a progress note on
+    /// one of its requests, or a notice needs nothing back.
     pub fn kind(&self) -> &'static str {
-        if self.expects_reply {
+        if self.is_progress() {
+            "progress"
+        } else if self.expects_reply {
             "request"
         } else if self.reply_to.is_some() {
             "response"
