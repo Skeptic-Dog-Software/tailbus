@@ -587,6 +587,7 @@ on. Models are called only for judgment.
 | `tailbus acr benchmark --base <ref> --known <file>` | Run a binding set against a commit with known blockers, and report what was caught, missed and falsely found, and the cost. |
 | `tailbus acr check <key>` | Check that a trial on an answer key can run: each session starts, reads the trial's copy, is refused a file outside it, and writes where it should. |
 | `tailbus acr calibrate <key>...` | Give the pipeline's Judge each key's own findings, one dimension at a time, and count the blockers it agrees on, misses and overrates. Runs no reviewer. |
+| `tailbus acr residual <key> --patch <file> \| --commit <rev> [--also <results>]` | Whether the key's findings, and the blockers a saved run upheld, are still present in a final version: the key's head with a patch, or another commit, such as what was merged. Check both sides against the same list. |
 | `tailbus acr trial <key> --arm <design>` | Review the key's change blind, in a copy holding only its head's history, and score the result against the key. |
 
 **What the change is for.** Every role gets, ahead of the diff, what the

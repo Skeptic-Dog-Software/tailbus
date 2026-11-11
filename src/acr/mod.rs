@@ -149,6 +149,25 @@ pub enum AcrCmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Whether the defects a key's review found, and the blockers a saved
+    /// run upheld, are still present in a final version of the change: the
+    /// key's head with `--patch` (a review to convergence's), or `--commit`
+    /// (what was merged). Check both sides' final versions against the same
+    /// list to compare them on the same terms.
+    Residual {
+        key: PathBuf,
+        #[arg(long, conflicts_with = "commit")]
+        patch: Option<PathBuf>,
+        #[arg(long)]
+        commit: Option<String>,
+        /// A results file whose last line for the key adds its upheld
+        /// blockers to the list.
+        #[arg(long)]
+        also: Option<PathBuf>,
+        /// Append the result to this file, as a line of JSON.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Score saved trials of new work, once its own review has filled in the
     /// key's findings.
     Rescore {
@@ -957,6 +976,42 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                     let mut file = fs::OpenOptions::new().create(true).append(true).open(out)?;
                     std::io::Write::write_all(&mut file, format!("{result}\n").as_bytes())?;
                 }
+            }
+        }
+        AcrCmd::Residual {
+            key,
+            patch,
+            commit,
+            also,
+            out,
+        } => {
+            let mut k = trial::read_key(&key)?;
+            let name = key
+                .file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let run: Option<trial::Outcome> = match &also {
+                Some(results) => fs::read_to_string(results)?
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(|l| serde_json::from_str::<trial::Outcome>(l).ok())
+                    .rfind(|o| o.key.starts_with(name.trim_end_matches("-briefed"))),
+                None => None,
+            };
+            let defects = trial::defects(&k, run.as_ref());
+            k.patch = patch;
+            if let Some(commit) = commit {
+                k.head = commit;
+            }
+            let mut result = trial::residual(paths, k, &defects)?;
+            result["key"] = serde_json::json!(name);
+            println!(
+                "{name}: {} present ({} blockers), {} absent, {} unclear",
+                result["present"], result["present_blockers"], result["absent"], result["unclear"]
+            );
+            if let Some(out) = &out {
+                let mut file = fs::OpenOptions::new().create(true).append(true).open(out)?;
+                std::io::Write::write_all(&mut file, format!("{result}\n").as_bytes())?;
             }
         }
         AcrCmd::Rescore { key, results } => {

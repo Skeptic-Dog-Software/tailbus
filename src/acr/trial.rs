@@ -1055,6 +1055,129 @@ pub fn run(paths: &Paths, key_path: &Path, arm: Arm, pipeline: Pipeline) -> Resu
     })
 }
 
+/// What's checked for, in a final version: a defect someone found in an
+/// earlier one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Defect {
+    pub id: String,
+    pub dimension: String,
+    pub what: String,
+    /// Who found it: the key's own review, or a design.
+    pub by: String,
+    pub blocker: bool,
+}
+
+/// The defects a key's review found, and the blockers a design's saved run
+/// upheld, as one list to check final versions against.
+pub fn defects(key: &Key, run: Option<&Outcome>) -> Vec<Defect> {
+    let mut list: Vec<Defect> = key
+        .findings
+        .iter()
+        .map(|f| Defect {
+            id: f.id.clone(),
+            dimension: f.dimension.clone(),
+            what: f.what.clone(),
+            by: "the key's review".into(),
+            blocker: f.blocker,
+        })
+        .collect();
+    if let Some(run) = run {
+        for (i, f) in run.findings.iter().filter(|f| f.blocker).enumerate() {
+            list.push(Defect {
+                id: format!("{}-{}", run.arm_name(), i + 1),
+                dimension: f.dimension.clone(),
+                what: format!("{}: {}", f.title, f.detail),
+                by: format!("the {} design", run.arm_name()),
+                blocker: true,
+            });
+        }
+    }
+    list
+}
+
+impl Outcome {
+    fn arm_name(&self) -> String {
+        serde_json::to_value(self.arm)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+}
+
+/// Whether each defect is still present in a final version of the change:
+/// the key's head with a patch, or another commit, such as what was merged.
+/// One check for each dimension's defects, by a session that reads, and may
+/// run things in, a copy of that version. The same list, checked against
+/// each side's final version, compares them on the same terms.
+pub fn residual(paths: &Paths, key: Key, defects: &[Defect]) -> Result<Value> {
+    let (key, s) = copy(paths, resolved(key)?)?;
+    let mut dims: Vec<&str> = defects.iter().map(|d| d.dimension.as_str()).collect();
+    dims.sort();
+    dims.dedup();
+    let mut rows: Vec<Value> = Vec::new();
+    for (n, dim) in dims.iter().enumerate() {
+        let list: String = defects
+            .iter()
+            .filter(|d| d.dimension == *dim)
+            .map(|d| format!("- {}: {}\n", d.id, d.what.replace('\n', " ")))
+            .collect();
+        let prompt = format!(
+            "You check whether defects found in an earlier version of a change are still in \
+             it. Your working directory is the change as it stands now, at {head}, in a copy \
+             that's yours: read anything, and run what you need to settle a defect, such as \
+             one test. What the change is for:\n{context}\n\n\
+             For each defect below, decide from the code and tests as they are now: present, if \
+             it's still there; absent, if it's fixed or the code it was in is gone; unclear, if \
+             you can't tell. Give the evidence in a line or two.\n\n# Defects ({dim})\n\n\
+             {list}\n\
+             Answer with only JSON: {{\"defects\": [{{\"id\": \"\", \"status\": \
+             \"present|absent|unclear\", \"evidence\": \"\"}}]}}.",
+            head = key.head,
+            context = key.context.trim(),
+        );
+        let config = s.dir.join(format!("residual-{n}"));
+        fs::create_dir_all(&config)?;
+        let answer = claude(
+            paths,
+            &config,
+            &s.tree,
+            &Ask {
+                model: SCORER_MODEL,
+                effort: "high",
+                tools: "Read,Grep,Glob,Bash",
+                prompt: &prompt,
+                limit: SCORER_TIMEOUT,
+            },
+        )
+        .map_err(|e| s.failed(paths, e))?;
+        let value = last_json(&answer).context("the check's answer isn't JSON")?;
+        for d in defects.iter().filter(|d| d.dimension == *dim) {
+            let row = value["defects"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["id"] == d.id.as_str()));
+            rows.push(json!({
+                "id": d.id, "by": d.by, "blocker": d.blocker, "dimension": d.dimension,
+                "status": row.and_then(|r| r["status"].as_str()).unwrap_or("unchecked"),
+                "evidence": row.and_then(|r| r["evidence"].as_str()).unwrap_or(""),
+            }));
+        }
+    }
+    let count = |status: &str, blocker: Option<bool>| {
+        rows.iter()
+            .filter(|r| r["status"] == status && blocker.is_none_or(|b| r["blocker"] == b))
+            .count()
+    };
+    Ok(json!({
+        "head": key.head,
+        "patch": key.patch,
+        "present": count("present", None),
+        "present_blockers": count("present", Some(true)),
+        "absent": count("absent", None),
+        "unclear": count("unclear", None),
+        "defects": rows,
+    }))
+}
+
 /// Scores the saved runs on a key that aren't scored yet, now that the key
 /// has findings, and rewrites `results` with them in place. Other lines stay
 /// as they are. Returns how many it scored.
@@ -1175,6 +1298,55 @@ mod tests {
         let tree = s.tree.clone();
         drop(s);
         assert!(!tree.exists(), "the copy goes when the trial ends");
+    }
+
+    #[test]
+    fn one_defect_list_holds_the_keys_findings_and_a_runs_upheld_blockers() {
+        let key = Key {
+            repo: PathBuf::from("/r"),
+            pr: None,
+            base: "b".into(),
+            head: "h".into(),
+            context: "c".into(),
+            dimensions: vec!["correctness".into()],
+            findings: vec![KeyFinding {
+                id: "k1".into(),
+                blocker: true,
+                dimension: "correctness".into(),
+                what: "the lookup takes the wrong id".into(),
+                how_found: None,
+                found_later: false,
+            }],
+            patch: None,
+            every_dimension: false,
+            brief: None,
+        };
+        let found = |blocker: bool| Found {
+            dimension: "probes".into(),
+            title: "an edit saves nothing".into(),
+            detail: "the probe shows it".into(),
+            blocker,
+            ..Found::default()
+        };
+        let run = Outcome {
+            key: "k".into(),
+            pr: None,
+            arm: Arm::Converge,
+            seconds: 1,
+            tokens: Counts::default(),
+            models: Vec::new(),
+            score: None,
+            findings: vec![found(true), found(false)],
+            failures: Vec::new(),
+            notes: Vec::new(),
+            converged: None,
+        };
+        let list = defects(&key, Some(&run));
+        let ids: Vec<&str> = list.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["k1", "converge-1"]);
+        assert_eq!(list[1].by, "the converge design");
+        assert!(list[1].what.starts_with("an edit saves nothing: "));
+        assert_eq!(defects(&key, None).len(), 1);
     }
 
     #[test]
