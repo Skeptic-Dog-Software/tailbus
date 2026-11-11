@@ -191,10 +191,68 @@ tailbus acr plan --base <ref>     # tier, lenses, bindings, cost; no model calls
 checks that each one reads the copy, is refused a file outside it, and, for
 a reviewer with a shell, works in a copy of its own.
 
-## 7. Calibrate it on real work
+## 7. Calibrate before you trust its rulings
 
-A config is right when the pipeline finds what your most careful review
-finds. To measure that:
+The pipeline's Judge decides what blocks, from the facts it states about
+each finding and from each lens's criteria. Until those rulings have been
+checked against a careful review of this repository, nothing says they fit
+it. So `tailbus acr run` refuses a repository that isn't calibrated. It
+also refuses one whose config has changed since it was calibrated, and it
+notes when only the Judge has changed. `--uncalibrated` reviews it anyway.
+
+1. **Run one full ACR on a real change.** Use the in-session method, the
+   tailbus `acr` skill: clean-context reviewers, one lens each, folding
+   findings in round by round until nothing blocks. Pick a change with some
+   substance. Keep any defect you already know of out of the reviewers'
+   briefs.
+2. **Write its key from that review's own records**, at
+   `~/.config/tailbus/acr/bench/<repository>-<name>.yaml`:
+
+   ```yaml
+   repo: /absolute/path/to/the/repository
+   base: <full sha the change was made on>
+   head: <full sha of the version round 1 reviewed>
+   context: |
+     What the change is for, as the builder described it before any review.
+   dimensions: [correctness, ...]
+   findings:
+     - id: short-kebab-name
+       blocker: true            # the review's own ruling at the time
+       dimension: correctness   # a lens id in this repository's config
+       what: >
+         The defect as the review found it: where, what's wrong, the evidence.
+       found_later: false       # true if found in round 2 or later
+   ```
+
+   Every finding must be a defect in the code at `head`. A later round
+   also reviews what earlier fixes added, and those findings don't belong:
+   check each later-round finding with `git show <head>:<path>`. Every
+   dimension must be a lens id in the config, spelled the same.
+3. **Run `tailbus acr calibrate <key>...` twice.** Each run is one Judge
+   call per dimension and no reviewers, and each is recorded for the
+   repository.
+4. **Read where the Judge and the key disagree.** The review's own rulings
+   aren't ground truth: on a judgment call, either side can be right. What
+   to look for:
+   - **Dropped findings**, ones the Judge rated Rejected. If one is a real
+     defect, the Judge has lost it: fix the lens's criteria, or a
+     not-findings entry that's too broad.
+   - **Missed and overrated blockers.** Where the Judge is wrong because
+     the config doesn't say what blocks in this repository, say it there:
+     in the lens's criteria, or with a lens's `severity`. For example, a
+     repository whose reviews block on a comment the change makes false
+     should say so.
+   - **The key itself.** A finding about code that isn't at `head`, or a
+     blocker ruling the review's own record contradicts, is the key's
+     mistake. Fix the key.
+5. **Accept it** with `tailbus acr calibration --repo <path> --accept`,
+   once there are two runs on the current config and Judge. Change the
+   config later, and run steps 3 to 5 again on the keys you have.
+
+## 8. Measure what it finds
+
+Calibration checks the Judge. Whether the reviewers find what your most
+careful review finds is a separate question:
 
 1. Take a real change, new work nobody has reviewed. Freeze a key with its
    repository, base, head, a paragraph of what it's for, and the dimensions.
@@ -203,7 +261,9 @@ finds. To measure that:
 3. Review the change by your most careful method to convergence, and write
    its findings into the key, each marked as a blocker or not, and found in
    round 1 or later.
-4. Run `tailbus acr rescore <key> --results <file>`.
+4. Run `tailbus acr rescore <key> --results <file>`. A key finding counts as
+   caught if the pipeline reported it at any severity. Blocker agreement is
+   reported apart from that.
 5. Read what the pipeline missed, and why. A trial keeps every reviewer's
    transcript in `<state>/bridge/<agent>/log/<run>/transcripts`. Most misses
    trace to a missing technique in a lens's `attack`, or to a runbook gap

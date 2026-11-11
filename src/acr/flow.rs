@@ -1372,6 +1372,20 @@ pub(super) fn ruling(cfg: &Config, lens: &Lens, r: &roles::Rating) -> Ruled {
     Ruled::plain(r.severity, cfg.action(lens, r.severity))
 }
 
+/// The text of the rules that decide what blocks: a calibration made before
+/// they changed is stale.
+pub(super) fn rules_source() -> String {
+    let flow = super::calibration::source_of(
+        include_str!("flow.rs"),
+        &["pub(super) fn ruling(", "pub(super) fn grounded("],
+    );
+    let stages = super::calibration::source_of(
+        include_str!("stages.rs"),
+        &["pub fn changed_lines(", "pub fn adds_text("],
+    );
+    format!("{flow}\n{stages}")
+}
+
 /// A ruling: the severity and action rules give a finding, and whether it
 /// also goes to a person.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3428,6 +3442,22 @@ lenses:
             raised(r#""misleads": true, "misleading_claim": "cancelled when the date moves""#),
             Severity::High
         );
+    }
+
+    #[test]
+    fn a_calibration_fingerprints_every_rule() {
+        let rules = rules_source();
+        for f in [
+            "fn ruling(",
+            "fn grounded(",
+            "fn changed_lines(",
+            "fn adds_text(",
+        ] {
+            assert!(
+                rules.contains(f),
+                "{f} is missing from the rules' fingerprint"
+            );
+        }
     }
 
     #[test]

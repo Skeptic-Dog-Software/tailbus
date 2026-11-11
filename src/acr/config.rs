@@ -953,7 +953,16 @@ mod tests {
             include_str!("roles.rs"),
             include_str!("stages.rs"),
         ] {
-            let code = source.split("#[cfg(test)]").next().unwrap();
+            // Its own source, read to fingerprint the rules, isn't
+            // knowledge of a repository.
+            let code: String = source
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap()
+                .lines()
+                .filter(|l| !l.contains("include_str!("))
+                .collect::<Vec<_>>()
+                .join("\n");
             // Words from the two examples' configs.
             for word in [
                 "goroutine-safety",

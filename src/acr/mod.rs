@@ -2,6 +2,7 @@
 //! framework holds no knowledge of a repository. Roles, tiers, lenses and
 //! bindings all come from config, in `config`.
 
+mod calibration;
 mod change;
 mod config;
 mod flow;
@@ -223,7 +224,8 @@ pub enum AcrCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Review a change.
+    /// Review a change. The repository must be calibrated first: see
+    /// `acr calibration`.
     Run {
         #[command(flatten)]
         target: Target,
@@ -231,6 +233,26 @@ pub enum AcrCmd {
         /// that on.
         #[arg(long, value_name = "NUMBER")]
         post_pr: Option<u64>,
+        /// Review a repository that isn't calibrated, or whose config has
+        /// changed since: its rulings haven't been checked against a full
+        /// review.
+        #[arg(long)]
+        uncalibrated: bool,
+    },
+    /// Where a repository's calibration stands. With `--accept`, accept the
+    /// latest, once you've read where the Judge and the keys' own review
+    /// disagree.
+    Calibration {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Where a config inside the repository is read from.
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// The repository's config, if it's kept somewhere else.
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        accept: bool,
     },
     /// Carry on with a review that's waiting for a person.
     Resume {
@@ -885,15 +907,30 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 describe_plan(&plan);
             }
         }
-        AcrCmd::Run { target, post_pr } => {
+        AcrCmd::Run {
+            target,
+            post_pr,
+            uncalibrated,
+        } => {
             let (cfg, source) = load_config(paths, &target, &flags(&target))?;
             cfg.check_bindings()?;
+            let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
+            let (text, _) = repo_layer(
+                paths,
+                &target.repo,
+                Some(&target.base),
+                target.config.as_deref(),
+            )?;
+            let name = change::name(&target.repo)?;
+            let now = fingerprint(&cfg, &text, &list)?;
+            if let Some(note) = calibrated(paths, &name, &now, uncalibrated)? {
+                eprintln!("{note}");
+            }
             cfg.check_local(&this_machine(paths)?)?;
             change::checked_out(&target.repo, target.head.as_deref())?;
             allow_copies(paths, &cfg)?;
             let description = description_of(&target, post_pr)?;
             let id = new_id();
-            let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
             let mut s = setting(paths, &cfg, &id, Some(list))?;
             s.description = description;
             s.builder_brief = target
@@ -960,9 +997,71 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let score = flow::score(&run, &known)?;
             println!("{}", serde_json::to_string_pretty(&score)?);
         }
+        AcrCmd::Calibration {
+            repo,
+            base,
+            config,
+            accept,
+        } => {
+            let target = Target {
+                repo: repo.clone(),
+                base: base.clone(),
+                config: config.clone(),
+                head: None,
+                human_gate: None,
+                max_rounds: None,
+                review_scope: None,
+                bindings: Vec::new(),
+                description: None,
+                pr: None,
+                brief: None,
+            };
+            let (cfg, source) = load_config(paths, &target, &flags(&target))?;
+            let (text, _) = repo_layer(paths, &repo, Some(&base), config.as_deref())?;
+            let decided = not_findings(&cfg, &source, &repo, &base)?;
+            let now = fingerprint(&cfg, &text, &decided)?;
+            let name = change::name(&repo)?;
+            if accept {
+                let a = calibration::accept(&paths.state, &name, &now, crate::util::now_ms())?;
+                println!("Accepted {name}'s calibration, on {} runs.", a.runs);
+            }
+            let record = calibration::load(&paths.state, &name)?;
+            println!("{}", calibration::report(&name, &record, &now));
+        }
         AcrCmd::Calibrate { keys, out } => {
+            let mut runs: Vec<(String, String, calibration::CalibrationRun)> = Vec::new();
             for key in keys {
                 let result = calibrate(paths, &key)?;
+                let fp: calibration::Fingerprint =
+                    serde_json::from_value(result["fingerprint"].clone())?;
+                let repo = result["repo"].as_str().unwrap_or_default().to_string();
+                let count = |k: &str| result[k].as_u64().unwrap_or_default() as usize;
+                let name = result["key"].as_str().unwrap_or_default().to_string();
+                match runs
+                    .iter_mut()
+                    .find(|(r, _, run)| r == &repo && run.fingerprint == fp)
+                {
+                    Some((_, _, run)) => {
+                        run.keys.push(name);
+                        run.agreed += count("agreed_blockers");
+                        run.missed += count("missed_blockers");
+                        run.overrated += count("overrated");
+                        run.dropped += count("dropped");
+                    }
+                    None => runs.push((
+                        repo,
+                        result["repo_path"].as_str().unwrap_or_default().to_string(),
+                        calibration::CalibrationRun {
+                            at: crate::util::now_ms(),
+                            keys: vec![name],
+                            fingerprint: fp,
+                            agreed: count("agreed_blockers"),
+                            missed: count("missed_blockers"),
+                            overrated: count("overrated"),
+                            dropped: count("dropped"),
+                        },
+                    )),
+                }
                 println!(
                     "{}: blockers agreed {}, missed {}, overrated {}; non-blockers agreed {}; unrated {}",
                     result["key"].as_str().unwrap_or_default(),
@@ -976,6 +1075,16 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                     let mut file = fs::OpenOptions::new().create(true).append(true).open(out)?;
                     std::io::Write::write_all(&mut file, format!("{result}\n").as_bytes())?;
                 }
+            }
+            for (repo, path, run) in runs {
+                let fp = run.fingerprint.clone();
+                let record = calibration::add_run(&paths.state, &repo, run)?;
+                println!(
+                    "Recorded for {repo}: {} run(s) on its current config and Judge. Read where \
+                     the Judge and the keys disagree, then accept it with `tailbus acr \
+                     calibration --repo {path} --accept`.",
+                    record.runs_on(&fp).len()
+                );
             }
         }
         AcrCmd::Residual {
@@ -1527,6 +1636,8 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
     let artifact = s.dir.join("calibrate.diff");
     fs::write(&artifact, format!("{intent}# The diff\n\n{}", change.diff))?;
     let decided = not_findings(&cfg, &source, &s.tree, &key.base)?;
+    let (text, _) = repo_layer(paths, &s.tree, Some(&key.base), None)?;
+    let fp = fingerprint(&cfg, &text, &decided)?;
     let mut caller = BridgeCaller::new(paths)?;
     caller.keep_logs = true;
     let tag = regex::Regex::new(r"\[K(\d+)\]").expect("a fixed pattern");
@@ -1617,11 +1728,78 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
             "severity": j.as_ref().map(|(_, s)| s.clone()),
         }));
     }
+    let dropped = judged
+        .iter()
+        .filter(|j| j.as_ref().is_some_and(|(_, s)| s == "Rejected"))
+        .count();
     Ok(json!({
         "key": key_path.file_stem().map(|n| n.to_string_lossy().into_owned()),
         "agreed_blockers": agreed_b, "missed_blockers": missed, "overrated": over,
-        "agreed_non_blockers": agreed_n, "unrated": unrated, "findings": rows,
+        "agreed_non_blockers": agreed_n, "unrated": unrated, "dropped": dropped,
+        "findings": rows,
+        "repo": change::name(&s.tree)?, "repo_path": key.repo, "fingerprint": fp,
     }))
+}
+
+/// What a calibration of a repository is made against: its config and
+/// decided non-issues, and its Judge, as its binding, prompt and rules.
+fn fingerprint(cfg: &Config, text: &str, decided: &str) -> Result<calibration::Fingerprint> {
+    let judge = cfg.binding(Role::Judge, None)?;
+    let lens = config::Lens {
+        id: "lens".into(),
+        criteria: String::new(),
+        attack: None,
+        triggers: config::Triggers::default(),
+        binding: None,
+        severity: Default::default(),
+        include_generated: false,
+    };
+    let prompt = roles::judge_prompt(&lens, &[Vec::new()], "")?;
+    Ok(calibration::Fingerprint {
+        config: calibration::hash(&[text, decided]),
+        judge: calibration::hash(&[
+            &judge.agent,
+            judge.model.as_deref().unwrap_or_default(),
+            judge.effort.as_deref().unwrap_or_default(),
+            &prompt,
+            &flow::rules_source(),
+        ]),
+    })
+}
+
+/// Whether `acr run` may rule on a repository: never calibrated, or its
+/// config changed since, it refuses unless told to go anyway. A changed
+/// Judge only gets a note: that's tailbus's doing, not the repository's.
+fn calibrated(
+    paths: &Paths,
+    name: &str,
+    now: &calibration::Fingerprint,
+    anyway: bool,
+) -> Result<Option<String>> {
+    use calibration::Standing;
+    let record = calibration::load(&paths.state, name)?;
+    let how = "Run `tailbus acr calibrate` on its keys twice, then `tailbus acr calibration \
+               --accept` (section 7 of docs/acr-repo-setup.md)";
+    match calibration::standing(&record, now) {
+        Standing::Calibrated => Ok(None),
+        Standing::JudgeChanged => Ok(Some(format!(
+            "Note: the Judge (its binding, prompt or rules) has changed since {name} was \
+             calibrated. {how}."
+        ))),
+        _ if anyway => Ok(Some(format!(
+            "Note: {name} isn't calibrated for this config, so its rulings haven't been checked \
+             against a full review."
+        ))),
+        Standing::Never => bail!(
+            "{name} isn't calibrated, so the pipeline's rulings here haven't been checked \
+             against a full review. Build its keys from one full ACR, then: {how}. \
+             `--uncalibrated` reviews it anyway."
+        ),
+        Standing::ConfigChanged => bail!(
+            "{name}'s review config has changed since it was calibrated. {how}. \
+             `--uncalibrated` reviews it anyway."
+        ),
+    }
 }
 
 /// A run's config, as it was when it started: resuming can't pick up a/// A run's config, as it was when it started: resuming can't pick up a
