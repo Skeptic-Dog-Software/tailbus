@@ -37,7 +37,7 @@ use crate::config::Paths;
 use crate::format::Tools;
 use crate::local::{Client, Events, Inbox, Moved, Peers, Request, Sent, Status, Thread};
 use crate::proto::{AgentList, RunOptions};
-use crate::util::{derive_agent_name, normalize_name, rfc3339, valid_name};
+use crate::util::{derive_agent_name, rfc3339};
 
 #[derive(Parser)]
 #[command(
@@ -302,15 +302,13 @@ fn main() -> ExitCode {
     }
 }
 
-/// The agent the CLI or MCP server acts as.
+/// The agent the CLI or MCP server acts as. A name given that isn't valid,
+/// such as `WebApp`, is made valid the same way the hooks make it, so a
+/// session's server and its hooks are always the same agent: a server that
+/// refused it left the session getting messages it couldn't answer.
 fn agent_name(explicit: Option<String>) -> Result<String> {
     match explicit {
-        Some(name) if valid_name(&name) => Ok(name),
-        Some(name) => bail!(
-            "{name:?} isn't a valid agent name: use lowercase letters, digits and hyphens \
-             (such as {:?})",
-            normalize_name(&name)
-        ),
+        Some(name) => Ok(util::as_agent_name(&name)),
         None => {
             let dir = env::var_os("CLAUDE_PROJECT_DIR")
                 .map(PathBuf::from)
@@ -345,7 +343,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             )?;
         }
         Cmd::Hook { command } => {
-            let explicit = cli.agent.filter(|a| valid_name(a));
+            let explicit = cli.agent.as_deref().map(util::as_agent_name);
             return match command {
                 HookCmd::SessionStart => hook::session_start(&socket, explicit),
                 HookCmd::Prompt => hook::prompt(&socket, explicit),

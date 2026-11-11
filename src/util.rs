@@ -59,6 +59,16 @@ pub fn valid_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// A name given for an agent, made valid if it isn't: `WebApp` is
+/// `webapp`.
+pub fn as_agent_name(raw: &str) -> String {
+    if valid_name(raw) {
+        raw.to_string()
+    } else {
+        normalize_name(raw)
+    }
+}
+
 /// Turns a directory name or the like into a valid name.
 pub fn normalize_name(raw: &str) -> String {
     let mut out = String::new();
@@ -282,6 +292,13 @@ mod tests {
         let kept = fs::read_to_string(&log).unwrap();
         assert!(kept.ends_with("line 0999\nafter\n"), "{kept:?}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_given_agent_name_is_made_valid_not_refused() {
+        assert_eq!(as_agent_name("writer"), "writer");
+        assert_eq!(as_agent_name("WebApp"), "webapp");
+        assert_eq!(as_agent_name("Sci Fi"), "sci-fi");
     }
 
     #[test]
