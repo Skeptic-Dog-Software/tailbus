@@ -135,6 +135,15 @@ pub enum AcrCmd {
     },
     /// Print the published schema.
     Schema,
+    /// How the pipeline's Judge rates what each key's own review found, set
+    /// against how that review rated it: blockers agreed on, missed, and
+    /// overrated. Runs no reviewer: one Judge call for each dimension.
+    Calibrate {
+        keys: Vec<PathBuf>,
+        /// Append each key's result to this file, as a line of JSON.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Score saved trials of new work, once its own review has filled in the
     /// key's findings.
     Rescore {
@@ -913,6 +922,24 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let score = flow::score(&run, &known)?;
             println!("{}", serde_json::to_string_pretty(&score)?);
         }
+        AcrCmd::Calibrate { keys, out } => {
+            for key in keys {
+                let result = calibrate(paths, &key)?;
+                println!(
+                    "{}: blockers agreed {}, missed {}, overrated {}; non-blockers agreed {}; unrated {}",
+                    result["key"].as_str().unwrap_or_default(),
+                    result["agreed_blockers"],
+                    result["missed_blockers"],
+                    result["overrated"],
+                    result["agreed_non_blockers"],
+                    result["unrated"],
+                );
+                if let Some(out) = &out {
+                    let mut file = fs::OpenOptions::new().create(true).append(true).open(out)?;
+                    std::io::Write::write_all(&mut file, format!("{result}\n").as_bytes())?;
+                }
+            }
+        }
         AcrCmd::Rescore { key, results } => {
             let n = trial::rescore(paths, &key, &results)?;
             println!(
@@ -1374,7 +1401,151 @@ fn pipeline_arm(
     })
 }
 
-/// A run's config, as it was when it started: resuming can't pick up a
+/// `tailbus acr calibrate`, for one key: its own review's findings, each
+/// tagged, go to the pipeline's Judge one dimension at a time, in a copy of
+/// the change, and its ratings are set against the review's.
+fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let (key, s) = trial::copy(paths, trial::resolved(trial::read_key(key_path)?)?)?;
+    if key.findings.is_empty() {
+        bail!("{} has no findings to calibrate on", key_path.display());
+    }
+    let target = Target {
+        repo: s.tree.clone(),
+        base: key.base.clone(),
+        config: None,
+        head: Some(key.head.clone()),
+        human_gate: None,
+        max_rounds: None,
+        review_scope: None,
+        bindings: Vec::new(),
+        description: None,
+        pr: None,
+    };
+    let (cfg, source) = load_config(paths, &target, &flags(&target))?;
+    let judge = cfg.binding(Role::Judge, None)?;
+    let bridge = judge
+        .agent
+        .split('@')
+        .next()
+        .unwrap_or(&judge.agent)
+        .to_string();
+    let mut allowed = AllowedFor {
+        paths,
+        tree: s.tree.clone(),
+        bridges: Vec::new(),
+    };
+    allow_trials(paths, &bridge)?;
+    crate::setup::acr_repo(paths, &s.tree, true, &bridge)?;
+    allowed.bridges.push(bridge);
+    let change = reload(&cfg, &s.tree, &key.base, Some(&key.head))?;
+    let intent = change::intent(Some(&key.context), &change.commits);
+    let artifact = s.dir.join("calibrate.diff");
+    fs::write(&artifact, format!("{intent}# The diff\n\n{}", change.diff))?;
+    let decided = not_findings(&cfg, &source, &s.tree, &key.base)?;
+    let mut caller = BridgeCaller::new(paths)?;
+    caller.keep_logs = true;
+    let tag = regex::Regex::new(r"\[K(\d+)\]").expect("a fixed pattern");
+    let mut judged: Vec<Option<(bool, String)>> = vec![None; key.findings.len()];
+    let mut dimensions: Vec<&str> = key.findings.iter().map(|f| f.dimension.as_str()).collect();
+    dimensions.sort();
+    dimensions.dedup();
+    for d in dimensions {
+        let lens = cfg
+            .lenses
+            .iter()
+            .find(|l| l.id == d)
+            .cloned()
+            .unwrap_or(config::Lens {
+                id: d.to_string(),
+                criteria: "(this repository's review config has no criteria for it)".into(),
+                attack: None,
+                triggers: config::Triggers::default(),
+                binding: None,
+                severity: Default::default(),
+                include_generated: false,
+            });
+        let raws: Vec<roles::Raw> = key
+            .findings
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.dimension == d)
+            .map(|(i, f)| roles::Raw {
+                title: format!(
+                    "[K{i}] {}",
+                    f.what
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ),
+                detail: f.what.clone(),
+                file: None,
+                line: None,
+            })
+            .collect();
+        let prompt = roles::judge_prompt(&lens, &[raws], &decided)?
+            + "\n\nKeep each finding's title as it's given, with its [K..] tag, and judge each \
+               on its own: don't merge them.";
+        let answer = caller.call(&Call {
+            role: Role::Judge,
+            binding_name: cfg.binding_name(Role::Judge, None)?,
+            binding: judge,
+            prompt: &prompt,
+            artifact: Some(&artifact),
+            writes: false,
+            repo: &s.tree,
+        })?;
+        for r in roles::read_ratings(&answer.text)? {
+            let Some(i) = tag
+                .captures(&r.title)
+                .and_then(|c| c[1].parse::<usize>().ok())
+                .filter(|i| *i < judged.len())
+            else {
+                continue;
+            };
+            let action = if r.relevant && r.on_task {
+                lens.severity
+                    .get(&r.severity)
+                    .copied()
+                    .unwrap_or(r.severity.default_action())
+            } else {
+                config::Action::Drop
+            };
+            let blocks = matches!(
+                action,
+                config::Action::Blocks | config::Action::BlocksUnlessWaived
+            );
+            judged[i] = Some((blocks, format!("{:?}", r.severity)));
+        }
+    }
+    drop(allowed);
+    let mut rows = Vec::new();
+    let (mut agreed_b, mut missed, mut over, mut agreed_n, mut unrated) = (0, 0, 0, 0, 0);
+    for (f, j) in key.findings.iter().zip(&judged) {
+        match (f.blocker, j.as_ref().map(|(b, _)| *b)) {
+            (true, Some(true)) => agreed_b += 1,
+            (true, Some(false)) => missed += 1,
+            (false, Some(true)) => over += 1,
+            (false, Some(false)) => agreed_n += 1,
+            (_, None) => unrated += 1,
+        }
+        rows.push(json!({
+            "id": f.id, "dimension": f.dimension, "key_blocker": f.blocker,
+            "judged_blocker": j.as_ref().map(|(b, _)| *b),
+            "severity": j.as_ref().map(|(_, s)| s.clone()),
+        }));
+    }
+    Ok(json!({
+        "key": key_path.file_stem().map(|n| n.to_string_lossy().into_owned()),
+        "agreed_blockers": agreed_b, "missed_blockers": missed, "overrated": over,
+        "agreed_non_blockers": agreed_n, "unrated": unrated, "findings": rows,
+    }))
+}
+
+/// A run's config, as it was when it started: resuming can't pick up a/// A run's config, as it was when it started: resuming can't pick up a
 /// config that's changed since.
 fn stored_config(bytes: &[u8]) -> Result<Config> {
     serde_json::from_slice(bytes).map_err(|e| anyhow!("reading the run's config: {e}"))

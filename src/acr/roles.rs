@@ -302,12 +302,15 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          is on task: rate it as you would any other, and say in its reason that it's \
          pre-existing. It's High or above only if the change claims to fix it, or makes it \
          worse.\n\n\
-         Where the lens's criteria say when a finding blocks, a finding that meets that \
-         condition is High at least. A claim the change makes about itself that the code or \
-         tests don't bear out is High when someone relying on it would ship a defect or skip a \
-         test: a test that can't catch what its name, its comments or the change say it \
-         checks; a comment, doc or ledger line that misstates what the code does. It's Low \
-         only when it would mislead no one.\n\n\
+         Rate by consequence: what happens if the change merges as it is. High or above \
+         means a user or caller meets a defect, data is lost or exposed, or someone relying \
+         on the change is misled into shipping one: a test that claims to guard behaviour the \
+         change exists to fix but can't catch its failure, or a doc that would lead someone to \
+         the wrong code. Where the lens's criteria say when a finding blocks, a finding that \
+         meets that condition is High at least. A claim that's merely imprecise is Low, \
+         however true the finding: a stale line number, a test name broader than its check, \
+         a comment that overstates without changing what anyone would do, a gap in a test \
+         that other tests cover.\n\n\
          Decided non-issues:\n{not_findings}\n\n\
          Set split when the reviewers disagree about a finding. Set values_call when rejecting it \
          comes down to values, not fact. Give both sides in `sides` when you set either.\n\n\
@@ -346,12 +349,13 @@ pub fn steelman_prompt(
     writer_follows: bool,
 ) -> String {
     let pins = if writer_follows {
-        "Leave the tests that pin these fixes to the test writer who follows you, and run the \
-         existing tests that cover what you change."
+        "Leave the tests that pin these fixes to the test writer who follows you. Run only the \
+         existing tests that cover what you change: no mutation checks or whole-suite runs, \
+         which the review runs itself."
     } else {
         "Where a blocker comes with a test or scenario that shows it, keep that test as its \
-         pin; where a blocker is a gap in the tests, write the test that closes it. Run the \
-         tests that cover what you change."
+         pin; where a blocker is a gap in the tests, write the test that closes it. Run only \
+         the tests that cover what you change: no mutation checks or whole-suite runs."
     };
     let earlier = if earlier.is_empty() {
         "Nothing yet: this is the first.\n"
@@ -368,7 +372,9 @@ pub fn steelman_prompt(
          # What earlier rounds changed\n\n{earlier}\n\
          # Blockers\n\n\
          Fold each into the work in the working directory, so that a fresh reviewer finds \
-         nothing in it to block. If you're sure one is wrong, decline it and say why.\n\n\
+         nothing in it to block, with the smallest change that does it: a fix that reaches \
+         code the change didn't touch gives the next round more to attack. If you're sure one \
+         is wrong, decline it and say why.\n\n\
          {blockers}\n\
          # How\n\n\
          Fold in these and nothing else: what the Judge upheld without blocking goes to a \
@@ -424,7 +430,8 @@ mod tests {
         let prompt = judge_prompt(&lens, &[Vec::new()], "").unwrap();
         assert!(prompt.contains("It blocks when the tests claim the behaviour is covered."));
         assert!(prompt.contains("a finding that meets that condition is High at least"));
-        assert!(prompt.contains("a test that can't catch what its name"));
+        assert!(prompt.contains("Rate by consequence"));
+        assert!(prompt.contains("a stale line number"));
         assert!(prompt.contains("pre-existing"));
     }
 
