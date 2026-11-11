@@ -38,13 +38,30 @@ const SCORER_TIMEOUT: Duration = Duration::from_secs(3600);
 /// What a change's in-session review found, as its builder ruled.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Key {
+    /// Left out for work that isn't code: `head_file` gives it instead.
+    #[serde(default)]
     pub repo: PathBuf,
     #[serde(default)]
     pub pr: Option<u64>,
-    #[serde(deserialize_with = "commit")]
+    #[serde(default, deserialize_with = "commit")]
     pub base: String,
-    #[serde(deserialize_with = "commit")]
+    #[serde(default, deserialize_with = "commit")]
     pub head: String,
+    /// Work that isn't code: the version before it, as a file or folder of
+    /// text. Left out, the whole of the work is new. A relative path is
+    /// from the key's own file.
+    #[serde(default)]
+    pub base_file: Option<PathBuf>,
+    /// Work that isn't code: the version round 1 reviewed. The key is then
+    /// carried into a git repository (see `acr carry`), which gives its
+    /// repo, base and head.
+    #[serde(default)]
+    pub head_file: Option<PathBuf>,
+    /// The carrier repository's name, and so its review config's:
+    /// `~/.config/tailbus/acr/<carrier>.yaml`. Keys of one kind of work
+    /// share it. Left out, it's the key file's name.
+    #[serde(default)]
+    pub carrier: Option<String>,
     /// What the change is for: all a trial's builder is told.
     pub context: String,
     pub dimensions: Vec<String>,
@@ -991,6 +1008,12 @@ pub(super) fn check_session(
 
 /// Runs one design on one change, and scores it.
 pub(super) fn read_key(key_path: &Path) -> Result<Key> {
+    read_key_with(key_path, || Ok(Paths::find()?.state))
+}
+
+/// A key, with work that isn't code carried into git under the state
+/// directory `state` gives, only when there is some.
+fn read_key_with(key_path: &Path, state: impl FnOnce() -> Result<PathBuf>) -> Result<Key> {
     let mut key: Key = serde_yaml_ng::from_str(
         &fs::read_to_string(key_path).with_context(|| format!("reading {}", key_path.display()))?,
     )
@@ -1001,6 +1024,21 @@ pub(super) fn read_key(key_path: &Path) -> Result<Key> {
     }
     if let Some(brief) = key.brief.take() {
         key.brief = Some(dir.join(brief));
+    }
+    if let Some(head) = key.head_file.clone() {
+        let name = key.carrier.clone().unwrap_or_else(|| key_name(key_path));
+        let state = state()?;
+        let base = key.base_file.as_ref().map(|b| dir.join(b));
+        let carried = super::carry::carry(&state, &name, base.as_deref(), &dir.join(head))
+            .with_context(|| format!("carrying {} into git", key_path.display()))?;
+        key.repo = carried.repo;
+        key.base = carried.base;
+        key.head = carried.head;
+    } else if key.repo.as_os_str().is_empty() || key.base.is_empty() || key.head.is_empty() {
+        bail!(
+            "{} needs repo, base and head, or head_file for work that isn't code",
+            key_path.display()
+        );
     }
     Ok(key)
 }
@@ -1233,6 +1271,34 @@ mod tests {
     }
 
     #[test]
+    fn a_key_for_work_that_isnt_code_is_carried_into_git() {
+        let dir = std::env::temp_dir().join(format!("tb-doc-key-{}", new_id()));
+        fs::create_dir_all(dir.join("design-step2")).unwrap();
+        fs::write(dir.join("design-step2/base.md"), "- Step 1\n").unwrap();
+        fs::write(dir.join("design-step2/head.md"), "- Step 1\n- Step 2\n").unwrap();
+        let key_path = dir.join("design-step2.yaml");
+        fs::write(
+            &key_path,
+            "kind: document\nartifact: a board\ncarrier: design\n\
+             base_file: design-step2/base.md\nhead_file: design-step2/head.md\n\
+             context: the second step\ndimensions: [clarity]\nfindings: []\n",
+        )
+        .unwrap();
+        let state = dir.join("state");
+        let key = read_key_with(&key_path, || Ok(state.clone())).unwrap();
+        assert!(key.repo.ends_with("acr-carried/design"));
+        let diff = super::super::change::git(&key.repo, &["diff", &key.base, &key.head]).unwrap();
+        assert!(diff.contains("+- Step 2"), "{diff}");
+        // A key with neither a repository nor a document is refused.
+        fs::write(&key_path, "context: x\ndimensions: []\n").unwrap();
+        let err = read_key_with(&key_path, || Ok(state.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("head_file"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_trials_copy_holds_the_head_and_nothing_after_it() {
         use super::super::change::tests::{branch, commit, repo_with};
         let repo = repo_with(&[("a.txt", "one\n")]);
@@ -1258,6 +1324,9 @@ mod tests {
             patch: None,
             every_dimension: false,
             brief: None,
+            base_file: None,
+            head_file: None,
+            carrier: None,
         };
         let past = Key {
             base: fixed.clone(),
@@ -1320,6 +1389,9 @@ mod tests {
             patch: None,
             every_dimension: false,
             brief: None,
+            base_file: None,
+            head_file: None,
+            carrier: None,
         };
         let found = |blocker: bool| Found {
             dimension: "probes".into(),
@@ -1578,6 +1650,9 @@ mod tests {
             patch: None,
             every_dimension: false,
             brief: None,
+            base_file: None,
+            head_file: None,
+            carrier: None,
         };
         let criteria = [(
             "correctness".to_string(),

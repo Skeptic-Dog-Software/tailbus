@@ -3,6 +3,7 @@
 //! bindings all come from config, in `config`.
 
 mod calibration;
+mod carry;
 mod change;
 mod config;
 mod flow;
@@ -238,6 +239,22 @@ pub enum AcrCmd {
         /// review.
         #[arg(long)]
         uncalibrated: bool,
+    },
+    /// Carry work that isn't code into git, so ACR can review it: commits
+    /// the version before the work (if given) and the version to review to
+    /// a carrier repository, and prints how to review it.
+    Carry {
+        /// The carrier's name. Its review config is
+        /// `~/.config/tailbus/acr/<name>.yaml`.
+        #[arg(long)]
+        name: String,
+        /// The version before the work, as a file or folder of text. Left
+        /// out, the whole of the work is new.
+        #[arg(long, value_name = "PATH")]
+        base: Option<PathBuf>,
+        /// The version to review, as a file or folder of text.
+        #[arg(long, value_name = "PATH")]
+        head: PathBuf,
     },
     /// Where a repository's calibration stands. With `--accept`, accept the
     /// latest, once you've read where the Judge and the keys' own review
@@ -996,6 +1013,21 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let run = one_round(paths, &target, description)?;
             let score = flow::score(&run, &known)?;
             println!("{}", serde_json::to_string_pretty(&score)?);
+        }
+        AcrCmd::Carry { name, base, head } => {
+            let c = carry::carry(&paths.state, &name, base.as_deref(), &head)?;
+            println!(
+                "Carried into {}: base {}, head {}.\nReview it with `tailbus acr run --repo {} \
+                 --base {} --head {}`, once {name}'s config is in place and calibrated, and \
+                 `tailbus acr add-repo {}` lets ACR review it.",
+                c.repo.display(),
+                c.base,
+                c.head,
+                c.repo.display(),
+                c.base,
+                c.head,
+                c.repo.display()
+            );
         }
         AcrCmd::Calibration {
             repo,

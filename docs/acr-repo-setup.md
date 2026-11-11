@@ -270,6 +270,36 @@ careful review finds is a separate question:
    that kept a reviewer from running something. Fix those, and run the next
    change.
 
+## 9. Work that isn't code
+
+ACR reviews a change, which needs a repository, a base and a head. A
+design, a document or a plan has versions but no repository, so carry it
+into one:
+
+```sh
+tailbus acr carry --name design --base before.md --head draft.md
+```
+
+This commits each version, a file or a folder of text, to a carrier
+repository in tailbus's state, checks the head out there, and prints how to
+review it. Leave out `--base` when there's no earlier version: the whole of
+the work is then new. Carrying the same versions again gives the same
+commits.
+
+- **Export to stable text.** Two exports of the same version must match,
+  or every diff is noise. Use a fixed order, such as frames and then what's
+  in them, and leave out positions, colours and ids that change from one
+  export to the next.
+- **Configure the carrier like any repository.** Its config is
+  `~/.config/tailbus/acr/<name>.yaml`, and one carrier serves every piece of
+  the same kind of work. Its lenses are that work's own: for a design, say,
+  requirements coverage, consistency, feasibility, user flow, accessibility
+  and clarity. The test stages don't apply. `claims` and `context` do.
+- **Calibrate it the same way.** A key for work that isn't code gives
+  `head_file`, and `base_file` if there's a version before it, in place of
+  `repo`, `base` and `head`, and `carrier` for the carrier's name. Paths are
+  from the key's own file. `acr calibrate` and `acr trial` carry it first.
+
 ## What not to put in the config
 
 Don't put severity tables or objectives written per repository or project.
