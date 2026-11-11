@@ -1085,12 +1085,12 @@ pub struct Gap {
     pub blocks: bool,
 }
 
+/// The lines a change adds, by file.
+pub type ChangedLines = std::collections::BTreeMap<String, std::collections::BTreeSet<u64>>;
+
 /// The lines a diff adds, by file.
-pub fn changed_lines(
-    diff: &str,
-) -> std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> {
-    let mut lines: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> =
-        Default::default();
+pub fn changed_lines(diff: &str) -> ChangedLines {
+    let mut lines: ChangedLines = Default::default();
     for (f, n, _) in added_lines(diff) {
         lines.entry(f).or_default().insert(n);
     }

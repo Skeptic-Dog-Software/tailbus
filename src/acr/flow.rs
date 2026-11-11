@@ -1157,7 +1157,13 @@ fn gate_round(
         match judged {
             Ok(ratings) => {
                 let tag = regex::Regex::new(r"^\[G(\d+)\]").expect("a fixed pattern");
-                let mut findings = rate(run, cfg, lens, ratings);
+                let mut findings = rate(
+                    run,
+                    cfg,
+                    lens,
+                    ratings,
+                    &stages::changed_lines(&change.diff),
+                );
                 for f in &mut findings {
                     let measured = tag
                         .captures(&f.title)
@@ -1385,9 +1391,27 @@ impl Ruled {
     }
 }
 
-fn rate(run: &mut Run, cfg: &Config, lens: &Lens, ratings: Vec<roles::Rating>) -> Vec<Finding> {
+/// A fact the diff settles, whatever the Judge said: a finding in a line the
+/// change adds isn't pre-existing.
+pub(super) fn grounded(mut r: roles::Rating, changed: &stages::ChangedLines) -> roles::Rating {
+    if let (Some(file), Some(line)) = (r.file.as_deref(), r.line)
+        && changed.get(file).is_some_and(|lines| lines.contains(&line))
+    {
+        r.pre_existing = false;
+    }
+    r
+}
+
+fn rate(
+    run: &mut Run,
+    cfg: &Config,
+    lens: &Lens,
+    ratings: Vec<roles::Rating>,
+    changed: &stages::ChangedLines,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (n, rating) in ratings.into_iter().enumerate() {
+        let rating = grounded(rating, changed);
         let Ruled {
             severity,
             action,
@@ -1578,12 +1602,13 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             .collect()
     });
     let changed = before.is_some() && caller.fingerprint(&run.repo) != before;
+    let lines = stages::changed_lines(&change.diff);
     for ((id, lens, mut round, _), judged) in lenses.into_iter().zip(judged) {
         match judged {
             Some(Ok((mut usage, ratings))) => {
                 usage.round = run.round;
                 run.usage.push(usage);
-                round.findings = rate(run, cfg, lens, ratings);
+                round.findings = rate(run, cfg, lens, ratings, &lines);
             }
             Some(Err(e)) => round.failures.push(format!("the Judge: {e:#}")),
             None => {}
@@ -3321,6 +3346,24 @@ lenses:
     }
 
     #[test]
+    fn the_diff_settles_that_a_finding_in_an_added_line_isnt_pre_existing() {
+        let changed = stages::changed_lines("+++ b/test/a_test.dart\n@@ -0,0 +5,2 @@\n+x\n+y\n");
+        let rating = |line: u64| -> roles::Rating {
+            roles::read_ratings(&format!(
+                r#"{{"findings": [{{"title": "t", "severity": "Low", "file": "test/a_test.dart", "line": {line}, "pre_existing": true, "worsens": true}}]}}"#
+            ))
+            .unwrap()
+            .remove(0)
+        };
+        assert!(!grounded(rating(6), &changed).pre_existing);
+        assert!(grounded(rating(40), &changed).pre_existing);
+        // So a new test's flaw isn't raised as a worsened old defect.
+        let cfg = plain("exception", 3, 1);
+        let ruled = ruling(&cfg, &cfg.lenses[0], &grounded(rating(6), &changed));
+        assert_eq!(ruled.severity, Severity::Low);
+    }
+
+    #[test]
     fn rules_decide_what_blocks_from_the_judges_facts() {
         let cfg = plain("exception", 3, 1);
         let lens = cfg.lenses[0].clone();
@@ -3351,7 +3394,7 @@ lenses:
         );
         // A break nobody could see, and a Critical stays Critical.
         assert_eq!(
-            rated(r#"{"title": "t", "severity": "High", "equivalent": true}"#).1,
+            rated(r#"{"title": "t", "severity": "High", "equivalent_mutant": true}"#).1,
             Action::Drop
         );
         assert_eq!(

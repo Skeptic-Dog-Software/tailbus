@@ -288,8 +288,13 @@ pub struct Rating {
     /// ship a defect or skip a test.
     #[serde(default, deserialize_with = "lenient::flag")]
     pub misleads: bool,
-    /// A break that changes nothing a user or caller could see.
-    #[serde(default, deserialize_with = "lenient::flag")]
+    /// A deliberate break of the code, a mutant, that changes nothing a
+    /// user or caller could see. Only ever about a mutant.
+    #[serde(
+        default,
+        rename = "equivalent_mutant",
+        deserialize_with = "lenient::flag"
+    )]
     pub equivalent: bool,
 }
 
@@ -318,16 +323,20 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          - High: real defect in a realistic case\n\
          - Medium: real defect in a narrow case\n\
          - Low: nit or unlikely edge case\n\
-         - Rejected: off task, noise, or a decided non-issue, with the reason\n\n\
+         - Rejected: not a real defect, or a decided non-issue, with the reason\n\n\
+         A real defect outside this lens's criteria is rated like any other, with `on_task` \
+         false: don't reject it for that.\n\n\
          For each finding, also state these facts, each true or false, from the code: \
-         `pre_existing`, the defect was there before the change; `claims_fix`, the change says \
-         it fixes it; `worsens`, the change makes it worse; `weak_pin`, it's a test the change \
-         adds or changes that can't fail when what it's there to pin breaks; `misleads`, it's a \
-         claim the change makes, in a comment, doc, ledger line or test name, that would lead \
-         someone relying on it to ship a defect or skip a test; `equivalent`, it's a break \
-         that changes nothing a user or caller could see. Fixed rules decide from these facts \
-         what blocks: rate the severity for what the defect costs on its own, and don't reject \
-         a real defect because it's pre-existing or belongs to another lens.\n\n\
+         `pre_existing`, the defect is in code as it was before the change, which the change \
+         didn't add or alter: a test or line the change adds is never pre-existing; \
+         `claims_fix`, the change says it fixes it; `worsens`, the change makes a pre-existing \
+         defect worse; `weak_pin`, it's a test the change adds or changes that can't fail when \
+         what it's there to pin breaks; `misleads`, it's a claim the change makes, in a \
+         comment, doc, ledger line or test name, that would lead someone relying on it to ship \
+         a defect or skip a test; `equivalent_mutant`, only for a deliberate break of the code \
+         (a mutant) that the tests passed: true if that break changes nothing a user or caller \
+         could see, and false for every other finding. Fixed rules decide from these facts what \
+         blocks: rate the severity for what the defect costs on its own.\n\n\
          Decided non-issues:\n{not_findings}\n\n\
          Set split when the reviewers disagree about a finding. Set values_call when rejecting it \
          comes down to values, not fact. Give both sides in `sides` when you set either.\n\n\
@@ -335,7 +344,7 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          Answer with only JSON: {{\"findings\": [{{\"title\", \"detail\", \"file\", \"line\", \
          \"severity\", \"relevant\", \"on_task\", \"reason\", \"split\", \"values_call\", \
          \"sides\", \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \"misleads\", \
-         \"equivalent\"}}]}}.",
+         \"equivalent_mutant\"}}]}}.",
         n = reviews.len(),
         id = lens.id,
         criteria = lens.criteria,

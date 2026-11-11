@@ -1523,6 +1523,7 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
     allowed.bridges.push(bridge);
     let change = reload(&cfg, &s.tree, &key.base, Some(&key.head))?;
     let intent = change::intent(Some(&key.context), &change.commits);
+    let lines = stages::changed_lines(&change.diff);
     let artifact = s.dir.join("calibrate.diff");
     fs::write(&artifact, format!("{intent}# The diff\n\n{}", change.diff))?;
     let decided = not_findings(&cfg, &source, &s.tree, &key.base)?;
@@ -1591,7 +1592,7 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
             };
             let flow::Ruled {
                 severity, action, ..
-            } = flow::ruling(&cfg, &lens, &r);
+            } = flow::ruling(&cfg, &lens, &flow::grounded(r, &lines));
             let blocks = matches!(
                 action,
                 config::Action::Blocks | config::Action::BlocksUnlessWaived
