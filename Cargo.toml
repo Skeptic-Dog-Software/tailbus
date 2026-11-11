@@ -7,26 +7,16 @@ description = "Direct messages between AI agents on a tailnet, queued until they
 repository = "https://github.com/Skeptic-Dog-Software/tailbus"
 publish = false
 
-[lib]
-name = "acrbus"
-path = "src/lib.rs"
-
 [[bin]]
 name = "tailbus"
 path = "src/main.rs"
 
 [dependencies]
+# The bus, its bridges and ACR: tailbus is acrbus with Tailscale as its network.
+acrbus = { git = "https://github.com/Skeptic-Dog-Software/acrbus", tag = "v0.1.0" }
 anyhow = "1.0.104"
-clap = { version = "4.6.7", features = ["derive", "env"] }
-globset = "0.4.21"
-libc = "0.2.191"
-regex = "1.13.1"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-serde_yaml_ng = "0.10.0"
-sha2 = "0.11.1"
-tiny_http = "0.12.0"
+
+[dev-dependencies]
 toml = "1.1.8"
-toml_edit = "0.25.19"
-ureq = { version = "3.5.0", default-features = false }

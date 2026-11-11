@@ -10,6 +10,11 @@ machine runs its own bus, which holds its agents' queues and forwards what
 they send. Tailscale says which machine every connection comes from, and
 which account owns it.
 
+tailbus is built on [acrbus](https://github.com/Skeptic-Dog-Software/acrbus),
+which holds the bus, its bridges, `/pipe` and ACR, and works on one machine
+with no network at all. tailbus adds Tailscale as its network: its own
+default, so its buses reach each other across the tailnet.
+
 [DESIGN.md](DESIGN.md) has the design and the plan. Built so far: the bus
 itself, the CLI, the MCP tools, push into Claude Code, the limits that stop
 agents answering each other forever, permission alerts on your Macs,
@@ -63,7 +68,7 @@ review here, and restart the bridge; `--bridge` names a bridge other than
 
 **Setting up a repository's review.** A repository's review config says what's
 wrong in each lens, how to attack it, and how to work in the repository on
-this machine. [docs/acr-repo-setup.md](docs/acr-repo-setup.md) walks through
+this machine. [acrbus's docs/acr-repo-setup.md](https://github.com/Skeptic-Dog-Software/acrbus/blob/main/docs/acr-repo-setup.md) walks through
 writing one for a repository you don't know yet, and checking it against
 real work.
 
@@ -116,7 +121,8 @@ have no effect on it.
 
 An agent's address is `name@machine`, such as `api@laptop`. The name
 defaults to the repository the session runs in, plus the worktree name in a
-linked worktree. Set `TAILBUS_AGENT`, or pass `--as`, to choose another.
+linked worktree. Set `ACRBUS_AGENT` (or `TAILBUS_AGENT`, also read), or pass
+`--as`, to choose another.
 
 Only one live session can hold a name at a time. A second session with the
 same name is refused, and has to choose a name of its own. An agent's
@@ -566,7 +572,7 @@ statement and what earlier commits and docs say, as claims to check, not to
 take on trust. A lens's `blocker` gives its dimension's definition of a
 blocker, set when the repository is calibrated, and every repository also
 gets a built-in `elegance` lens. The method is in
-[the ACR skill](plugin/skills/acr/SKILL.md). All four roles go through
+[the ACR skill](https://github.com/Skeptic-Dog-Software/acrbus/blob/main/plugin/skills/acr/SKILL.md). All four roles go through
 [bridges](#headless-agents).
 
 | Role | Job | Sized for |
@@ -682,8 +688,8 @@ The repository's config needn't be in the repository. Keep it at
 `~/.config/tailbus/acr/<repository>.yaml`, or name it with `--config`, and its
 `not_findings` path is beside it. Then nothing about the review goes into the
 repository, and no change to it can touch the rules it's reviewed by. Without
-one, it's the repository's own `.acr/config.yaml`. [`schema/acr.schema.json`](schema/acr.schema.json)
-is the published schema, and [`examples/acr/`](examples/acr/) has configs for a
+one, it's the repository's own `.acr/config.yaml`. [`schema/acr.schema.json`](https://github.com/Skeptic-Dog-Software/acrbus/blob/main/schema/acr.schema.json)
+is the published schema, and [`examples/acr/`](https://github.com/Skeptic-Dog-Software/acrbus/blob/main/examples/acr/) has configs for a
 Go and a Rust repository, and a user's. A tier's `match.paths` applies when every
 changed file matches. Tiers go from lowest to highest, and when the Sizer isn't
 sure, it's the higher one. `bottom-of-stack` reviews the first commit after the
@@ -868,3 +874,11 @@ cargo fmt --check
 
 CI runs these on the org's self-hosted runner, which isn't a Mac, so run
 them on a Mac before pushing.
+
+This repository is the tailbus program: `src/main.rs` names it and adds
+Tailscale (`src/tailscale.rs`) as its network. Everything else, the bus,
+bridges, `/pipe`, ACR and their tests, is
+[acrbus](https://github.com/Skeptic-Dog-Software/acrbus), pinned by tag in
+`Cargo.toml`. Change it there, tag a release, and move the pin here. To try
+a local acrbus first, point the dependency at it with
+`cargo build --config 'patch."https://github.com/Skeptic-Dog-Software/acrbus".acrbus.path="../acrbus"'`.
