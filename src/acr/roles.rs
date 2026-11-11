@@ -255,7 +255,13 @@ pub struct Rating {
     pub line: Option<u64>,
     #[serde(deserialize_with = "lenient::severity")]
     pub severity: Severity,
-    #[serde(default = "yes", deserialize_with = "lenient::flag")]
+    /// It's a real defect, whatever caused it: false only for something
+    /// that isn't a defect at all.
+    #[serde(
+        default = "yes",
+        rename = "real_defect",
+        deserialize_with = "lenient::flag"
+    )]
     pub relevant: bool,
     #[serde(default = "yes", deserialize_with = "lenient::flag")]
     pub on_task: bool,
@@ -323,11 +329,12 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          - High: real defect in a realistic case\n\
          - Medium: real defect in a narrow case\n\
          - Low: nit or unlikely edge case\n\
-         - Rejected: not a real defect, or a decided non-issue, with the reason\n\n\
+         - Rejected: a decided non-issue, with the reason\n\n\
          A real defect outside this lens's criteria is rated like any other, with `on_task` \
          false: don't reject it for that.\n\n\
          For each finding, also state these facts, each true or false, from the code: \
-         `pre_existing`, the defect is in code as it was before the change, which the change \
+         `real_defect`, it's a real defect, whatever caused it and whichever lens it belongs \
+         to: false only for something that isn't a defect at all; `pre_existing`, the defect is in code as it was before the change, which the change \
          didn't add or alter: a test or line the change adds is never pre-existing; \
          `claims_fix`, the change says it fixes it; `worsens`, the change makes a pre-existing \
          defect worse; `weak_pin`, it's a test the change adds or changes that can't fail when \
@@ -342,7 +349,7 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          comes down to values, not fact. Give both sides in `sides` when you set either.\n\n\
          The reviewers' findings, one list each:\n{findings}\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\", \"detail\", \"file\", \"line\", \
-         \"severity\", \"relevant\", \"on_task\", \"reason\", \"split\", \"values_call\", \
+         \"severity\", \"real_defect\", \"on_task\", \"reason\", \"split\", \"values_call\", \
          \"sides\", \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \"misleads\", \
          \"equivalent_mutant\"}}]}}.",
         n = reviews.len(),
@@ -478,7 +485,7 @@ mod tests {
 {"findings": [
   {"title": "Lost email", "file": "welcome.go", "line": "128-138", "severity": "high",
    "split": "true", "sides": "one reviewer says it's fine"},
-  {"title": "Nit", "line": 7, "severity": "Low: an unlikely edge", "relevant": "no"},
+  {"title": "Nit", "line": 7, "severity": "Low: an unlikely edge", "real_defect": "no"},
   {"title": "Noise", "line": null, "severity": "REJECTED", "reason": "decided"}
 ]}
 ```

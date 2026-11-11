@@ -3268,7 +3268,7 @@ lenses:
             Role::Reviewer => Ok(ONE.into()),
             Role::Judge => Ok(r#"{"findings": [{"title": "t", "severity": "Critical",
                 "on_task": false, "reason": "another lens's job"},
-                {"title": "n", "severity": "High", "relevant": false, "reason": "not so"}]}"#
+                {"title": "n", "severity": "High", "real_defect": false, "reason": "not so"}]}"#
                 .into()),
             _ => Ok(NOTHING.into()),
         });
