@@ -21,6 +21,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::config::APP_NAME;
 use crate::config::Paths;
 use crate::util::new_id;
 
@@ -506,7 +507,7 @@ fn confine_settings(paths: &Paths) -> Result<PathBuf> {
         .join(crate::setup::CONFINE_FILE);
     if !path.is_file() {
         bail!(
-            "{} is missing, which keeps reviewers to the code under review: run `tailbus setup acr`",
+            "{} is missing, which keeps reviewers to the code under review: run `{APP_NAME} setup acr`",
             path.display()
         );
     }
@@ -535,8 +536,12 @@ fn claude(paths: &Paths, config: &Path, workdir: &Path, ask: &Ask) -> Result<Str
     } = *ask;
     let confine = confine_settings(paths)?;
     let token_file = paths.config.with_file_name("claude-token");
-    let token = fs::read_to_string(&token_file)
-        .with_context(|| format!("reading {}: run `tailbus setup acr`", token_file.display()))?;
+    let token = fs::read_to_string(&token_file).with_context(|| {
+        format!(
+            "reading {}: run `{APP_NAME} setup acr`",
+            token_file.display()
+        )
+    })?;
     let tmp = config.with_file_name(format!(
         "{}-tmp",
         config.file_name().unwrap_or_default().to_string_lossy()
@@ -1138,7 +1143,7 @@ fn unscored(e: &anyhow::Error, kept: Option<&Path>, key_path: &Path) -> String {
         })
         .unwrap_or_default();
     format!(
-        "not scored: {e:#}{kept}; score it with `tailbus acr rescore {} --results <file>`",
+        "not scored: {e:#}{kept}; score it with `{APP_NAME} acr rescore {} --results <file>`",
         key_path.display()
     )
 }
@@ -1684,7 +1689,7 @@ mod tests {
         assert!(
             note.starts_with("not scored: the scorer failed 2 times: try 2 isn't JSON")
                 && note.contains("/kept/x")
-                && note.contains("tailbus acr rescore /b/k.yaml --results"),
+                && note.contains(&format!("{APP_NAME} acr rescore /b/k.yaml --results")),
             "{note}"
         );
     }

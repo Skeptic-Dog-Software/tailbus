@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use crate::alert;
 use crate::ask::{self, Asks, Prompt};
 use crate::attach::Attachments;
+use crate::config::APP_NAME;
 use crate::config::Config;
 use crate::format;
 use crate::local::{Awaited, Event, Inbox, Item, Moved, PeerMachine, Peers, Sent};
@@ -821,7 +822,7 @@ impl Bus {
         let run = live.runs.get(agent)?;
         run.paused.then(|| {
             format!(
-                "tailbus has paused your messages. Other agents' messages have reached you {} \
+                "{APP_NAME} has paused your messages. Other agents' messages have reached you {} \
                  times in a row without your user typing in this session, so new ones wait \
                  until your user does, or lets them continue from the dialog on their Mac. \
                  Don't wait for replies now: finish what you're doing and tell your user \
@@ -855,7 +856,7 @@ impl Bus {
         };
         let machine = self.me().map(|m| m.machine).unwrap_or_default();
         let prompt = Prompt {
-            title: "tailbus: agents paused".into(),
+            title: format!("{APP_NAME}: agents paused"),
             text: format!(
                 "{agent}@{machine} has been handed messages from other agents {limit} times in \
                  a row without you typing in its session. The latest is from {}:\n\n{}\n\n\
@@ -1056,12 +1057,11 @@ impl Bus {
         let steps = self.db().pipe_steps(agent, &task.msg.id, &task.msg.from)?;
         let stage = |s: &Incoming| s.msg.pipe.as_ref().map(|p| p.stage);
         if steps.iter().any(|s| stage(s) == Some(PipeStage::Cancel)) {
-            return Ok(Some(
-                "tailbus: your hub's user cancelled this /pipe task, so start no more \
-                 subagents. Stop the ones still running, and send pipe_result (reply_to: the \
-                 task's id) with what's done, saying it was cancelled."
-                    .into(),
-            ));
+            return Ok(Some(format!(
+                "{APP_NAME}: your hub's user cancelled this /pipe task, so start no more \
+                     subagents. Stop the ones still running, and send pipe_result (reply_to: \
+                     the task's id) with what's done, saying it was cancelled."
+            )));
         }
         // What the latest approval allows comes from the worker's own plan,
         // whatever the approval says.
@@ -1074,19 +1074,18 @@ impl Bus {
                 plan.msg.pipe?.plan?.estimate.map(|e| e.budget)
             });
         let Some(budget) = approved else {
-            return Ok(Some(
-                "tailbus: this /pipe task's plan isn't approved yet, so it can't start \
-                 subagents. Send your plan with pipe_plan (reply_to: the task's id), and wait \
-                 for your hub's answer."
-                    .into(),
-            ));
+            return Ok(Some(format!(
+                "{APP_NAME}: this /pipe task's plan isn't approved yet, so it can't start \
+                     subagents. Send your plan with pipe_plan (reply_to: the task's id), and \
+                     wait for your hub's answer."
+            )));
         };
         let used = usage::measure(transcript, task.msg.created_at - CLOCK_SLACK_MS)
             .map(|u| u.total().total())
             .unwrap_or(0);
         if used >= budget {
             return Ok(Some(format!(
-                "tailbus: this /pipe task has used {} tokens, and its approved plan allows {}, \
+                "{APP_NAME}: this /pipe task has used {} tokens, and its approved plan allows {}, \
                  so it can't start more subagents. Send a plan for what's left with pipe_plan, \
                  which asks your hub's user to approve more, or stop and send pipe_result \
                  with what's done.",
@@ -1116,7 +1115,7 @@ impl Bus {
         let running = found.running + starting;
         if running >= cap as usize {
             return Ok(Some(format!(
-                "tailbus: this /pipe task already has {running} subagent{} running, and its \
+                "{APP_NAME}: this /pipe task already has {running} subagent{} running, and its \
                  cap is {cap} at once. Start this one after one of them finishes.",
                 if running == 1 { "" } else { "s" }
             )));
@@ -2461,10 +2460,10 @@ pub(crate) mod tests {
         assert_eq!(preview("hello\nworld"), "hello…");
     }
 
-    /// The tailnet, which these tests never ask: each sets the bus's view
-    /// of it itself.
+    /// A network that reaches other machines, which these tests never ask:
+    /// each sets the bus's view of it itself.
     pub fn tailnet() -> Box<dyn Network> {
-        Box::new(crate::tailscale::Tailscale::find(None))
+        Box::new(crate::network::Remote)
     }
 
     /// A bus on machine `here` with no Tailscale, no dialogs, and `api`
@@ -3197,7 +3196,12 @@ pub(crate) mod tests {
         // The worker's bus adds the estimate, and the hub sees it.
         let shown = bus.db().incoming(&plan).unwrap().unwrap();
         assert!(shown.msg.body.starts_with("One researcher, two builders"));
-        assert!(shown.msg.body.contains("## Estimate, by tailbus"));
+        assert!(
+            shown
+                .msg
+                .body
+                .contains(&format!("## Estimate, by {APP_NAME}"))
+        );
         let step = shown.msg.pipe.unwrap();
         assert_eq!(step.task.as_deref(), Some(task.as_str()));
         let estimate = step.plan.unwrap().estimate.unwrap();

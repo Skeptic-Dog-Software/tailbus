@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::config::APP_NAME;
 use anyhow::{Context, Result, bail};
 
 /// Escape picks the first button, the "no" one. None is the default, so
@@ -61,7 +62,7 @@ impl Dialog {
             });
         }
         if !cfg!(target_os = "macos") {
-            bail!("tailbus shows dialogs only on macOS");
+            bail!("{APP_NAME} shows dialogs only on macOS");
         }
         let child = Command::new("/usr/bin/osascript")
             .arg("-e")

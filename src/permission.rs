@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::alert;
 use crate::ask::Prompt;
+use crate::config::APP_NAME;
 
 /// Tools whose permission prompt is the user answering in the terminal, a
 /// question carousel or a plan to approve, rather than a call to allow.
@@ -167,7 +168,7 @@ pub fn prompt(r: &Request) -> Prompt {
         buttons.push("Allow for session".into());
     }
     Prompt {
-        title: "tailbus: permission".into(),
+        title: format!("{APP_NAME}: permission"),
         text,
         buttons,
     }
@@ -189,7 +190,7 @@ pub fn decision(choice: usize, machine: &str, rules: &[Value]) -> Value {
         ALLOW_FOR_SESSION => json!({"behavior": "allow", "updatedPermissions": rules}),
         _ => json!({
             "behavior": "deny",
-            "message": format!("Your user denied this from the tailbus alert on {machine}."),
+            "message": format!("Your user denied this from the {APP_NAME} alert on {machine}."),
         }),
     };
     json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}})

@@ -1,32 +1,78 @@
-//! Where tailbus keeps its state, and its optional config file.
+//! Which program this is, where it keeps its state, and its optional config
+//! file.
 
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
 pub const DEFAULT_PORT: u16 = 4747;
 
-/// Which program this is: where it keeps things and what its services are
-/// called. The only thing that will tell acrbus and tailbus apart.
+/// Which program this is: its name, where it keeps things, what its
+/// services are called, and which network a bus is on when its config names
+/// none. The only thing that tells acrbus and a program built on it, such
+/// as tailbus, apart.
+#[derive(Debug)]
 pub struct App {
-    /// Its folders under XDG's, and its systemd units.
+    /// Its name, in what it says and runs as, its folders under XDG's, and
+    /// its systemd units.
     pub name: &'static str,
-    /// The variable that puts everything in one folder instead.
-    pub home_var: &'static str,
     /// Its launchd labels.
     pub label: &'static str,
+    /// What `--help` says it is.
+    pub about: &'static str,
+    /// The network a config that names none is on.
+    pub network: &'static str,
+    /// The networks it knows besides `local`, which every one knows.
+    pub networks: &'static [crate::network::Kind],
 }
 
-pub const APP: App = App {
-    name: "tailbus",
-    home_var: "TAILBUS_HOME",
-    label: "com.skepticdogsoftware.tailbus",
+/// acrbus itself: a bus on this machine alone.
+pub const ACRBUS: App = App {
+    name: "acrbus",
+    label: "com.skepticdogsoftware.acrbus",
+    about: "Adversarial convergence review (ACR) on a local agent bus",
+    network: "local",
+    networks: &[],
 };
+
+static CURRENT: OnceLock<&'static App> = OnceLock::new();
+
+/// Says which program this is, once, before anything else runs. A program
+/// that never says is acrbus.
+pub fn set_app(app: &'static App) {
+    let _ = CURRENT.set(app);
+}
+
+pub fn app() -> &'static App {
+    CURRENT.get().copied().unwrap_or(&ACRBUS)
+}
+
+/// The program's name in what it says: `{APP_NAME}` in a format string.
+pub struct AppName;
+
+impl fmt::Display for AppName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(app().name)
+    }
+}
+
+pub const APP_NAME: AppName = AppName;
+
+/// One of our environment variables, `ACRBUS_<name>`, or `TAILBUS_<name>`,
+/// which sessions started before acrbus set. Either is accepted, whichever
+/// program this is; an empty one counts as unset.
+pub fn env_var(name: &str) -> Option<String> {
+    [format!("ACRBUS_{name}"), format!("TAILBUS_{name}")]
+        .iter()
+        .find_map(|var| env::var(var).ok().filter(|v| !v.is_empty()))
+}
 
 pub struct Paths {
     /// Database, socket and log. Kept `0700`.
@@ -35,11 +81,11 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// `$TAILBUS_HOME` holds everything when set. Otherwise state goes in
-    /// `$XDG_STATE_HOME/tailbus` and the config in
-    /// `$XDG_CONFIG_HOME/tailbus/config.toml`.
+    /// `$ACRBUS_HOME` (or `$TAILBUS_HOME`) holds everything when set.
+    /// Otherwise state goes in `$XDG_STATE_HOME/<app>` and the config in
+    /// `$XDG_CONFIG_HOME/<app>/config.toml`.
     pub fn find() -> Result<Paths> {
-        if let Some(home) = env_path(APP.home_var) {
+        if let Some(home) = env_var("HOME").map(PathBuf::from) {
             return Ok(Paths {
                 config: home.join("config.toml"),
                 state: home,
@@ -51,11 +97,11 @@ impl Paths {
         };
         Ok(Paths {
             state: Paths::default_state()?,
-            config: config.join(APP.name).join("config.toml"),
+            config: config.join(app().name).join("config.toml"),
         })
     }
 
-    /// Where state goes when `$TAILBUS_HOME` doesn't say: the default home,
+    /// Where state goes when `$ACRBUS_HOME` doesn't say: the default home,
     /// whose services keep the plain names.
     pub fn default_state() -> Result<PathBuf> {
         let state = match env_path("XDG_STATE_HOME") {
@@ -64,7 +110,7 @@ impl Paths {
                 .context("HOME is not set")?
                 .join(".local/state"),
         };
-        Ok(state.join(APP.name))
+        Ok(state.join(app().name))
     }
 
     pub fn socket(&self) -> PathBuf {
@@ -76,9 +122,9 @@ impl Paths {
         let socket = self.socket();
         if socket.as_os_str().len() >= 104 {
             anyhow::bail!(
-                "the socket path {} is too long for a Unix socket; set {} to a shorter directory",
+                "the socket path {} is too long for a Unix socket; set ACRBUS_HOME to a shorter \
+                 directory",
                 socket.display(),
-                APP.home_var
             );
         }
         Ok(())
@@ -117,10 +163,11 @@ fn env_path(var: &str) -> Option<PathBuf> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// `tailscale`, the default, carries messages between the tailnet's
-    /// machines. `local` keeps the bus to this machine, with no Tailscale.
+    /// Which network the bus is on: `local`, this machine alone, or one the
+    /// program knows besides, such as tailbus's `tailscale`. The program's
+    /// own when left out.
     #[serde(default)]
-    pub network: crate::network::Kind,
+    pub network: Option<String>,
     /// On a local bus, this machine's name on it. The hostname by default.
     pub machine: Option<String>,
     /// On a local bus, who every message here comes from, which each
@@ -140,7 +187,8 @@ pub struct Config {
     /// Days a stale message is kept, to be seen, before it evaporates.
     #[serde(default = "default_stale")]
     pub stale_days: u32,
-    /// The Tailscale CLI, if not the app's or the one on `PATH`.
+    /// A network's own setting: for tailbus's `tailscale` network, the
+    /// Tailscale CLI, if not the app's or the one on `PATH`.
     pub tailscale: Option<PathBuf>,
     /// How many times in a row a session can be handed other agents'
     /// messages, with no prompt from its user in between, before the bus
@@ -251,7 +299,7 @@ mod tests {
         assert!(cfg.clients.is_empty());
         assert_eq!(cfg.max_subagents, 5);
         assert!(cfg.bridges.is_empty());
-        assert_eq!(cfg.network, crate::network::Kind::Tailscale);
+        assert_eq!(cfg.network, None, "the program's own network");
         assert!(cfg.machine.is_none() && cfg.owner.is_none());
         assert_eq!(cfg.max_attachment_bytes, 1 << 30);
         assert_eq!(cfg.attachment_retention_days, 7);

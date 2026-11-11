@@ -15,6 +15,7 @@ use serde_json::json;
 
 use crate::attach::Attachments;
 use crate::bridge::on_stop_signal;
+use crate::config::APP_NAME;
 use crate::config::{Config, Paths};
 use crate::local::{self, Awaited, Client, Item, Request, Sent};
 use crate::proto::{Extras, MAX_BODY, RunOptions, RunStatus};
@@ -65,7 +66,7 @@ pub fn exit_code(status: RunStatus) -> u8 {
 }
 
 fn say(code: u8, why: impl std::fmt::Display) -> ExitCode {
-    eprintln!("tailbus: {why}");
+    eprintln!("{APP_NAME}: {why}");
     ExitCode::from(code)
 }
 
@@ -187,14 +188,14 @@ fn show(item: &Item, args: &Args) -> Result<u8> {
     }
     for a in msg.attachments().iter().filter(|a| Some(&a.sha256) != full) {
         eprintln!(
-            "tailbus: attached {} at {}",
+            "{APP_NAME}: attached {} at {}",
             a.name,
             a.path.as_deref().unwrap_or("nowhere on this machine")
         );
     }
     if let (true, Some(r)) = (args.verbose, result) {
         eprintln!(
-            "tailbus: run {}: {}, {} ms, {}",
+            "{APP_NAME}: run {}: {}, {} ms, {}",
             r.run_id,
             r.status.as_str(),
             r.duration_ms,
@@ -205,7 +206,7 @@ fn show(item: &Item, args: &Args) -> Result<u8> {
                 .usd
                 .map_or(String::new(), |usd| format!(", ${usd:.4} by its count"));
             eprintln!(
-                "tailbus: used {} model call(s): {} tokens in ({} read from cache, {} written to it), {} out{usd}",
+                "{APP_NAME}: used {} model call(s): {} tokens in ({} read from cache, {} written to it), {} out{usd}",
                 u.calls,
                 u.input_tokens + u.cache_read_tokens + u.cache_write_tokens,
                 u.cache_read_tokens,
@@ -241,19 +242,19 @@ fn watch_for_interrupt(
             process::exit(i32::from(CANCELLED));
         };
         if no_cancel {
-            eprintln!("tailbus: run {id} is still going");
+            eprintln!("{APP_NAME}: run {id} is still going");
             process::exit(i32::from(LEFT_RUNNING));
         }
         if let Err(e) = cancel_run(&socket, &agent, &id) {
-            eprintln!("tailbus: couldn't cancel run {id}: {e:#}");
+            eprintln!("{APP_NAME}: couldn't cancel run {id}: {e:#}");
             process::exit(i32::from(UNDELIVERED));
         }
         thread::sleep(CANCEL_WAIT);
-        eprintln!("tailbus: run {id} hasn't said it stopped");
+        eprintln!("{APP_NAME}: run {id} hasn't said it stopped");
         process::exit(i32::from(CANCELLED));
     });
     if let Err(e) = watched {
-        eprintln!("tailbus: an interrupt won't cancel this run: {e:#}");
+        eprintln!("{APP_NAME}: an interrupt won't cancel this run: {e:#}");
     }
 }
 
@@ -305,27 +306,27 @@ pub(crate) fn request(
         *run = Some(sent.id.clone());
     }
     if args.verbose {
-        eprintln!("tailbus: run {}", sent.id);
+        eprintln!("{APP_NAME}: run {}", sent.id);
     }
     match wait(socket, client, agent, &sent.id, until)? {
         Awaited::Reply { item } => show(&item, args),
         Awaited::Undelivered { why } => {
-            eprintln!("tailbus: {why}");
+            eprintln!("{APP_NAME}: {why}");
             Ok(UNDELIVERED)
         }
         Awaited::Unanswered => {
             eprintln!(
-                "tailbus: {} marked it handled without answering. A bridge does that with \
+                "{APP_NAME}: {} marked it handled without answering. A bridge does that with \
                  requests from anyone but its owner.",
                 sent.to
             );
             Ok(REFUSED)
         }
         Awaited::TimedOut => {
-            eprintln!("tailbus: no reply within {wait_secs} seconds");
+            eprintln!("{APP_NAME}: no reply within {wait_secs} seconds");
             if !args.no_cancel {
                 cancel_run(socket, agent, &sent.id)
-                    .map_err(|e| eprintln!("tailbus: couldn't cancel run {}: {e:#}", sent.id))
+                    .map_err(|e| eprintln!("{APP_NAME}: couldn't cancel run {}: {e:#}", sent.id))
                     .ok();
             }
             Ok(WAIT_TIMED_OUT)

@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::ask;
 use crate::bus::{Bus, Claim, Draft, Handoff, Waited};
+use crate::config::APP_NAME;
 use crate::config::{Config, Paths};
 use crate::local::{
     self, AgentStatus, Awaited, BRIDGE_SESSION, Events, Held, Hello, Item, Messages, Request,
@@ -47,7 +48,7 @@ pub fn run(paths: &Paths) -> Result<()> {
     let socket = paths.socket();
     if UnixStream::connect(&socket).is_ok() {
         bail!(
-            "a tailbus daemon is already running on {}",
+            "a {APP_NAME} daemon is already running on {}",
             socket.display()
         );
     }
@@ -78,11 +79,11 @@ pub fn run(paths: &Paths) -> Result<()> {
     let local = if bus.remote() { "" } else { ", local only" };
     match bus.refresh_status() {
         Ok(s) => bus.event(format!(
-            "tailbus {VERSION} up on {} ({}){local}",
+            "{APP_NAME} {VERSION} up on {} ({}){local}",
             s.machine, s.owner
         )),
         Err(e) => bus.event(format!(
-            "tailbus {VERSION} up; waiting for Tailscale: {e:#}"
+            "{APP_NAME} {VERSION} up; waiting for its network: {e:#}"
         )),
     }
     if bus.remote() {

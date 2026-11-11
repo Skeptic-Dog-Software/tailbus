@@ -19,6 +19,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Deserialize;
 
+use crate::config::APP_NAME;
 use crate::format::{self, Tools};
 use crate::local::{self, Client, Inbox, Messages, Request, Verdict, Woken};
 use crate::permission;
@@ -127,7 +128,7 @@ pub fn session_start(socket: &Path, explicit: Option<String>) -> Result<ExitCode
         .count();
     if earlier > 0 {
         println!(
-            "tailbus: {earlier} message{} to you ({agent}@{}) from other agents {} read \
+            "{APP_NAME}: {earlier} message{} to you ({agent}@{}) from other agents {} read \
              earlier but not answered or marked handled. msg_inbox lists them.",
             if earlier == 1 { "" } else { "s" },
             inbox.machine,

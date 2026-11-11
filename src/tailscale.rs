@@ -10,7 +10,18 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::network::{Network, Peer, Status, Whois};
+use acrbus::config::Config;
+use acrbus::network::{Kind, Network, Peer, Status, Whois};
+
+/// tailbus's network: the bus on a tailnet, its default.
+pub const KIND: Kind = Kind {
+    name: "tailscale",
+    open: open_tailscale,
+};
+
+fn open_tailscale(cfg: &Config) -> Result<Box<dyn Network>> {
+    Ok(Box::new(Tailscale::find(cfg.tailscale.as_deref())))
+}
 
 /// The macOS app's own binary. The `tailscale` symlinks Homebrew and the app
 /// install crash with a bundle identifier error, so this goes first.
@@ -186,6 +197,25 @@ struct RawWhoisNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tailscale_is_tailbus_default_and_takes_no_local_identity() {
+        let open = |text: &str| {
+            let cfg: Config = toml::from_str(text).unwrap();
+            acrbus::network::open_for(&crate::TAILBUS, &cfg)
+        };
+        assert!(open("").unwrap().remote());
+        let e = open("owner = \"me@example.com\"").err().unwrap();
+        assert!(format!("{e:#}").contains("for a local bus"), "{e:#}");
+        // A local bus is still there for tailbus to choose.
+        let local = open("network = \"local\"\nowner = \"me@example.com\"").unwrap();
+        assert!(!local.remote());
+        let e = open("network = \"carrier-pigeon\"").err().unwrap();
+        assert!(
+            format!("{e:#}").contains("tailbus knows: it knows local, tailscale"),
+            "{e:#}"
+        );
+    }
 
     #[test]
     fn reads_status_and_whois() {

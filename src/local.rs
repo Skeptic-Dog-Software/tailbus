@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::config::APP_NAME;
 use crate::proto::{AgentList, Message};
 use crate::store::{Incoming, Outgoing};
 
@@ -441,8 +442,8 @@ impl Client {
     pub fn connect(socket: &Path) -> Result<Client> {
         let stream = UnixStream::connect(socket).map_err(|e| {
             anyhow!(
-                "the tailbus daemon isn't running ({e} at {}). Start it with \
-                 `tailbus service install`, or run `tailbus daemon`.",
+                "the {APP_NAME} daemon isn't running ({e} at {}). Start it with \
+                 `{APP_NAME} service install`, or run `{APP_NAME} daemon`.",
                 socket.display()
             )
         })?;
@@ -463,7 +464,7 @@ impl Client {
         line.push('\n');
         self.writer
             .write_all(line.as_bytes())
-            .context("writing to the tailbus daemon")
+            .with_context(|| format!("writing to the {APP_NAME} daemon"))
     }
 
     /// Reads the next reply. A dropped connection is an error.
@@ -472,10 +473,10 @@ impl Client {
         if self
             .reader
             .read_line(&mut line)
-            .context("reading from the tailbus daemon")?
+            .with_context(|| format!("reading from the {APP_NAME} daemon"))?
             == 0
         {
-            bail!("the tailbus daemon closed the connection");
+            bail!("the {APP_NAME} daemon closed the connection");
         }
         let reply: Reply = serde_json::from_str(&line).context("reading the daemon's reply")?;
         if !reply.ok {

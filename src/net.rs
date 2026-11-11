@@ -19,6 +19,7 @@ use tiny_http::{Header, Method, Response, Server};
 
 use crate::ask;
 use crate::bus::Bus;
+use crate::config::APP_NAME;
 use crate::proto::{
     AgentList, AskAnswer, AskClose, AskShow, Attachment, MessageBatch, ReceiptBatch,
 };
@@ -79,7 +80,7 @@ impl HttpError {
     pub fn describe(&self, machine: &str) -> String {
         match self.code {
             404 => format!(
-                "the bus on {machine} is too old for options or attachments; update its tailbus"
+                "the bus on {machine} is too old for options or attachments; update its {APP_NAME}"
             ),
             _ => format!("{machine} refused it: {}", self.why),
         }

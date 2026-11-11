@@ -26,6 +26,7 @@ use self::change::Change;
 use self::config::{Config, Flags, HumanGate, REPO_CONFIG, ReviewScope, Role, SCHEMA};
 use self::flow::{Answer, Call, Caller, Decision, Known, Run, Setting, Status};
 use crate::attach::Attachments;
+use crate::config::APP_NAME;
 use crate::config::{Config as BusConfig, Paths};
 use crate::local::{Awaited, Client, Request, Sent};
 use crate::proto::{Extras, MAX_BODY, RunOptions, RunStatus};
@@ -473,7 +474,8 @@ impl BridgeCaller {
             match tried {
                 Ok(awaited) => return Ok(awaited),
                 Err(e) if std::time::Instant::now() >= until => {
-                    return Err(e).context("the tailbus daemon went away mid-call");
+                    return Err(e)
+                        .with_context(|| format!("the {APP_NAME} daemon went away mid-call"));
                 }
                 Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
             }
@@ -668,7 +670,10 @@ fn finish(paths: &Paths, run: &Run, cfg: &Config, pr: Option<u64>) -> Result<Exi
                 Some(flow::Gate::Escalation) => ESCALATED,
                 _ => WAITING,
             };
-            eprintln!("tailbus: waiting for you: tailbus acr resume {}", run.id);
+            eprintln!(
+                "{APP_NAME}: waiting for you: {APP_NAME} acr resume {}",
+                run.id
+            );
             ExitCode::from(code)
         }
         Status::Running | Status::Stopped => ExitCode::FAILURE,
@@ -1023,9 +1028,9 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
         AcrCmd::Carry { name, base, head } => {
             let c = carry::carry(&paths.state, &name, base.as_deref(), &head)?;
             println!(
-                "Carried into {}: base {}, head {}.\nReview it with `tailbus acr run --repo {} \
+                "Carried into {}: base {}, head {}.\nReview it with `{APP_NAME} acr run --repo {} \
                  --base {} --head {}`, once {name}'s config is in place and calibrated, and \
-                 `tailbus acr add-repo {}` lets ACR review it.",
+                 `{APP_NAME} acr add-repo {}` lets ACR review it.",
                 c.repo.display(),
                 c.base,
                 c.head,
@@ -1119,7 +1124,7 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
                 let record = calibration::add_run(&paths.state, &repo, run)?;
                 println!(
                     "Recorded for {repo}: {} run(s) on its current config and Judge. Read where \
-                     the Judge and the keys disagree, then accept it with `tailbus acr \
+                     the Judge and the keys disagree, then accept it with `{APP_NAME} acr \
                      calibration --repo {path} --accept`.",
                     record.runs_on(&fp).len()
                 );
@@ -1511,7 +1516,7 @@ fn lens_criteria(paths: &Paths, tree: &Path, key: &trial::Key) -> Vec<(String, S
             .map(|l| (l.id.clone(), l.criteria.clone()))
             .collect(),
         Err(e) => {
-            eprintln!("tailbus: no review criteria for the builder: {e:#}");
+            eprintln!("{APP_NAME}: no review criteria for the builder: {e:#}");
             Vec::new()
         }
     }
@@ -1841,8 +1846,10 @@ fn calibrated(
 ) -> Result<Option<String>> {
     use calibration::Standing;
     let record = calibration::load(&paths.state, name)?;
-    let how = "Run `tailbus acr calibrate` on its keys twice, then `tailbus acr calibration \
-               --accept` (section 7 of docs/acr-repo-setup.md)";
+    let how = format!(
+        "Run `{APP_NAME} acr calibrate` on its keys twice, then `{APP_NAME} acr calibration \
+         --accept` (section 7 of docs/acr-repo-setup.md)"
+    );
     match calibration::standing(&record, now) {
         Standing::Calibrated => Ok(None),
         Standing::JudgeChanged => Ok(Some(format!(

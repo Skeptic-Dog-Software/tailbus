@@ -12,6 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::APP_NAME;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -160,7 +161,7 @@ pub fn accept(state: &Path, repo: &str, now: &Fingerprint, at: i64) -> Result<Ac
     if runs < RUNS_NEEDED {
         bail!(
             "{repo} has {runs} calibration run(s) on its current config and Judge; it needs \
-             {RUNS_NEEDED}: run `tailbus acr calibrate` on its keys again first"
+             {RUNS_NEEDED}: run `{APP_NAME} acr calibrate` on its keys again first"
         );
     }
     let accepted = Accepted {

@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::bridge;
-use crate::config::{APP, Paths};
+use crate::config::{APP_NAME, Paths, app, env_var};
 use crate::local::{self, Hello, Request};
 
 /// The wait hook's timeout. Claude Code enforces it on `asyncRewake` hooks,
@@ -37,7 +37,7 @@ fn this_exe() -> Result<PathBuf> {
     let exe = env::current_exe()?.canonicalize()?;
     if exe.components().any(|c| c.as_os_str() == "target") {
         eprintln!(
-            "Note: {} looks like a build directory. Install tailbus first \
+            "Note: {} looks like a build directory. Install {APP_NAME} first \
              (`cargo install --path .`) so this points at a binary that stays put.",
             exe.display()
         );
@@ -68,30 +68,31 @@ pub fn claude(install: bool) -> Result<()> {
             || home().map(|h| h.join(".local/share")),
             |d| Ok(PathBuf::from(d)),
         )?;
-    let root = data.join("tailbus").join("claude");
-    let plugin = root.join("tailbus");
-    let description = "Direct messages between AI agents on your tailnet";
+    let name = app().name;
+    let root = data.join(name).join("claude");
+    let plugin = root.join(name);
+    let description = app().about;
 
     write(
         &root.join(".claude-plugin/marketplace.json"),
         &pretty(&json!({
-            "name": "tailbus",
+            "name": name,
             "owner": {"name": "Skeptic Dog Software"},
-            "plugins": [{"name": "tailbus", "source": "./tailbus", "description": description}]
+            "plugins": [{"name": name, "source": format!("./{name}"), "description": description}]
         })),
     )?;
     write(
         &plugin.join(".claude-plugin/plugin.json"),
         &pretty(&json!({
-            "name": "tailbus",
+            "name": name,
             "version": env!("CARGO_PKG_VERSION"),
             "description": description,
-            "repository": "https://github.com/Skeptic-Dog-Software/tailbus"
+            "repository": format!("https://github.com/Skeptic-Dog-Software/{name}")
         })),
     )?;
     write(
         &plugin.join(".mcp.json"),
-        &pretty(&json!({"mcpServers": {"tailbus": {"command": exe, "args": ["mcp"]}}})),
+        &pretty(&json!({"mcpServers": {name: {"command": exe, "args": ["mcp"]}}})),
     )?;
     let wait = json!({
         "type": "command", "command": exe, "args": ["hook", "wait"],
@@ -105,7 +106,7 @@ pub fn claude(install: bool) -> Result<()> {
     write(
         &plugin.join("hooks/hooks.json"),
         &pretty(&json!({
-            "description": "tailbus: show messages from other agents, waking the session when it's idle",
+            "description": format!("{name}: show messages from other agents, waking the session when it's idle"),
             "hooks": {
                 "SessionStart": [{"hooks": [
                     {"type": "command", "command": exe, "args": ["hook", "session-start"], "timeout": 10},
@@ -129,7 +130,7 @@ pub fn claude(install: bool) -> Result<()> {
         })),
     )?;
     // The /pipe command, and the ACR method its workers follow.
-    write(&plugin.join("commands/pipe.md"), PIPE)?;
+    write(&plugin.join("commands/pipe.md"), &pipe_text())?;
     write(
         &plugin.join("skills/acr/SKILL.md"),
         include_str!("../plugin/skills/acr/SKILL.md"),
@@ -139,7 +140,7 @@ pub fn claude(install: bool) -> Result<()> {
 
     if !install {
         println!(
-            "To install it:\n  claude plugin marketplace add {}\n  claude plugin install tailbus@tailbus",
+            "To install it:\n  claude plugin marketplace add {}\n  claude plugin install {APP_NAME}@{APP_NAME}",
             root.display()
         );
         return Ok(());
@@ -157,7 +158,8 @@ pub fn claude(install: bool) -> Result<()> {
         bail!("`claude plugin marketplace add` failed: {}", said.trim());
     }
     let installed = Command::new(&claude)
-        .args(["plugin", "install", "tailbus@tailbus"])
+        .args(["plugin", "install"])
+        .arg(format!("{name}@{name}"))
         .stdin(Stdio::null())
         .output()?;
     let said = String::from_utf8_lossy(&installed.stdout).to_string()
@@ -166,25 +168,37 @@ pub fn claude(install: bool) -> Result<()> {
         bail!("`claude plugin install` failed: {}", said.trim());
     }
     println!(
-        "Installed the tailbus plugin. Sessions started from now on load it. Restart \
+        "Installed the {APP_NAME} plugin. Sessions started from now on load it. Restart \
          sessions that are already open: /reload-plugins rereads the plugin's files, but \
-         keeps a tailbus server that's already running on the old version."
+         keeps a {APP_NAME} server that's already running on the old version."
     );
     Ok(())
 }
 
 const PIPE: &str = include_str!("../plugin/commands/pipe.md");
-/// Marks the personal `/pipe` skill as tailbus's, so setup replaces only
-/// its own.
-const PIPE_MARK: &str = "<!-- Installed by `tailbus setup claude`, which rewrites this file. -->";
+
+/// The `/pipe` command, naming this program where it says "tailbus".
+fn pipe_text() -> String {
+    PIPE.replace("tailbus", app().name)
+}
+
+/// The end of the mark on the personal `/pipe` skill that says setup wrote
+/// it, so setup replaces only its own: the same whichever program wrote it.
+const PIPE_MARK_END: &str = "setup claude`, which rewrites this file. -->";
+
+fn pipe_mark() -> String {
+    format!("<!-- Installed by `{APP_NAME} {PIPE_MARK_END}")
+}
 
 /// The `/pipe` command as a personal skill. A plugin's commands always
 /// carry the plugin's name, as `/tailbus:pipe`, and a personal skill is the
 /// way to have a plain `/pipe`. Only your user starts it.
 fn pipe_skill() -> String {
-    let rest = PIPE.strip_prefix("---\n").unwrap_or(PIPE);
+    let pipe = pipe_text();
+    let rest = pipe.strip_prefix("---\n").unwrap_or(&pipe);
     let (front, body) = rest.split_once("\n---\n").unwrap_or(("", rest));
-    format!("---\nname: pipe\ndisable-model-invocation: true\n{front}\n---\n{PIPE_MARK}\n{body}")
+    let mark = pipe_mark();
+    format!("---\nname: pipe\ndisable-model-invocation: true\n{front}\n---\n{mark}\n{body}")
 }
 
 fn install_pipe_skill() -> Result<()> {
@@ -196,10 +210,10 @@ fn install_pipe_skill() -> Result<()> {
         )?;
     let path = config.join("skills/pipe/SKILL.md");
     if let Ok(existing) = fs::read_to_string(&path)
-        && !existing.contains(PIPE_MARK)
+        && !existing.contains(PIPE_MARK_END)
     {
         println!(
-            "Left {} alone, since tailbus didn't write it. /tailbus:pipe works either way.",
+            "Left {} alone, since {APP_NAME} didn't write it. /{APP_NAME}:pipe works either way.",
             path.display()
         );
         return Ok(());
@@ -322,13 +336,9 @@ impl UserUnit<'_> {
             .chain(self.args.iter().map(|a| a.to_string()))
             .map(|a| quoted(&a))
             .collect();
-        let tailbus_home = env::var_os(APP.home_var)
-            .map(|h| {
-                format!(
-                    "Environment={}\n",
-                    quoted(&format!("{}={}", APP.home_var, h.to_string_lossy()))
-                )
-            })
+        // ACRBUS_HOME is what's written now; TAILBUS_HOME is still read.
+        let tailbus_home = env_var("HOME")
+            .map(|h| format!("Environment={}\n", quoted(&format!("ACRBUS_HOME={h}"))))
             .unwrap_or_default();
         format!(
             "[Unit]\nDescription={}\n{after}\n[Service]\nExecStart={}\n{tailbus_home}Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
@@ -389,8 +399,8 @@ fn instance(paths: &Paths) -> Option<String> {
 
 fn daemon_label(paths: &Paths) -> String {
     match instance(paths) {
-        Some(i) => format!("{}.{i}", APP.label),
-        None => APP.label.to_string(),
+        Some(i) => format!("{}.{i}", app().label),
+        None => app().label.to_string(),
     }
 }
 
@@ -400,8 +410,8 @@ fn bridge_label(paths: &Paths, agent: &str) -> String {
 
 fn daemon_unit(paths: &Paths) -> String {
     match instance(paths) {
-        Some(i) => format!("{}-{i}", APP.name),
-        None => APP.name.to_string(),
+        Some(i) => format!("{}-{i}", app().name),
+        None => app().name.to_string(),
     }
 }
 
@@ -427,11 +437,10 @@ impl LaunchAgent<'_> {
         let mut env_vars = String::from(
             "        <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>\n",
         );
-        if let Some(home) = env::var_os(APP.home_var) {
+        if let Some(home) = env_var("HOME") {
             env_vars.push_str(&format!(
-                "        <key>{}</key><string>{}</string>\n",
-                APP.home_var,
-                xml(&home.to_string_lossy())
+                "        <key>ACRBUS_HOME</key><string>{}</string>\n",
+                xml(&home)
             ));
         }
         let args: String = self
@@ -569,7 +578,10 @@ fn wait_for_quiet(paths: &Paths, bridges: &[String], reviews: bool, now: bool) -
 /// Runs the daemon as a service that starts at login and restarts if it
 /// stops. Running it again replaces the running daemon, for upgrades.
 pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
-    let manager = manager("tailbus service", "tailbus daemon")?;
+    let manager = manager(
+        &format!("{APP_NAME} service"),
+        &format!("{APP_NAME} daemon"),
+    )?;
     paths.make_state_dir()?;
     // A restart drops every connection to the daemon: bridges reconnect, but
     // a run's reply or a review's call can be cut short.
@@ -592,7 +604,7 @@ pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
         }
         Manager::Systemd => UserUnit {
             name: &unit,
-            description: "tailbus: direct messages between AI agents on your tailnet",
+            description: &format!("{APP_NAME}: {}", app().about),
             args: &["daemon"],
             after: None,
         }
@@ -612,7 +624,7 @@ pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
                 } else {
                     format!("on {}, owned by {}", hello.machine, hello.owner)
                 };
-                println!("tailbus {} is running {on} ({job}).", hello.version);
+                println!("{APP_NAME} {} is running {on} ({job}).", hello.version);
                 println!("Log: {log}");
                 if manager == Manager::Systemd {
                     linger_hint();
@@ -628,18 +640,27 @@ pub fn service_install(paths: &Paths, now: bool) -> Result<()> {
 }
 
 pub fn service_uninstall(paths: &Paths) -> Result<()> {
-    let path = match manager("tailbus service", "tailbus daemon")? {
+    let path = match manager(
+        &format!("{APP_NAME} service"),
+        &format!("{APP_NAME} daemon"),
+    )? {
         Manager::Launchd => stop_launch_agent(&daemon_label(paths))?,
         Manager::Systemd => stop_unit(&daemon_unit(paths))?,
     };
-    println!("Stopped the tailbus daemon and removed {}.", path.display());
+    println!(
+        "Stopped the {APP_NAME} daemon and removed {}.",
+        path.display()
+    );
     Ok(())
 }
 
 /// Runs a bridge as a service, the way `service_install` runs the daemon.
 /// Running it again replaces the running bridge.
 pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
-    let manager = manager("tailbus bridge install", "tailbus bridge run")?;
+    let manager = manager(
+        &format!("{APP_NAME} bridge install"),
+        &format!("{APP_NAME} bridge run"),
+    )?;
     paths.make_state_dir()?;
     let settings = bridge::load(paths, agent)?;
     wait_for_quiet(paths, &[agent.to_string()], false, now)?;
@@ -667,7 +688,7 @@ pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
         Manager::Systemd => {
             let name = bridge_unit(paths, agent);
             let daemon = daemon_unit(paths);
-            let description = format!("tailbus bridge: {agent}");
+            let description = format!("{APP_NAME} bridge: {agent}");
             let job = UserUnit {
                 name: &name,
                 description: &description,
@@ -691,12 +712,15 @@ pub fn bridge_install(paths: &Paths, agent: &str, now: bool) -> Result<()> {
         thread::sleep(Duration::from_millis(250));
     }
     bail!(
-        "{job} started the {agent} bridge, but it isn't up. Is the tailbus daemon running? See {shown}"
+        "{job} started the {agent} bridge, but it isn't up. Is the {APP_NAME} daemon running? See {shown}"
     )
 }
 
 pub fn bridge_uninstall(paths: &Paths, agent: &str) -> Result<()> {
-    let path = match manager("tailbus bridge uninstall", "tailbus bridge run")? {
+    let path = match manager(
+        &format!("{APP_NAME} bridge uninstall"),
+        &format!("{APP_NAME} bridge run"),
+    )? {
         Manager::Launchd => stop_launch_agent(&bridge_label(paths, agent))?,
         Manager::Systemd => stop_unit(&bridge_unit(paths, agent))?,
     };
@@ -761,9 +785,9 @@ fn acr_bridge(
     let p = |p: &Path| q(&p.to_string_lossy());
     format!(
         r#"
-# ACR on this machine, set up by `tailbus setup acr`: headless Claude Code,
+# ACR on this machine, set up by `{APP_NAME} setup acr`: headless Claude Code,
 # on your own subscription, running in the repository under review. Allow a
-# repository with `tailbus acr add-repo <path>`.
+# repository with `{APP_NAME} acr add-repo <path>`.
 [bridges.{ACR_AGENT}]
 owner = {owner}
 command = {claude}
@@ -869,7 +893,7 @@ fn confine_bridge(doc: &mut toml_edit::DocumentMut, confine: &Path) -> Result<bo
 fn acr_bindings(machine: &str) -> String {
     let agent = format!("{ACR_AGENT}@{machine}");
     format!(
-        r#"# ACR's bindings, set up by `tailbus setup acr`: Anthropic models through
+        r#"# ACR's bindings, set up by `{APP_NAME} setup acr`: Anthropic models through
 # {agent}, headless Claude Code on your subscription, so they count in
 # tokens. ACR runs on one machine: every role works in the repository, and
 # reviewers read it in place, read-only. Each timeout is 4 hours, a cap no
@@ -965,7 +989,7 @@ fn make_token(claude: &Path, token: &Path) -> Result<()> {
     }
     let text = read_hidden("Paste the token it printed (it won't show): ")?;
     if text.is_empty() || text.contains(char::is_whitespace) {
-        bail!("that doesn't look like a token; run `tailbus setup acr` again");
+        bail!("that doesn't look like a token; run `{APP_NAME} setup acr` again");
     }
     if let Some(dir) = token.parent() {
         fs::create_dir_all(dir)?;
@@ -1012,7 +1036,7 @@ fn acr_workdirs<'a>(
         .and_then(|b| b.get_mut(agent))
         .and_then(|a| a.as_table_like_mut())
         .with_context(|| match agent {
-            ACR_AGENT => "there's no ACR agent here yet: run `tailbus setup acr` first".to_string(),
+            ACR_AGENT => format!("there's no ACR agent here yet: run `{APP_NAME} setup acr` first"),
             _ => format!("there's no {agent} bridge in this machine's config"),
         })?;
     let options = bridge
@@ -1125,7 +1149,9 @@ pub fn acr_dir(paths: &Paths, dir: &Path, agent: &str) -> Result<bool> {
 /// part is left alone if it's there already, so running it again is safe.
 pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
     let status: crate::local::Status = local::call(&paths.socket(), &Request::Status)
-        .context("the tailbus daemon has to be running: tailbus service install")?;
+        .with_context(|| {
+            format!("the {APP_NAME} daemon has to be running: {APP_NAME} service install")
+        })?;
     let (Some(machine), Some(owner)) = (status.machine, status.owner) else {
         bail!("the daemon doesn't know this machine's name yet; try again in a moment");
     };
@@ -1223,7 +1249,7 @@ pub fn acr(paths: &Paths, repos: &[PathBuf]) -> Result<()> {
     bridge_install(paths, ACR_AGENT, false)?;
     let empty = acr_workdirs(&mut doc, ACR_AGENT)?.is_empty();
     if empty {
-        println!("Next, allow each repository ACR reviews here: tailbus acr add-repo <path>");
+        println!("Next, allow each repository ACR reviews here: {APP_NAME} acr add-repo <path>");
     }
     Ok(())
 }
@@ -1238,27 +1264,26 @@ mod tests {
             state: Paths::default_state().unwrap(),
             config: PathBuf::from("/c/config.toml"),
         };
-        assert_eq!(daemon_label(&default), "com.skepticdogsoftware.tailbus");
+        // Named after the program: acrbus here, tailbus in tailbus.
+        let (label, name) = (app().label, app().name);
+        assert_eq!(daemon_label(&default), label);
         assert_eq!(
             bridge_label(&default, "claude-acr"),
-            "com.skepticdogsoftware.tailbus.bridge.claude-acr"
+            format!("{label}.bridge.claude-acr")
         );
-        assert_eq!(daemon_unit(&default), "tailbus");
-        assert_eq!(bridge_unit(&default, "omp"), "tailbus-bridge-omp");
+        assert_eq!(daemon_unit(&default), name);
+        assert_eq!(bridge_unit(&default, "omp"), format!("{name}-bridge-omp"));
 
         let other = Paths {
             state: PathBuf::from("/tmp/a-test-home"),
             config: PathBuf::from("/tmp/a-test-home/config.toml"),
         };
         let label = bridge_label(&other, "claude-acr");
-        assert!(
-            label.starts_with("com.skepticdogsoftware.tailbus."),
-            "{label}"
-        );
+        assert!(label.starts_with(&format!("{}.", app().label)), "{label}");
         assert!(label.ends_with(".bridge.claude-acr"), "{label}");
         assert_ne!(label, bridge_label(&default, "claude-acr"));
         assert_ne!(daemon_label(&other), daemon_label(&default));
-        assert!(bridge_unit(&other, "omp").starts_with("tailbus-"));
+        assert!(bridge_unit(&other, "omp").starts_with(&format!("{name}-")));
         assert_ne!(bridge_unit(&other, "omp"), bridge_unit(&default, "omp"));
         // The same home always gets the same names.
         assert_eq!(label, bridge_label(&other, "claude-acr"));
@@ -1479,7 +1504,7 @@ mod tests {
         let skill = pipe_skill();
         assert!(skill.starts_with("---\nname: pipe\ndisable-model-invocation: true\ndescription:"));
         assert!(skill.contains("argument-hint:"));
-        assert!(skill.contains(&format!("---\n{PIPE_MARK}\n")));
+        assert!(skill.contains(&format!("---\n{}\n", pipe_mark())));
         assert!(skill.contains("Arguments: $ARGUMENTS"));
         assert_eq!(skill.matches("\n---\n").count(), 1);
     }

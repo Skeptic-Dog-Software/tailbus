@@ -1,17 +1,15 @@
 //! What the bus knows of where it is: this machine's name and owner, the
 //! other machines it can reach, and who is on the other end of a connection.
 //!
-//! Tailscale is one network. A local bus is the other: its name and owner
-//! come from the config, it reaches no other machine, and it needs no
-//! Tailscale at all.
+//! A local bus is the one every program knows: its name and owner come from
+//! the config, and it reaches no other machine. A program built on acrbus
+//! can know more, such as tailbus's Tailscale, through its `App`.
 
 use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{Result, bail};
-use serde::Deserialize;
 
-use crate::config::Config;
-use crate::tailscale::Tailscale;
+use crate::config::{Config, app};
 use crate::util::{normalize_name, valid_name};
 
 #[derive(Debug, Clone)]
@@ -49,14 +47,16 @@ pub trait Network: Send + Sync {
     fn remote(&self) -> bool;
 }
 
-/// Which network the config chose.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    #[default]
-    Tailscale,
-    Local,
+/// A network a bus can be on besides `local`: what `network` calls it in
+/// config.toml, and how it's opened.
+#[derive(Debug)]
+pub struct Kind {
+    pub name: &'static str,
+    pub open: fn(&Config) -> Result<Box<dyn Network>>,
 }
+
+/// The network every program knows: this machine alone.
+pub const LOCAL: &str = "local";
 
 /// This machine alone, with no Tailscale.
 #[derive(Debug, Clone)]
@@ -114,22 +114,56 @@ impl Network for Local {
     }
 }
 
-/// The network the config names.
+/// The network the config names, or the program's own.
 pub fn open(cfg: &Config) -> Result<Box<dyn Network>> {
-    match cfg.network {
-        Kind::Tailscale => {
-            if cfg.machine.is_some() || cfg.owner.is_some() {
-                bail!(
-                    "`machine` and `owner` in config.toml are for a local bus \
-                     (`network = \"local\"`): on Tailscale, Tailscale names this machine and its owner"
-                );
-            }
-            Ok(Box::new(Tailscale::find(cfg.tailscale.as_deref())))
-        }
-        Kind::Local => Ok(Box::new(Local::new(
+    open_for(app(), cfg)
+}
+
+/// The network the config names, or `app`'s own, for `app`.
+pub fn open_for(app: &crate::config::App, cfg: &Config) -> Result<Box<dyn Network>> {
+    let name = cfg.network.as_deref().unwrap_or(app.network);
+    if name == LOCAL {
+        return Ok(Box::new(Local::new(
             cfg.machine.as_deref(),
             cfg.owner.as_deref(),
-        )?)),
+        )?));
+    }
+    let Some(kind) = app.networks.iter().find(|k| k.name == name) else {
+        let known: Vec<&str> = std::iter::once(LOCAL)
+            .chain(app.networks.iter().map(|k| k.name))
+            .collect();
+        bail!(
+            "`network = {name:?}` in config.toml isn't a network {} knows: it knows {}",
+            app.name,
+            known.join(", ")
+        );
+    };
+    if cfg.machine.is_some() || cfg.owner.is_some() {
+        bail!(
+            "`machine` and `owner` in config.toml are for a local bus \
+             (`network = \"local\"`): on {name}, the network names this machine and its owner"
+        );
+    }
+    (kind.open)(cfg)
+}
+
+/// For tests: a network that reaches other machines, which the tests never
+/// ask, setting the bus's view of it themselves.
+#[cfg(test)]
+pub struct Remote;
+
+#[cfg(test)]
+impl Network for Remote {
+    fn status(&self) -> Result<Status> {
+        bail!("a test's remote network isn't asked")
+    }
+
+    fn whois(&self, ip: IpAddr) -> Result<Whois> {
+        bail!("a test's remote network isn't asked about {ip}")
+    }
+
+    fn remote(&self) -> bool {
+        true
     }
 }
 
@@ -201,12 +235,16 @@ mod tests {
     }
 
     #[test]
-    fn tailscale_is_the_default_and_takes_no_local_identity() {
-        let net = open(&cfg("")).unwrap();
-        assert!(net.remote());
-        let e = open(&cfg("owner = \"me@example.com\"")).err().unwrap();
-        assert!(format!("{e:#}").contains("for a local bus"), "{e:#}");
-        assert!(toml::from_str::<Config>("network = \"carrier-pigeon\"").is_err());
+    fn acrbus_is_local_by_default_and_names_the_networks_it_knows() {
+        // acrbus's own network is local, so it needs an owner.
+        let e = open(&cfg("")).err().unwrap();
+        assert!(format!("{e:#}").contains("needs `owner`"), "{e:#}");
+        assert!(!open(&cfg("owner = \"me@example.com\"")).unwrap().remote());
+        let e = open(&cfg("network = \"carrier-pigeon\"")).err().unwrap();
+        assert!(
+            format!("{e:#}").contains("isn't a network acrbus knows: it knows local"),
+            "{e:#}"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use crate::config::APP_NAME;
 use anyhow::{Context, Result, bail};
 use globset::Glob;
 use regex::Regex;
@@ -631,7 +632,7 @@ pub fn resolve(user: &UserConfig, repo: Policy, flags: &Flags) -> Result<Config>
         .over(repo)
         .over(flag_layer);
     if merged.version != Some(VERSION) {
-        bail!("this tailbus reads ACR config version {VERSION}");
+        bail!("this {APP_NAME} reads ACR config version {VERSION}");
     }
     let config = Config {
         tiers: merged.tiers.unwrap_or_default(),
