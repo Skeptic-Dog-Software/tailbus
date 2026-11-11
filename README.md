@@ -604,8 +604,11 @@ Fresh reviewers attack. The Orchestrator then steelmans the change: it folds
 in the blockers the Judge upheld, and any it declines is recorded, with its
 reason, as a disagreement. What the Judge upheld without blocking is
 reported, not folded in, so the change doesn't grow past what it's for.
-Every lens then attacks the new version, and this repeats until one round
-has no blocker in any lens. Each round's version is checked again for the
+Then the lenses whose triggers match what the fixes changed attack the new
+version, with the fixes' own diff as their focus, and this repeats until a
+round has no blocker. Before the review ends, every lens that hasn't
+attacked the change as it is now does, in one full sweep: it ends only
+when every lens agrees on the same version. Each round's version is checked again for the
 lenses it needs, without what was ruled out before: one a fix's code now
 triggers joins, and records when and why, and one that has run stays on. The Orchestrator here is
 the `steelman` binding, which needs `writes: true`. A review stops at 20

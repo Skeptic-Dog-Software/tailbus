@@ -54,6 +54,17 @@ pub trait Caller: Sync {
     fn fingerprint(&self, _repo: &Path) -> Option<String> {
         None
     }
+
+    /// The checkout as it is now, to compare later. None if this caller
+    /// can't say, and every lens attacks again after a fix.
+    fn snapshot(&self, _repo: &Path) -> Option<String> {
+        None
+    }
+
+    /// The files that changed between two snapshots, and the diff.
+    fn delta(&self, _repo: &Path, _from: &str, _to: &str) -> Option<(Vec<String>, String)> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +263,14 @@ pub struct Run {
     /// description, kept so a resumed review sends the same.
     #[serde(default)]
     pub description: Option<String>,
+    /// What the last steelman's fixes changed, in a review to convergence:
+    /// the next round attacks it first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<FixDelta>,
+    /// This round is the full sweep: every lens that hasn't attacked the
+    /// change as it is now does, before the review can converge.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sweep: bool,
     /// Reviewed to convergence: see `Setting::converge`.
     #[serde(default)]
     pub converge: bool,
@@ -278,7 +297,15 @@ pub struct Steelman {
     pub declined: Vec<roles::Declined>,
 }
 
-/// A test file the writer wrote between rounds, and how it fared: a pin
+/// What a steelman's fixes changed: the round whose blockers they fixed,
+/// and the files. The diff is kept beside the round's own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FixDelta {
+    pub round: u32,
+    pub files: Vec<String>,
+}
+
+/// A test file the writer wrote between rounds/// A test file the writer wrote between rounds, and how it fared: a pin
 /// fails on the code from before the fixes and passes after. None where it
 /// couldn't be run, or ran past the limit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -457,6 +484,23 @@ fn write_artifact(s: &Setting, run: &Run, change: &Change, round: u32) -> Result
     if s.cfg.stages.contains(&Kind::Context) {
         intent.push_str(&stages::context_pack(&run.repo, &run.base, change));
     }
+    if let Some(fix) = run
+        .fix
+        .as_ref()
+        .filter(|f| !run.sweep && round == f.round + 1)
+    {
+        let diff = fs::read_to_string(s.work_dir.join(format!("round-{}.fix.diff", fix.round)))
+            .unwrap_or_default();
+        if !diff.trim().is_empty() {
+            intent.push_str(&format!(
+                "# What the fixes after round {} changed\n\nThis round, attack these \
+                 changes, and what they touch, first: the rest of the change was attacked \
+                 before, and is attacked again before the review ends.\n\n```diff\n{}\n```\n\n",
+                fix.round,
+                stages::clip_text(&diff, 30 * 1024)
+            ));
+        }
+    }
     let diff = s.work_dir.join(format!("round-{round}.diff"));
     fs::write(&diff, format!("{intent}# The diff\n\n{}", change.diff))?;
     let full = match &change.full {
@@ -633,6 +677,8 @@ pub fn start(
         description: s.description.clone(),
         converge: s.converge,
         steelmans: Vec::new(),
+        fix: None,
+        sweep: false,
     };
     let artifacts = write_artifact(s, &run, change, 0)?;
     choose_tier(&mut run, s, change, caller, &artifacts.diff)?;
@@ -1449,6 +1495,33 @@ fn settle(run: &mut Run, cfg: &Config) {
         .filter(|l| l.outcome == Outcome::Open)
         .map(|l| l.id.clone())
         .collect();
+    // In a review to convergence, nothing blocks now, but a lens that
+    // hasn't attacked the change as it is now must, before it can end: the
+    // full sweep.
+    if open.is_empty() && run.converge && run.round < cfg.max_rounds {
+        let fixed_after = run.steelmans.last().map_or(0, |m| m.round);
+        let stale: Vec<String> = run
+            .lenses
+            .values()
+            .filter(|l| {
+                l.outcome == Outcome::Confirmed
+                    && fixed_after > 0
+                    && l.rounds.last().is_none_or(|r| r.round <= fixed_after)
+            })
+            .map(|l| l.id.clone())
+            .collect();
+        if !stale.is_empty() {
+            for id in stale {
+                if let Some(l) = run.lenses.get_mut(&id) {
+                    l.outcome = Outcome::Open;
+                }
+            }
+            run.sweep = true;
+            run.round += 1;
+            run.stage = Stage::Review;
+            return;
+        }
+    }
     if open.is_empty() {
         run.stage = if cfg.human_gate == HumanGate::Ends {
             Stage::Final
@@ -1567,6 +1640,8 @@ fn fix(
         writes: true,
         repo: &repo,
     };
+    // The checkout before the fixes, to see what they changed.
+    let before_fix = run.converge.then(|| caller.snapshot(&run.repo)).flatten();
     let fixed = caller.call(&call).and_then(|answer| {
         record(run, cfg, &call, prompt.len(), &answer);
         roles::read_fixed(&answer.text)
@@ -1612,10 +1687,48 @@ fn fix(
                         m.tests_done = done;
                     }
                 }
-                // The change is a new version now: every lens attacks it.
-                for lens in run.lenses.values_mut() {
-                    if lens.outcome == Outcome::Confirmed {
-                        lens.outcome = Outcome::Open;
+                // The change is a new version now. A lens attacks it again
+                // if the fixes touched what it covers, with the fixes as its
+                // focus; the rest wait for the sweep before it can end.
+                let delta = before_fix.as_deref().and_then(|from| {
+                    let to = caller.snapshot(&run.repo)?;
+                    caller.delta(&run.repo, from, &to)
+                });
+                run.sweep = false;
+                match delta {
+                    Some((files, diff)) => {
+                        let _ = fs::write(
+                            s.work_dir.join(format!("round-{}.fix.diff", run.round)),
+                            &diff,
+                        );
+                        let touched = Change {
+                            files: files.clone(),
+                            diff,
+                            ..Change::default()
+                        };
+                        run.fix = Some(FixDelta {
+                            round: run.round,
+                            files,
+                        });
+                        for lens in run.lenses.values_mut() {
+                            let applies = cfg
+                                .lenses
+                                .iter()
+                                .find(|l| l.id == lens.id)
+                                .and_then(|l| plan::lens_applies(l, &touched).ok().flatten())
+                                .is_some();
+                            if lens.outcome == Outcome::Confirmed && applies {
+                                lens.outcome = Outcome::Open;
+                            }
+                        }
+                    }
+                    None => {
+                        run.fix = None;
+                        for lens in run.lenses.values_mut() {
+                            if lens.outcome == Outcome::Confirmed {
+                                lens.outcome = Outcome::Open;
+                            }
+                        }
                     }
                 }
             }
@@ -1911,6 +2024,8 @@ lenses:
         repos: Mutex<Vec<(Role, PathBuf, bool)>>,
         /// Whether each call's working directory held what a setup leaves.
         warmed: Mutex<Vec<bool>>,
+        /// What a fix changes, as the checkout's snapshots would say.
+        fixes: Option<Vec<String>>,
     }
 
     impl<F: Fn(Role, &str) -> Result<String> + Sync> Fake<F> {
@@ -1925,6 +2040,7 @@ lenses:
                 sent: Mutex::new(Vec::new()),
                 repos: Mutex::new(Vec::new()),
                 warmed: Mutex::new(Vec::new()),
+                fixes: None,
             }
         }
 
@@ -1968,6 +2084,16 @@ lenses:
                 run_id: new_id(),
                 usage: self.usage.clone(),
             })
+        }
+
+        fn snapshot(&self, _repo: &Path) -> Option<String> {
+            self.fixes.as_ref().map(|_| new_id())
+        }
+
+        fn delta(&self, _repo: &Path, _from: &str, _to: &str) -> Option<(Vec<String>, String)> {
+            self.fixes
+                .clone()
+                .map(|files| (files, "+the fix\n".to_string()))
         }
 
         fn fingerprint(&self, _repo: &Path) -> Option<String> {
@@ -2656,6 +2782,61 @@ lenses:
         // The round's copies go with it.
         assert!(!root.join("r-r1").exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn after_a_fix_only_what_it_touched_attacks_then_a_sweep_covers_the_rest() {
+        let extra =
+            r#"  - {id: gamma, criteria: "gamma criteria", triggers: {paths: ["**/*.md"]}}"#;
+        let cfg = config("exception", 20, 1, extra, "");
+        let fixed = Mutex::new(false);
+        let mut fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Reviewer if prompt.contains("alpha") && !*fixed.lock().unwrap() => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                Role::Orchestrator if prompt.contains("You synthesize") => {
+                    *fixed.lock().unwrap() = true;
+                    r#"{"done": "fixed alpha"}"#.to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        // The fix touches only the code, not the docs gamma covers.
+        fake.fixes = Some(vec!["a.src".into()]);
+        let mut s = setting(&cfg);
+        s.converge = true;
+        let c = change(&["a.src", "README.md"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.status, Status::Confirmed);
+        // Round 1 all; round 2 alpha and beta, which the fix touched, with
+        // the fix as their focus; round 3 the sweep: gamma, on the version
+        // it hadn't seen.
+        assert_eq!(run.round, 3);
+        let rounds =
+            |id: &str| -> Vec<u32> { run.lenses[id].rounds.iter().map(|r| r.round).collect() };
+        assert_eq!(rounds("alpha"), [1, 2]);
+        assert_eq!(rounds("beta"), [1, 2]);
+        assert_eq!(rounds("gamma"), [1, 3]);
+        assert_eq!(
+            run.fix.as_ref().map(|f| f.files.clone()),
+            Some(vec!["a.src".to_string()])
+        );
+        let sent = fake.sent.lock().unwrap();
+        let focused = sent
+            .iter()
+            .filter(|(r, text)| {
+                *r == Role::Reviewer && text.contains("What the fixes after round 1 changed")
+            })
+            .count();
+        assert_eq!(
+            focused, 2,
+            "round 2's two reviewers got the fix as their focus"
+        );
+        let _ = fs::remove_dir_all(&s.work_dir);
     }
 
     #[test]

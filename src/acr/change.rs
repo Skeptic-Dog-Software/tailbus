@@ -245,6 +245,43 @@ pub fn copy_of(repo: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The checkout as it is now, changes and new files too, as a git tree, made
+/// with an index of its own so the checkout's index is untouched. Comparing
+/// two of these says what changed in between.
+pub fn worktree_tree(repo: &Path) -> Result<String> {
+    let index = std::env::temp_dir().join(format!("tb-acr-index-{}", crate::util::new_id()));
+    let run = |args: &[&str]| -> Result<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .stdin(Stdio::null())
+            .output()
+            .context("running git")?;
+        if !out.status.success() {
+            bail!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let tree = run(&["read-tree", "HEAD"])
+        .and_then(|_| run(&["add", "--all"]))
+        .and_then(|_| run(&["write-tree"]));
+    let _ = fs::remove_file(&index);
+    tree
+}
+
+/// The files that differ between two trees, and the diff.
+pub fn tree_diff(repo: &Path, from: &str, to: &str) -> Result<(Vec<String>, String)> {
+    let files = git(repo, &["diff", "--name-only", from, to])?;
+    let diff = git(repo, &["diff", from, to])?;
+    Ok((files.lines().map(str::to_string).collect(), diff))
+}
+
 /// Reviewers read the checkout itself, so a commit under review must be the
 /// one checked out, with nothing changed on top. Without `head`, the review
 /// is of the working tree, which is the checkout already.
@@ -457,6 +494,24 @@ pub mod tests {
     use crate::util::new_id;
 
     /// A git repository with one commit of `files` on `main`.
+    #[test]
+    fn two_worktree_trees_say_what_changed_between_them() {
+        let repo = repo_with(&[("a.txt", "one\n"), ("b.txt", "b\n")]);
+        fs::write(repo.join("a.txt"), "two\n").unwrap();
+        let before = fingerprint(&repo).unwrap();
+        let first = worktree_tree(&repo).unwrap();
+        fs::write(repo.join("a.txt"), "three\n").unwrap();
+        fs::write(repo.join("c.txt"), "new\n").unwrap();
+        let second = worktree_tree(&repo).unwrap();
+        let (files, diff) = tree_diff(&repo, &first, &second).unwrap();
+        assert_eq!(files, ["a.txt", "c.txt"]);
+        assert!(diff.contains("-two") && diff.contains("+three"));
+        // Its own index: the checkout's is as it was, but for the new file.
+        fs::remove_file(repo.join("c.txt")).unwrap();
+        fs::write(repo.join("a.txt"), "two\n").unwrap();
+        assert_eq!(fingerprint(&repo).unwrap(), before);
+    }
+
     #[test]
     fn a_reviewers_copy_is_the_checkout_as_it_is_and_reaches_nothing_back() {
         let repo = repo_with(&[("a.txt", "one\n"), ("dir/b.txt", "b\n")]);

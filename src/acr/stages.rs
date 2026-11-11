@@ -295,6 +295,11 @@ fn is_test_path(path: &str) -> bool {
     p.contains("test") || p.contains("spec")
 }
 
+/// Text cut to `max` bytes, at a character's edge.
+pub fn clip_text(text: &str, max: usize) -> String {
+    clip(text, max)
+}
+
 fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();

@@ -423,6 +423,14 @@ impl Caller for BridgeCaller {
         change::fingerprint(repo).ok()
     }
 
+    fn snapshot(&self, repo: &Path) -> Option<String> {
+        change::worktree_tree(repo).ok()
+    }
+
+    fn delta(&self, repo: &Path, from: &str, to: &str) -> Option<(Vec<String>, String)> {
+        change::tree_diff(repo, from, to).ok()
+    }
+
     fn call(&self, call: &Call) -> Result<Answer> {
         let b = call.binding;
         // Fixes only from a binding the user lets write.
