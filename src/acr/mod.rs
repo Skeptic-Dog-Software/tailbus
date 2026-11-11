@@ -1589,19 +1589,14 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
             else {
                 continue;
             };
-            let action = if r.relevant && r.on_task {
-                lens.severity
-                    .get(&r.severity)
-                    .copied()
-                    .unwrap_or(r.severity.default_action())
-            } else {
-                config::Action::Drop
-            };
+            let flow::Ruled {
+                severity, action, ..
+            } = flow::ruling(&cfg, &lens, &r);
             let blocks = matches!(
                 action,
                 config::Action::Blocks | config::Action::BlocksUnlessWaived
             );
-            judged[i] = Some((blocks, format!("{:?}", r.severity)));
+            judged[i] = Some((blocks, format!("{severity:?}")));
         }
     }
     drop(allowed);

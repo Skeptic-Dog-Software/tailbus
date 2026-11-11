@@ -707,6 +707,12 @@ enum Ran {
 /// Runs each mutant in a copy of its own, from one copy where the tests
 /// passed first, and returns the survivors as findings, with a summary.
 pub fn run_mutants(r: &Runner, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)> {
+    let (survivors, summary) = mutate(r, mutants)?;
+    Ok((survivors.into_iter().map(|(_, raw)| raw).collect(), summary))
+}
+
+/// The survivors, each with its mutant's place in `mutants`.
+fn mutate(r: &Runner, mutants: &[Mutant]) -> Result<(Vec<(usize, Raw)>, String)> {
     if mutants.is_empty() {
         return Ok((Vec::new(), "no mutants were proposed".into()));
     }
@@ -783,21 +789,24 @@ pub fn run_mutants(r: &Runner, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)>
                 } else {
                     m.tests.join(", ")
                 };
-                found.push(Raw {
-                    title: format!("The tests pass with this break: {}", clip(&m.why, 160)),
-                    detail: format!(
-                        "In {file}, replacing\n```\n{find}\n```\nwith\n```\n{replace}\n```\n\
+                found.push((
+                    i,
+                    Raw {
+                        title: format!("The tests pass with this break: {}", clip(&m.why, 160)),
+                        detail: format!(
+                            "In {file}, replacing\n```\n{find}\n```\nwith\n```\n{replace}\n```\n\
                          leaves {tests} passing. What a test should catch: {why}\n\
                          The end of the run:\n```\n{out}\n```",
-                        file = m.file,
-                        find = clip(&m.find, 1200),
-                        replace = clip(&m.replace, 1200),
-                        why = m.why,
-                        out = clip(&out, 1200),
-                    ),
-                    file: Some(m.file.clone()),
-                    line: None,
-                });
+                            file = m.file,
+                            find = clip(&m.find, 1200),
+                            replace = clip(&m.replace, 1200),
+                            why = m.why,
+                            out = clip(&out, 1200),
+                        ),
+                        file: Some(m.file.clone()),
+                        line: None,
+                    },
+                ));
             }
         }
     }
@@ -1067,9 +1076,50 @@ fn vary(g: &GateRuns) -> Result<(Vec<Raw>, String)> {
 
 /// Runs the gate: coverage first, which has to pass as it stands, then the
 /// mutants. Returns the gaps as findings, with a summary.
-pub fn run_gate(g: &GateRuns, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)> {
+/// A gap the gate found, and whether a fact it measured blocks by rule: a
+/// mutant that survives in a line the change adds, against a test the change
+/// adds or changes, or a test of the change's that fails run another way.
+#[derive(Debug, Clone)]
+pub struct Gap {
+    pub raw: Raw,
+    pub blocks: bool,
+}
+
+/// The lines a diff adds, by file.
+pub fn changed_lines(
+    diff: &str,
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> {
+    let mut lines: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> =
+        Default::default();
+    for (f, n, _) in added_lines(diff) {
+        lines.entry(f).or_default().insert(n);
+    }
+    lines
+}
+
+/// Whether a mutant breaks a line the change adds, and is set against a
+/// test the change adds or changes.
+fn in_the_change(repo: &Path, m: &Mutant, diff: &str) -> bool {
+    let changed = changed_lines(diff);
+    let Some(lines) = changed.get(&m.file) else {
+        return false;
+    };
+    let Ok(text) = fs::read_to_string(repo.join(&m.file)) else {
+        return false;
+    };
+    let Some(at) = text.find(&m.find) else {
+        return false;
+    };
+    let first = text[..at].matches('\n').count() as u64 + 1;
+    let last = first + m.find.matches('\n').count() as u64;
+    let touched = (first..=last).any(|n| lines.contains(&n));
+    let own = changed_tests(diff);
+    touched && m.tests.iter().any(|t| own.contains(t))
+}
+
+pub fn run_gate(g: &GateRuns, mutants: &[Mutant]) -> Result<(Vec<Gap>, String)> {
     let r = &g.runner;
-    let mut found = Vec::new();
+    let mut found: Vec<Gap> = Vec::new();
     let mut summary = Vec::new();
     if let Some(command) = g.coverage {
         let name = r
@@ -1092,17 +1142,20 @@ pub fn run_gate(g: &GateRuns, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)> 
             "coverage: {} file(s) with changed lines no test runs",
             gaps.len()
         ));
-        found.extend(gaps);
+        found.extend(gaps.into_iter().map(|raw| Gap { raw, blocks: false }));
         let _ = fs::remove_dir_all(r.dir.join("coverage"));
     }
-    let (survivors, mutated) = run_mutants(r, mutants)?;
+    let (survivors, mutated) = mutate(r, mutants)?;
     summary.push(mutated);
-    found.extend(survivors);
+    found.extend(survivors.into_iter().map(|(i, raw)| Gap {
+        raw,
+        blocks: in_the_change(r.repo, &mutants[i], g.diff),
+    }));
     let (varied, ways) = vary(g)?;
     if !ways.is_empty() {
         summary.push(ways);
     }
-    found.extend(varied);
+    found.extend(varied.into_iter().map(|raw| Gap { raw, blocks: true }));
     Ok((found, summary.join("; ")))
 }
 
@@ -1423,8 +1476,12 @@ mod tests {
         };
         let (found, summary) = run_gate(&runs, &[]).unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].title, "The change's tests fail in strict mode");
-        assert!(found[0].detail.contains("sh 'test/t.sh' strict"));
+        assert!(
+            found[0].blocks,
+            "a test of the change's own that fails another way blocks"
+        );
+        assert_eq!(found[0].raw.title, "The change's tests fail in strict mode");
+        assert!(found[0].raw.detail.contains("sh 'test/t.sh' strict"));
         assert!(
             summary.contains("run 4 other way(s): 1 failed"),
             "{summary}"

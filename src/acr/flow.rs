@@ -1130,7 +1130,20 @@ fn gate_round(
         "The test gate, {id}: coverage and mutants run here"
     ));
     if !gaps.is_empty() {
-        let judged = roles::judge_prompt(lens, &[gaps], &s.not_findings).and_then(|prompt| {
+        // Tagged, so a fact the gate measured follows its finding through
+        // the Judge.
+        let tagged: Vec<Raw> = gaps
+            .iter()
+            .enumerate()
+            .map(|(i, g)| Raw {
+                title: format!("[G{i}] {}", g.raw.title),
+                ..g.raw.clone()
+            })
+            .collect();
+        let judged = roles::judge_prompt(lens, &[tagged], &s.not_findings).and_then(|prompt| {
+            let prompt = prompt
+                + "\n\nKeep each finding's title as it's given, with its [G..] tag, and don't \
+                   merge them.";
             let text = ask(
                 run,
                 s,
@@ -1142,7 +1155,30 @@ fn gate_round(
             roles::read_ratings(&text)
         });
         match judged {
-            Ok(ratings) => round.findings = rate(run, cfg, lens, ratings),
+            Ok(ratings) => {
+                let tag = regex::Regex::new(r"^\[G(\d+)\]").expect("a fixed pattern");
+                let mut findings = rate(run, cfg, lens, ratings);
+                for f in &mut findings {
+                    let measured = tag
+                        .captures(&f.title)
+                        .and_then(|c| c[1].parse::<usize>().ok())
+                        .and_then(|i| gaps.get(i))
+                        .is_some_and(|g| g.blocks);
+                    // What the gate measured blocks by rule, unless the
+                    // Judge found it no defect at all.
+                    if measured && f.state != FindingState::Dropped && !f.blocks() {
+                        f.severity = Severity::High;
+                        f.action = cfg.action(lens, Severity::High);
+                        f.state = FindingState::Open;
+                        f.reason = format!(
+                            "{} (Blocks by rule: the gate measured it in the change's own \
+                             code and tests.)",
+                            f.reason
+                        );
+                    }
+                }
+                round.findings = findings;
+            }
             Err(e) => round.failures.push(format!("the Judge: {e:#}")),
         }
     }
@@ -1295,21 +1331,84 @@ fn prune_copies(root: &Path) {
 }
 
 /// Turns a Judge's ratings into a lens's findings for this round.
+/// What blocks, decided by fixed rules from the facts the Judge states, not
+/// by how a prompt words them. Rules only raise or route: a finding no rule
+/// covers keeps the Judge's severity, so a missing rule never silences one.
+/// Only two lower it, both explicit:
+/// - not a real defect, or a break that changes nothing: dropped;
+/// - there before the change, which the change neither claims to fix nor
+///   makes worse: logged, never blocking. A Critical one also goes to a
+///   person, so it's never silent.
+///
+/// And three raise it to High at least: a test the change adds that can't
+/// fail when what it pins breaks; a claim that would lead someone to ship a
+/// defect; a pre-existing defect the change claims to fix or makes worse.
+/// A real finding outside the reviewer's own lens is rated like any other.
+pub(super) fn ruling(cfg: &Config, lens: &Lens, r: &roles::Rating) -> Ruled {
+    if !r.relevant || r.equivalent || r.severity == Severity::Rejected {
+        return Ruled::plain(Severity::Rejected, Action::Drop);
+    }
+    if r.weak_pin || r.misleads || (r.pre_existing && (r.claims_fix || r.worsens)) {
+        let severity = if r.severity == Severity::Critical {
+            Severity::Critical
+        } else {
+            Severity::High
+        };
+        return Ruled::plain(severity, cfg.action(lens, severity));
+    }
+    if r.pre_existing {
+        return Ruled {
+            severity: Severity::Low,
+            action: Action::NeverBlocks,
+            escalate: r.severity == Severity::Critical,
+        };
+    }
+    Ruled::plain(r.severity, cfg.action(lens, r.severity))
+}
+
+/// A ruling: the severity and action rules give a finding, and whether it
+/// also goes to a person.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Ruled {
+    pub severity: Severity,
+    pub action: Action,
+    pub escalate: bool,
+}
+
+impl Ruled {
+    fn plain(severity: Severity, action: Action) -> Ruled {
+        Ruled {
+            severity,
+            action,
+            escalate: false,
+        }
+    }
+}
+
 fn rate(run: &mut Run, cfg: &Config, lens: &Lens, ratings: Vec<roles::Rating>) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (n, rating) in ratings.into_iter().enumerate() {
-        let severity = if rating.relevant && rating.on_task {
-            rating.severity
-        } else {
-            Severity::Rejected
-        };
-        let action = cfg.action(lens, severity);
+        let Ruled {
+            severity,
+            action,
+            escalate: to_person,
+        } = ruling(cfg, lens, &rating);
         let state = match action {
             Action::Blocks | Action::BlocksUnlessWaived => FindingState::Open,
             Action::NeverBlocks => FindingState::Logged,
             Action::Drop => FindingState::Dropped,
         };
         let id = format!("{}-r{}-{}", lens.id, run.round, n + 1);
+        if to_person {
+            escalate(
+                run,
+                format!(
+                    "{id} is Critical and was there before the change, which neither claims to \
+                     fix it nor makes it worse, so it doesn't block: {}",
+                    rating.title
+                ),
+            );
+        }
         if rating.split || (rating.values_call && severity == Severity::Rejected) {
             let what = if rating.split {
                 "reviewers split"
@@ -1331,7 +1430,13 @@ fn rate(run: &mut Run, cfg: &Config, lens: &Lens, ratings: Vec<roles::Rating>) -
             line: rating.line,
             severity,
             action,
-            reason: rating.reason,
+            // Recorded, never lowered: a real defect blocks whichever lens
+            // finds it.
+            reason: if rating.on_task {
+                rating.reason
+            } else {
+                format!("{} (outside this lens's criteria)", rating.reason)
+            },
             state,
         });
     }
@@ -3132,20 +3237,131 @@ lenses:
     }
 
     #[test]
-    fn what_isnt_relevant_or_on_task_is_rejected_with_its_reason() {
+    fn a_real_finding_another_lens_owns_is_rated_like_any_and_noise_is_dropped() {
         let cfg = plain("exception", 3, 1);
         let fake = Fake::new(|role, _: &str| match role {
             Role::Reviewer => Ok(ONE.into()),
             Role::Judge => Ok(r#"{"findings": [{"title": "t", "severity": "Critical",
-                "on_task": false, "reason": "another lens's job"}]}"#
+                "on_task": false, "reason": "another lens's job"},
+                {"title": "n", "severity": "High", "relevant": false, "reason": "not so"}]}"#
                 .into()),
             _ => Ok(NOTHING.into()),
         });
         let (run, _) = go(&cfg, &["a.src"], &fake);
-        assert_eq!(run.status, Status::Confirmed);
-        let f = &run.lenses["alpha"].rounds[0].findings[0];
-        assert_eq!(f.severity, Severity::Rejected);
-        assert_eq!(f.reason, "another lens's job");
+        let f = &run.lenses["alpha"].rounds[0].findings;
+        // A real Critical blocks, whichever lens finds it.
+        assert_eq!(f[0].severity, Severity::Critical);
+        assert_eq!(
+            f[0].reason,
+            "another lens's job (outside this lens's criteria)"
+        );
+        assert_eq!(f[1].severity, Severity::Rejected);
+        assert_eq!(f[1].state, FindingState::Dropped);
+    }
+
+    #[test]
+    fn every_combination_of_facts_has_one_ruling_and_none_hides_a_defect() {
+        let cfg = plain("exception", 3, 1);
+        let lens = cfg.lenses[0].clone();
+        let severities = [
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+            Severity::Rejected,
+        ];
+        let rank = |s: Severity| match s {
+            Severity::Critical => 4,
+            Severity::High => 3,
+            Severity::Medium => 2,
+            Severity::Low => 1,
+            Severity::Rejected => 0,
+        };
+        let mut cases = 0;
+        for bits in 0u32..256 {
+            let fact = |i: u32| bits & (1 << i) != 0;
+            for &severity in &severities {
+                let mut r: roles::Rating = serde_json::from_value(serde_json::json!({
+                    "title": "t", "severity": format!("{severity:?}")
+                }))
+                .unwrap();
+                r.relevant = fact(0);
+                r.on_task = fact(1);
+                r.pre_existing = fact(2);
+                r.claims_fix = fact(3);
+                r.worsens = fact(4);
+                r.weak_pin = fact(5);
+                r.misleads = fact(6);
+                r.equivalent = fact(7);
+                let ruled = ruling(&cfg, &lens, &r);
+                cases += 1;
+                let real = r.relevant && !r.equivalent && severity != Severity::Rejected;
+                // Only what isn't a real defect is dropped.
+                assert_eq!(ruled.action == Action::Drop, !real, "{r:?} -> {ruled:?}");
+                if !real {
+                    continue;
+                }
+                let raised =
+                    r.weak_pin || r.misleads || (r.pre_existing && (r.claims_fix || r.worsens));
+                if raised {
+                    assert!(rank(ruled.severity) >= 3, "{r:?} -> {ruled:?}");
+                    assert!(rank(ruled.severity) >= rank(severity));
+                } else if r.pre_existing {
+                    // The one lowering rule for a real defect: logged, and a
+                    // Critical one goes to a person.
+                    assert_eq!(ruled.action, Action::NeverBlocks);
+                    assert_eq!(ruled.escalate, severity == Severity::Critical);
+                } else {
+                    // Otherwise the Judge's severity stands, on task or not.
+                    assert_eq!(ruled.severity, severity, "{r:?} -> {ruled:?}");
+                }
+            }
+        }
+        assert_eq!(cases, 256 * 5);
+    }
+
+    #[test]
+    fn rules_decide_what_blocks_from_the_judges_facts() {
+        let cfg = plain("exception", 3, 1);
+        let lens = cfg.lenses[0].clone();
+        let rated = |json: &str| -> (Severity, Action) {
+            let r = roles::read_ratings(&format!("{{\"findings\": [{json}]}}")).unwrap();
+            let ruled = ruling(&cfg, &lens, &r[0]);
+            (ruled.severity, ruled.action)
+        };
+        // A test the change adds that can't fail when what it pins breaks.
+        assert_eq!(
+            rated(r#"{"title": "t", "severity": "Low", "weak_pin": true}"#),
+            (Severity::High, Action::Blocks)
+        );
+        // A claim that would lead someone to ship a defect.
+        assert_eq!(
+            rated(r#"{"title": "t", "severity": "Medium", "misleads": true}"#).0,
+            Severity::High
+        );
+        // There before, neither claimed fixed nor made worse: logged.
+        assert_eq!(
+            rated(r#"{"title": "t", "severity": "Medium", "pre_existing": true}"#),
+            (Severity::Low, Action::NeverBlocks)
+        );
+        assert_eq!(
+            rated(r#"{"title": "t", "severity": "Medium", "pre_existing": true, "worsens": true}"#)
+                .0,
+            Severity::High
+        );
+        // A break nobody could see, and a Critical stays Critical.
+        assert_eq!(
+            rated(r#"{"title": "t", "severity": "High", "equivalent": true}"#).1,
+            Action::Drop
+        );
+        assert_eq!(
+            rated(r#"{"title": "t", "severity": "Critical", "weak_pin": true}"#).0,
+            Severity::Critical
+        );
+        assert_eq!(
+            rated(r#"{"title": "t", "severity": "Medium"}"#),
+            (Severity::Medium, Action::BlocksUnlessWaived)
+        );
     }
 
     #[test]

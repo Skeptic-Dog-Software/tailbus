@@ -270,6 +270,27 @@ pub struct Rating {
     /// Both sides, when it's split or a values call.
     #[serde(default, deserialize_with = "lenient::strings")]
     pub sides: Vec<String>,
+    /// Facts the Judge states, from which rules decide what blocks. The
+    /// defect was there before the change.
+    #[serde(default, deserialize_with = "lenient::flag")]
+    pub pre_existing: bool,
+    /// The change says it fixes it.
+    #[serde(default, deserialize_with = "lenient::flag")]
+    pub claims_fix: bool,
+    /// The change makes it worse.
+    #[serde(default, deserialize_with = "lenient::flag")]
+    pub worsens: bool,
+    /// A test the change adds or changes that can't fail when what it's
+    /// there to pin breaks.
+    #[serde(default, deserialize_with = "lenient::flag")]
+    pub weak_pin: bool,
+    /// A claim the change makes that would lead someone relying on it to
+    /// ship a defect or skip a test.
+    #[serde(default, deserialize_with = "lenient::flag")]
+    pub misleads: bool,
+    /// A break that changes nothing a user or caller could see.
+    #[serde(default, deserialize_with = "lenient::flag")]
+    pub equivalent: bool,
 }
 
 fn yes() -> bool {
@@ -298,26 +319,23 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          - Medium: real defect in a narrow case\n\
          - Low: nit or unlikely edge case\n\
          - Rejected: off task, noise, or a decided non-issue, with the reason\n\n\
-         A defect that was there before the change, in code the change touches or relies on, \
-         is on task: rate it as you would any other, and say in its reason that it's \
-         pre-existing. It's High or above only if the change claims to fix it, or makes it \
-         worse.\n\n\
-         Rate by consequence: what happens if the change merges as it is. High or above \
-         means a user or caller meets a defect, data is lost or exposed, or someone relying \
-         on the change is misled into shipping one: a test that claims to guard behaviour the \
-         change exists to fix but can't catch its failure, or a doc that would lead someone to \
-         the wrong code. Where the lens's criteria say when a finding blocks, a finding that \
-         meets that condition is High at least. A claim that's merely imprecise is Low, \
-         however true the finding: a stale line number, a test name broader than its check, \
-         a comment that overstates without changing what anyone would do, a gap in a test \
-         that other tests cover.\n\n\
+         For each finding, also state these facts, each true or false, from the code: \
+         `pre_existing`, the defect was there before the change; `claims_fix`, the change says \
+         it fixes it; `worsens`, the change makes it worse; `weak_pin`, it's a test the change \
+         adds or changes that can't fail when what it's there to pin breaks; `misleads`, it's a \
+         claim the change makes, in a comment, doc, ledger line or test name, that would lead \
+         someone relying on it to ship a defect or skip a test; `equivalent`, it's a break \
+         that changes nothing a user or caller could see. Fixed rules decide from these facts \
+         what blocks: rate the severity for what the defect costs on its own, and don't reject \
+         a real defect because it's pre-existing or belongs to another lens.\n\n\
          Decided non-issues:\n{not_findings}\n\n\
          Set split when the reviewers disagree about a finding. Set values_call when rejecting it \
          comes down to values, not fact. Give both sides in `sides` when you set either.\n\n\
          The reviewers' findings, one list each:\n{findings}\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\", \"detail\", \"file\", \"line\", \
          \"severity\", \"relevant\", \"on_task\", \"reason\", \"split\", \"values_call\", \
-         \"sides\"}}]}}.",
+         \"sides\", \"pre_existing\", \"claims_fix\", \"worsens\", \"weak_pin\", \"misleads\", \
+         \"equivalent\"}}]}}.",
         n = reviews.len(),
         id = lens.id,
         criteria = lens.criteria,
@@ -439,10 +457,9 @@ mod tests {
         };
         let prompt = judge_prompt(&lens, &[Vec::new()], "").unwrap();
         assert!(prompt.contains("It blocks when the tests claim the behaviour is covered."));
-        assert!(prompt.contains("a finding that meets that condition is High at least"));
-        assert!(prompt.contains("Rate by consequence"));
-        assert!(prompt.contains("a stale line number"));
-        assert!(prompt.contains("pre-existing"));
+        assert!(prompt.contains("`weak_pin`"));
+        assert!(prompt.contains("`pre_existing`"));
+        assert!(prompt.contains("Fixed rules decide from these facts"));
     }
 
     #[test]
