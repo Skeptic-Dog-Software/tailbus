@@ -14,6 +14,9 @@ pub const TAILBUS: App = App {
     about: "Direct messages between AI agents on a tailnet",
     network: "tailscale",
     networks: &[tailscale::KIND],
+    // ACRBUS_* first, the names it writes; TAILBUS_*, which sessions
+    // started before acrbus set, still read.
+    env: &["ACRBUS", "TAILBUS"],
 };
 
 fn main() -> ExitCode {

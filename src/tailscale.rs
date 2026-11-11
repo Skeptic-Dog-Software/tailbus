@@ -17,10 +17,21 @@ use acrbus::network::{Kind, Network, Peer, Status, Whois};
 pub const KIND: Kind = Kind {
     name: "tailscale",
     open: open_tailscale,
+    settings: &[CLI_SETTING],
 };
 
+/// config.toml's key for the Tailscale CLI, when it isn't the app's or the
+/// one on `PATH`.
+const CLI_SETTING: &str = "tailscale";
+
 fn open_tailscale(cfg: &Config) -> Result<Box<dyn Network>> {
-    Ok(Box::new(Tailscale::find(cfg.tailscale.as_deref())))
+    let cli = match cfg.network_settings.get(CLI_SETTING) {
+        None => None,
+        Some(value) => Some(PathBuf::from(value.as_str().with_context(|| {
+            format!("`{CLI_SETTING}` in config.toml should be the path to the Tailscale CLI")
+        })?)),
+    };
+    Ok(Box::new(Tailscale::find(cli.as_deref())))
 }
 
 /// The macOS app's own binary. The `tailscale` symlinks Homebrew and the app
@@ -213,6 +224,16 @@ mod tests {
         let e = open("network = \"carrier-pigeon\"").err().unwrap();
         assert!(
             format!("{e:#}").contains("tailbus knows: it knows local, tailscale"),
+            "{e:#}"
+        );
+        // Its one setting, the CLI's path, is tailbus's to read, not acrbus's.
+        let cfg: Config = toml::from_str("tailscale = \"/opt/ts/tailscale\"").unwrap();
+        cfg.check_settings(&crate::TAILBUS).unwrap();
+        assert!(cfg.check_settings(&acrbus::config::ACRBUS).is_err());
+        assert!(open("tailscale = \"/opt/ts/tailscale\"").unwrap().remote());
+        let e = open("tailscale = 3").err().unwrap();
+        assert!(
+            format!("{e:#}").contains("path to the Tailscale CLI"),
             "{e:#}"
         );
     }
