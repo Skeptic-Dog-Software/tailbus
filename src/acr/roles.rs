@@ -342,7 +342,9 @@ pub fn judge_prompt(lens: &Lens, reviews: &[Vec<Raw>], not_findings: &str) -> Re
          false: don't reject it for that.\n\n\
          For each finding, also state these facts, each true or false, from the code: \
          `real_defect`, it's a real defect, whatever caused it and whichever lens it belongs \
-         to: false only for something that isn't a defect at all; `pre_existing`, the defect is in code as it was before the change, which the change \
+         to: false only for something that isn't a defect at all. A missing test, or a \
+         comment, doc or ledger line that's incomplete, is a real defect: rate it Low if it's \
+         minor; `pre_existing`, the defect is in code as it was before the change, which the change \
          didn't add or alter: a test or line the change adds is never pre-existing; \
          `claims_fix`, the change says it fixes it; `worsens`, the change makes a pre-existing \
          defect worse; `weak_pin`, it's a test the change adds or changes that can't fail when \
@@ -485,6 +487,7 @@ mod tests {
         assert!(prompt.contains("It blocks when the tests claim the behaviour is covered."));
         assert!(prompt.contains("`weak_pin`"));
         assert!(prompt.contains("a fact without its quote counts as false"));
+        assert!(prompt.contains("A missing test, or a comment, doc or ledger line"));
         assert!(prompt.contains("`pre_existing`"));
         assert!(prompt.contains("Fixed rules decide from these facts"));
     }
