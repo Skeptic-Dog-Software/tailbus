@@ -864,6 +864,14 @@ not during a round, so a crash mid-round means starting over.
   user's instructions, and Claude Code's permission prompts still apply to
   whatever it does about one.
 
+## History
+
+tailbus has been in development since January 2026. Its git history was
+overwritten before it was made open source, to remove sensitive
+information: names, hosts and other private details were replaced or
+removed throughout, so earlier commits don't show the code exactly as it
+was.
+
 ## Develop
 
 ```sh
