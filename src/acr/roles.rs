@@ -188,6 +188,13 @@ struct Reviewed {
     findings: Vec<Raw>,
 }
 
+/// For every role that runs things. One reviewer on a dependency bump spent
+/// 4.3M of its 12.3M tokens checking on a test run it had started in the
+/// background, 28 times, each check rereading a context of up to 174K tokens.
+pub(super) const WAIT: &str = "Run a long command in the foreground, with a time limit, and \
+     wait for it. Don't start it in the background and keep checking on it: each check \
+     rereads everything you've read so far, which can cost more than the run.";
+
 /// A reviewer's whole brief: the lens, the scope, and what's already been
 /// decided. The attached file is the change: what it says it's for, then its
 /// diff. Those are its claims; the reviewer gets nothing of the case made
@@ -206,17 +213,21 @@ pub fn reviewer_prompt(
         text => text.to_string(),
     };
     let workdir = if own_copy {
-        "Your working directory is your own copy of the repository, as the change leaves it, \
-         and nothing you do there reaches the change. Read any of it you need. Where reading \
-         leaves a doubt, settle it by running something: the tests that cover the change, a \
-         probe of what it claims, or a mutation, breaking the code a test should guard to see \
-         whether the test fails. Report a test that still passes against broken code. Nobody \
-         is here to grant a permission, so a shell command that would need one is refused: \
-         name paths in full, not through variables or `$(...)`, and put a probe of more than \
-         one step in a script, written with the Write tool and run by its path."
+        format!(
+            "Your working directory is your own copy of the repository, as the change leaves \
+             it, and nothing you do there reaches the change. Read any of it you need. Where \
+             reading leaves a doubt, settle it by running something: the tests that cover the \
+             change, a probe of what it claims, or a mutation, breaking the code a test should \
+             guard to see whether the test fails. Report a test that still passes against \
+             broken code. Nobody is here to grant a permission, so a shell command that would \
+             need one is refused: name paths in full, not through variables or `$(...)`, and \
+             put a probe of more than one step in a script, written with the Write tool and run \
+             by its path. {WAIT}"
+        )
     } else {
         "Your working directory is the repository, as the change leaves it: read any of it \
          you need, but change nothing."
+            .to_string()
     };
     format!(
         "You are the reviewer for {id}. Find what is wrong: assume defects exist until \
@@ -574,6 +585,12 @@ Note: `{AGENT}` in the prompt is filled in by the bridge, so it's fine."#;
         assert!(running.contains("# How to attack in this lens\n\nbreak it\n\nNot findings"));
         assert!(running.contains("your own copy") && running.contains("mutation"));
         assert!(!running.contains("change nothing"));
+        // It's told to wait on a long run, not keep checking on one; a
+        // reviewer that runs nothing isn't.
+        assert!(running.contains(WAIT) && !brief.contains(WAIT));
+        let probes = super::super::stages::probes_prompt("the whole change", "", None, "");
+        let claims = super::super::stages::claims_prompt(&[], "the whole change", "", true, "");
+        assert!(probes.contains(WAIT) && claims.contains(WAIT));
     }
 
     #[test]

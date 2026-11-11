@@ -530,13 +530,18 @@ pub fn claims_prompt(
         .map(|(i, c)| format!("{}. [{}] {}\n", i + 1, c.at, c.text))
         .collect();
     let how = if own_copy {
-        "Read to check each, and where reading leaves a doubt, run something in your working \
-         directory, your own copy of the repository: nothing you do there reaches the change. \
-         Nobody is here to grant a permission, so a shell command that would need one is \
-         refused: name paths in full, not through variables or `$(...)`, and put a check of \
-         more than one step in a script, written with the Write tool and run by its path."
+        format!(
+            "Read to check each, and where reading leaves a doubt, run something in your \
+             working directory, your own copy of the repository: nothing you do there reaches \
+             the change. Nobody is here to grant a permission, so a shell command that would \
+             need one is refused: name paths in full, not through variables or `$(...)`, and \
+             put a check of more than one step in a script, written with the Write tool and \
+             run by its path. {}",
+            super::roles::WAIT
+        )
     } else {
         "Read the repository, as the change leaves it, to check each, but change nothing."
+            .to_string()
     };
     format!(
         "You check what a change claims about itself. Scope: {scope}. The change is the \
@@ -595,12 +600,13 @@ pub fn probes_prompt(
          change, in what it touches, is a finding too: say it's pre-existing. Nobody is here to grant a permission, so a \
          shell command that would need one is refused: name paths in full, not through \
          variables or `$(...)`, and put anything of more than one step in a script, written \
-         with the Write tool and run by its path.\n\n\
+         with the Write tool and run by its path. {wait}\n\n\
          Not findings, which are already decided, so leave them out:\n{decided}\n\n\
          Answer with only JSON: {{\"findings\": [{{\"title\": \"<one line>\", \"detail\": \
          \"<the scenario, its code, and what it printed>\", \"file\": \"<path>\", \"line\": \
          <number>}}]}}. If every scenario passes, say so with an empty list.",
         decided = decided(not_findings),
+        wait = super::roles::WAIT,
     )
 }
 
