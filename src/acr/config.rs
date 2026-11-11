@@ -332,6 +332,24 @@ pub struct Tests {
     /// the default, or `warn` and let them run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateMode>,
+    /// Other ways the gate runs the change's own tests, each once, such as
+    /// in random order, one at a time, or in another time zone. A test that
+    /// passes plainly and fails one of these depends on what it varies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<Variant>,
+    /// How many more times the gate runs the change's own tests plainly,
+    /// after the first, to catch one that passes only sometimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<u32>,
+}
+
+/// A way to run the change's tests: its name, and its command, from the
+/// root, with `{tests}` for the test files.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Variant {
+    pub name: String,
+    pub command: String,
 }
 
 /// What the test gate does with a gap that blocks.

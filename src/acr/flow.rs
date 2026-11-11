@@ -692,6 +692,7 @@ fn attack(
     artifacts: &Artifacts,
     change: &Change,
     copying: Copying,
+    gate_text: &str,
 ) -> Result<Attacked> {
     let Copying { dir, source } = copying;
     let cfg = s.cfg;
@@ -770,7 +771,7 @@ fn attack(
             lens.attack.as_deref(),
             briefs.get(&lens.id).map(String::as_str),
             cfg.runbook.as_deref().filter(|_| own),
-        );
+        ) + gate_text;
         // A mutation reviewer only proposes, so one is enough.
         let fan_out = if stage == Some(Kind::Mutation) {
             1
@@ -946,7 +947,24 @@ fn warm_copy(run: &Run, s: &Setting, dir: Option<&Path>) -> (Option<PathBuf>, Op
     }
 }
 
-/// The test gate's round for its lens/// The test gate's round for its lens: mutants proposed by a reviewer and
+/// What the test gate found this round, for the reviewers who follow it:
+/// what it ran, and each gap with how it was rated.
+fn gate_report(round: &Round) -> String {
+    let mut out = String::from(
+        "# What the test gate found this round\n\nIt ran the change's tests with coverage, \
+         against mutants of its code, and other ways: don't repeat those runs.\n",
+    );
+    for note in &round.notes {
+        out.push_str(&format!("- {note}\n"));
+    }
+    for f in &round.findings {
+        out.push_str(&format!("- {:?}: {}\n", f.severity, f.title));
+    }
+    out.push('\n');
+    out
+}
+
+/// The test gate's round for its lens/// The test gate's round for its lens/// The test gate's round for its lens: mutants proposed by a reviewer and
 /// run with coverage against the tests, and the gaps judged.
 fn gate_round(
     run: &mut Run,
@@ -1017,6 +1035,8 @@ fn gate_round(
         coverage: cfg.tests.coverage.as_deref(),
         report: cfg.tests.report.as_deref().unwrap_or("coverage/lcov.info"),
         diff: &change.diff,
+        variants: &cfg.tests.variants,
+        repeat: cfg.tests.repeat.unwrap_or(0),
     };
     let gaps = match stages::run_gate(&runs, &mutants) {
         Ok((gaps, summary)) => {
@@ -1267,6 +1287,8 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
         dir: round_dir.0.as_deref(),
         source: &source,
     };
+    // What the gate found, for every reviewer this round.
+    let mut gate_text = String::new();
     // The test gate first: a gap that blocks ends the round before any
     // reviewer runs.
     if let Some(id) = stages::lens_id(Kind::Gate).filter(|id| {
@@ -1291,6 +1313,7 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
                 ),
             );
         }
+        gate_text = gate_report(&round);
         let lens = run.lenses.get_mut(id).expect("open");
         if round.failures.is_empty() && !blocks {
             lens.outcome = Outcome::Confirmed;
@@ -1301,7 +1324,7 @@ fn review_round(run: &mut Run, s: &Setting, change: &Change, caller: &dyn Caller
             return Ok(());
         }
     }
-    let (reviews, mut notes) = attack(run, s, caller, &artifacts, change, copying)?;
+    let (reviews, mut notes) = attack(run, s, caller, &artifacts, change, copying, &gate_text)?;
     if let Some(note) = &warm_note {
         for id in reviews.keys() {
             notes.entry(id.clone()).or_default().push(note.clone());

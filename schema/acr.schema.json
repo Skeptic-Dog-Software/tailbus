@@ -154,7 +154,21 @@
         "setup": {"type": "string", "description": "Run once a round, from the root of a copy of the change, before any reviewer's copy is made from it: the package install and a first build, so every copy starts warm."},
         "coverage": {"type": "string", "description": "The command that runs the tests with coverage, from the root, writing an lcov report, for the gate."},
         "report": {"type": "string", "description": "Where the coverage report is, from the root: coverage/lcov.info if unset."},
-        "gate": {"enum": ["stop", "warn"], "description": "What a gap that blocks does: stop the round before the reviewers (the default), or warn and let them run."}
+        "gate": {"enum": ["stop", "warn"], "description": "What a gap that blocks does: stop the round before the reviewers (the default), or warn and let them run."},
+        "variants": {
+          "type": "array",
+          "description": "Other ways the gate runs the change's own tests, each once, such as in random order, one at a time, or in another time zone.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "command"],
+            "properties": {
+              "name": {"type": "string"},
+              "command": {"type": "string", "description": "From the root, with {tests} for the test files."}
+            }
+          }
+        },
+        "repeat": {"type": "integer", "minimum": 1, "description": "How many more times the gate runs the change's own tests plainly, after the first, to catch one that passes only sometimes."}
       }
     },
     "runbook": {

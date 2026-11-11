@@ -64,8 +64,10 @@ pub fn criteria(stage: Stage) -> &'static str {
              covered, or when the break would ship the defect the change exists to prevent."
         }
         Stage::Gate => {
-            "The change's tests aren't enough: a line it adds or changes that no test runs, or \
-             a small break in its code that every test passes. It blocks when the untested \
+            "The change's tests aren't enough: a line it adds or changes that no test runs, a \
+             small break in its code that every test passes, or one of its tests that fails \
+             when run another way, in another order, alone, or in another time zone. It blocks \
+             when a test of the change fails another way, or when the untested \
              code is what the change exists to do or fix, or when the change, its tests or \
              its docs claim that behaviour is covered. A break that changes nothing a user or \
              caller could see isn't a finding."
@@ -948,6 +950,83 @@ pub struct GateRuns<'a> {
     /// Where its lcov report is, from the root.
     pub report: &'a str,
     pub diff: &'a str,
+    /// Other ways to run the change's own tests, each once.
+    pub variants: &'a [super::config::Variant],
+    /// How many plain runs of them, beyond the first.
+    pub repeat: u32,
+}
+
+/// The test files a diff adds or changes.
+pub fn changed_tests(diff: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for (f, _, _) in added_lines(diff) {
+        if is_test_path(&f) && !is_doc(&f) && !files.contains(&f) {
+            files.push(f);
+        }
+    }
+    files
+}
+
+/// Runs the change's own tests each other way, and again plainly: a run
+/// that fails is a finding.
+fn vary(g: &GateRuns) -> Result<(Vec<Raw>, String)> {
+    let r = &g.runner;
+    let name = r
+        .repo
+        .file_name()
+        .map_or_else(|| "repo".into(), |n| n.to_owned());
+    let copy = r.dir.join("checks").join(&name);
+    let tests: Vec<String> = changed_tests(g.diff)
+        .into_iter()
+        .filter(|t| r.repo.join(t).is_file())
+        .collect();
+    if tests.is_empty() || (g.variants.is_empty() && g.repeat == 0) {
+        return Ok((Vec::new(), String::new()));
+    }
+    copy_of(r.repo, &copy).context("copying the change to run its tests other ways")?;
+    let mut runs: Vec<(String, &str)> = g
+        .variants
+        .iter()
+        .map(|v| (v.name.clone(), v.command.as_str()))
+        .collect();
+    for n in 0..g.repeat {
+        runs.push((
+            format!("on plain run {} of {}", n + 2, g.repeat + 1),
+            r.command,
+        ));
+    }
+    let mut found = Vec::new();
+    for (i, (what, command)) in runs.iter().enumerate() {
+        let log = r.dir.join(format!("check-{i}.log"));
+        let (ran, out) = run_tests(&copy, command, &tests, r.limit, &log)?;
+        if ran != Ran::Passed {
+            let how = if ran == Ran::TimedOut {
+                format!("ran past {} s", r.limit.as_secs())
+            } else {
+                "failed".to_string()
+            };
+            found.push(Raw {
+                title: format!("The change's tests fail {what}"),
+                detail: format!(
+                    "They pass when run as the change's tests command runs them, but {how} \
+                     run as `{}`. The end of the run:\n```\n{}\n```",
+                    command_line(command, &tests),
+                    clip(&out, 1500)
+                ),
+                file: tests.first().cloned(),
+                line: None,
+            });
+        }
+    }
+    let _ = fs::remove_dir_all(r.dir.join("checks"));
+    Ok((
+        found.clone(),
+        format!(
+            "the change's tests run {} other way(s): {} failed",
+            runs.len(),
+            found.len()
+        ),
+    ))
 }
 
 /// Runs the gate: coverage first, which has to pass as it stands, then the
@@ -983,6 +1062,11 @@ pub fn run_gate(g: &GateRuns, mutants: &[Mutant]) -> Result<(Vec<Raw>, String)> 
     let (survivors, mutated) = run_mutants(r, mutants)?;
     summary.push(mutated);
     found.extend(survivors);
+    let (varied, ways) = vary(g)?;
+    if !ways.is_empty() {
+        summary.push(ways);
+    }
+    found.extend(varied);
     Ok((found, summary.join("; ")))
 }
 
@@ -1271,6 +1355,45 @@ mod tests {
         );
         assert!(found[0].detail.contains("- 11: y = 2;"));
         assert_eq!(found[0].line, Some(11));
+    }
+
+    #[test]
+    fn the_changes_tests_are_run_other_ways_and_a_failure_is_a_finding() {
+        let repo = repo_with(&[("test/t.sh", "[ \"$1\" != strict ]\n")]);
+        let dir = std::env::temp_dir().join(format!("tb-acr-vary-{}", crate::util::new_id()));
+        let variants = vec![
+            crate::acr::config::Variant {
+                name: "in strict mode".into(),
+                command: "sh {tests} strict".into(),
+            },
+            crate::acr::config::Variant {
+                name: "in loose mode".into(),
+                command: "sh {tests} loose".into(),
+            },
+        ];
+        let runs = GateRuns {
+            runner: Runner {
+                repo: &repo,
+                dir: &dir,
+                command: "sh {tests}",
+                parallel: 1,
+                limit: Duration::from_secs(30),
+            },
+            coverage: None,
+            report: "coverage/lcov.info",
+            diff: "+++ b/test/t.sh\n@@ -0,0 +1 @@\n+[ \"$1\" != strict ]\n",
+            variants: &variants,
+            repeat: 2,
+        };
+        let (found, summary) = run_gate(&runs, &[]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "The change's tests fail in strict mode");
+        assert!(found[0].detail.contains("sh 'test/t.sh' strict"));
+        assert!(
+            summary.contains("run 4 other way(s): 1 failed"),
+            "{summary}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
