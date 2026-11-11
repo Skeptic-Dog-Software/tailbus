@@ -325,6 +325,7 @@ path = "/Users/you/.local/bin:/usr/bin:/bin"
 | `sessions_dir` | Where `per-sender` sessions go, a directory for each sender. |
 | `max_concurrent` | The most runs at once. Default 1. |
 | `timeout_secs` | How long a run can take. Default 600. |
+| `idle_secs` | How long a run can go quiet, with no process of its own using CPU and no file changing in its folders. Then its process tree is shaken: woken with SIGCONT, and watched briefly. A run that stirs goes on. One that doesn't is abandoned, ended, and tried again in a fresh run, up to 3 tries in all, before its failure is the answer. Default 1200; 0 turns it off. |
 | `shutdown_grace_secs` | How long a stop gives runs already going. Default 10. |
 | `model` | What `{MODEL}` means when a request doesn't name one. |
 | `stderr_tail_bytes` | The most stderr a result carries. Default 4096. |

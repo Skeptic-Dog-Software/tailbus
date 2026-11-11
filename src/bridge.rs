@@ -109,6 +109,13 @@ pub struct Settings {
     pub max_concurrent: usize,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// How long a run may go quiet before it's ended: no process of its
+    /// own used any CPU, and no file in its run or session folder changed.
+    /// A hung session, waiting on something that won't come, ends in
+    /// minutes this way rather than at `timeout_secs`. A long test run or a
+    /// model thinking isn't quiet. 0 turns it off.
+    #[serde(default = "default_idle")]
+    pub idle_secs: u64,
     /// How long a stop gives runs already going before it kills them.
     #[serde(default = "default_grace")]
     pub shutdown_grace_secs: u64,
@@ -232,6 +239,10 @@ fn default_timeout() -> u64 {
 
 fn default_grace() -> u64 {
     10
+}
+
+fn default_idle() -> u64 {
+    20 * 60
 }
 
 fn default_stderr_tail() -> usize {
@@ -785,37 +796,253 @@ fn exited(pid: i32) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
 }
 
-/// Everything under `root`, from the process table. This finds what left
-/// the process group with `setsid`, while it still has a parent in the tree.
-fn descendants(root: i32) -> Vec<i32> {
+/// One process, from the process table: its ID, its parent's, the CPU
+/// time it has used, in hundredths of a second, its state as `ps` gives it,
+/// and its command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Process {
+    pid: i32,
+    ppid: i32,
+    cpu: u64,
+    state: String,
+    command: String,
+}
+
+impl Process {
+    /// Running, or waiting on a disk: doing something, however quietly.
+    fn busy(&self) -> bool {
+        matches!(self.state.chars().next(), Some('R' | 'D' | 'U'))
+    }
+
+    fn described(&self) -> String {
+        let state = match self.state.chars().next() {
+            Some('R') => "running",
+            Some('S' | 'I') => "sleeping",
+            Some('D' | 'U') => "waiting on a disk",
+            Some('T') => "stopped",
+            Some('Z') => "a zombie",
+            _ => "in an unknown state",
+        };
+        let name = self.command.rsplit('/').next().unwrap_or(&self.command);
+        format!("{name} ({}) {state}", self.pid)
+    }
+}
+
+fn process_table() -> Vec<Process> {
     let table = Command::new("ps")
-        .args(["-axo", "pid=,ppid="])
+        .args(["-axo", "pid=,ppid=,time=,stat=,comm="])
         .stdin(Stdio::null())
         .output();
     let Ok(table) = table else {
         return Vec::new();
     };
-    let text = String::from_utf8_lossy(&table.stdout);
-    let pairs: Vec<(i32, i32)> = text
+    String::from_utf8_lossy(&table.stdout)
         .lines()
         .filter_map(|line| {
             let mut words = line.split_whitespace();
-            Some((words.next()?.parse().ok()?, words.next()?.parse().ok()?))
+            let pid = words.next()?.parse().ok()?;
+            let ppid = words.next()?.parse().ok()?;
+            let cpu = words.next().and_then(cpu_time).unwrap_or(0);
+            let state = words.next().unwrap_or_default().to_string();
+            Some(Process {
+                pid,
+                ppid,
+                cpu,
+                state,
+                command: words.collect::<Vec<_>>().join(" "),
+            })
         })
-        .collect();
-    let mut found = vec![root];
+        .collect()
+}
+
+/// `ps`'s CPU time in hundredths of a second: `[[dd-]hh:]mm:ss[.ss]`, as
+/// macOS and Linux each write it.
+fn cpu_time(text: &str) -> Option<u64> {
+    let (days, rest) = match text.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, text),
+    };
+    let mut hundredths = 0u64;
+    for (i, part) in rest.rsplit(':').enumerate() {
+        let unit = [1, 60, 3600].get(i)?;
+        let value: f64 = part.parse().ok()?;
+        hundredths += (value * 100.0).round() as u64 * unit;
+    }
+    Some(hundredths + days * 86_400 * 100)
+}
+
+/// Everything under `root` in `table`. This finds what left the process
+/// group with `setsid`, while it still has a parent in the tree.
+fn tree_of(root: i32, table: &[Process]) -> Vec<Process> {
+    let mut found: Vec<Process> = table.iter().filter(|p| p.pid == root).cloned().collect();
+    let mut ids = vec![root];
     let mut next = 0;
-    while next < found.len() {
-        let parent = found[next];
+    while next < ids.len() {
+        let parent = ids[next];
         next += 1;
-        for &(pid, ppid) in &pairs {
-            if ppid == parent && !found.contains(&pid) {
-                found.push(pid);
+        for p in table {
+            if p.ppid == parent && !ids.contains(&p.pid) {
+                ids.push(p.pid);
+                found.push(p.clone());
             }
         }
     }
-    found.remove(0);
     found
+}
+
+/// Everything under `root`, from the process table.
+fn descendants(root: i32) -> Vec<i32> {
+    tree_of(root, &process_table())
+        .into_iter()
+        .map(|p| p.pid)
+        .filter(|&pid| pid != root)
+        .collect()
+}
+
+/// The most files a check for a quiet run looks at, so a run that copied a
+/// whole repository into its folder doesn't make each check slow.
+const QUIET_FILES: usize = 50_000;
+/// The longest between checks for a quiet run.
+const QUIET_CHECK: Duration = Duration::from_secs(30);
+
+/// What a run is doing, as far as a check for quiet can tell: each process
+/// of its tree with the CPU it has used, and the newest change to a file in
+/// its folders. Any difference between two checks is activity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Activity {
+    processes: Vec<(i32, u64)>,
+    newest: Option<std::time::SystemTime>,
+}
+
+impl Activity {
+    fn of(root: i32, dirs: &[&Path]) -> Activity {
+        let mut processes: Vec<(i32, u64)> = tree_of(root, &process_table())
+            .into_iter()
+            .map(|p| (p.pid, p.cpu))
+            .collect();
+        processes.sort_unstable();
+        let mut newest = None;
+        let mut left = QUIET_FILES;
+        for dir in dirs {
+            newest_change(dir, &mut newest, &mut left);
+        }
+        Activity { processes, newest }
+    }
+}
+
+fn newest_change(dir: &Path, newest: &mut Option<std::time::SystemTime>, left: &mut usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *left == 0 {
+            return;
+        }
+        *left -= 1;
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        if let Ok(at) = meta.modified()
+            && newest.is_none_or(|n| at > n)
+        {
+            *newest = Some(at);
+        }
+        if meta.is_dir() {
+            newest_change(&entry.path(), newest, left);
+        }
+    }
+}
+
+/// Watches a run for going quiet: no CPU used by any process of its tree,
+/// and no file changed in its folders, for `idle`. Quiet isn't abandoned:
+/// a run may be waiting on something that will come. So before it's ended
+/// its tree is shaken:
+/// 1. A process that's running, or waiting on a disk, is doing something:
+///    the run isn't quiet after all.
+/// 2. Otherwise every process gets SIGCONT, which wakes one that was
+///    stopped and does nothing to the rest, and the run gets `shake` more
+///    to show any activity.
+///
+/// Only if nothing stirs is it abandoned.
+struct Quiet {
+    idle: Option<Duration>,
+    every: Duration,
+    shake: Duration,
+    checked: Instant,
+    since: Instant,
+    seen: Activity,
+    shaking: Option<(Instant, Vec<Process>)>,
+}
+
+impl Quiet {
+    fn new(idle_secs: u64, pid: i32, dirs: &[&Path]) -> Quiet {
+        let idle = (idle_secs > 0).then(|| Duration::from_secs(idle_secs));
+        let every = idle.map_or(QUIET_CHECK, |i| (i / 4).clamp(POLL, QUIET_CHECK));
+        let shake = idle.map_or(QUIET_CHECK, |i| {
+            (i / 2).clamp(Duration::from_secs(1), SHAKE_WAIT)
+        });
+        Quiet {
+            idle,
+            every,
+            shake,
+            checked: Instant::now(),
+            since: Instant::now(),
+            seen: Activity::of(pid, dirs),
+            shaking: None,
+        }
+    }
+
+    /// What the shake found, once the run is abandoned.
+    fn check(&mut self, pid: i32, dirs: &[&Path]) -> Option<String> {
+        let idle = self.idle?;
+        if self.checked.elapsed() < self.every {
+            return None;
+        }
+        self.checked = Instant::now();
+        let now = Activity::of(pid, dirs);
+        if now != self.seen {
+            self.seen = now;
+            self.since = Instant::now();
+            self.shaking = None;
+            return None;
+        }
+        match &self.shaking {
+            None if self.since.elapsed() >= idle => {
+                let tree = tree_of(pid, &process_table());
+                if tree.iter().any(Process::busy) {
+                    self.since = Instant::now();
+                    return None;
+                }
+                for p in &tree {
+                    unsafe {
+                        libc::kill(p.pid, libc::SIGCONT);
+                    }
+                }
+                self.shaking = Some((Instant::now(), tree));
+                None
+            }
+            Some((at, tree)) if at.elapsed() >= self.shake => Some(
+                tree.iter()
+                    .take(8)
+                    .map(Process::described)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// The most a shake waits for a run to stir.
+const SHAKE_WAIT: Duration = Duration::from_secs(60);
+
+/// `secs` as a person would say it.
+fn how_long(secs: u64) -> String {
+    match secs {
+        s if s >= 120 && s % 60 == 0 => format!("{} minutes", s / 60),
+        1 => "1 second".into(),
+        s => format!("{s} seconds"),
+    }
 }
 
 fn signal_tree(pgid: i32, tree: &[i32], signal: i32) {
@@ -1106,11 +1333,18 @@ enum Outcome {
     Finished(Finished),
     /// A stop cut it short, so it stays pending for the next start.
     Stopped,
+    /// It went quiet and a shake couldn't wake it, so it was ended. The
+    /// request is still good: it's tried again in a fresh run, and this is
+    /// the answer only once every try has been abandoned.
+    Abandoned(Finished),
 }
 
 enum End {
     Exited(ExitStatus),
     TimedOut,
+    /// Nothing it ran used CPU or wrote a file for `idle_secs`, and a shake
+    /// of its process tree woke nothing: what the shake found.
+    Quiet(String),
     Stopped,
     Cancelled,
 }
@@ -1758,7 +1992,11 @@ impl Bridge {
         }
         let started = Instant::now();
         match self.attempt(job) {
-            Outcome::Finished(done) => self.conclude(&job.item, Some(&job.plan), done, started),
+            // `attempt` tries an abandoned run again, and turns the last
+            // one into its answer.
+            Outcome::Finished(done) | Outcome::Abandoned(done) => {
+                self.conclude(&job.item, Some(&job.plan), done, started)
+            }
             Outcome::Stopped => self.tell_stopped(msg),
         }
     }
@@ -1944,10 +2182,36 @@ impl Bridge {
         }
         self.save_journal(&msg.id, &journal);
         let run_dir = self.dir.join("runs").join(&msg.id);
-        let outcome = self
-            .run(job, &mut journal, &run_dir)
-            .unwrap_or_else(|e| Outcome::Finished(self.failed(format!("{e:#}"))));
-        let _ = fs::remove_dir_all(&run_dir);
+        let outcome = loop {
+            let outcome = self
+                .run(job, &mut journal, &run_dir)
+                .unwrap_or_else(|e| Outcome::Finished(self.failed(format!("{e:#}"))));
+            let _ = fs::remove_dir_all(&run_dir);
+            match outcome {
+                // Abandoned isn't the request's fault: run it again, fresh,
+                // while tries are left.
+                Outcome::Abandoned(_)
+                    if journal.attempts < MAX_ATTEMPTS && !self.is_cancelled(&msg.id) =>
+                {
+                    journal.attempts += 1;
+                    journal.pgid = None;
+                    journal.leader_started = None;
+                    self.save_journal(&msg.id, &journal);
+                    self.log(format!(
+                        "{}: trying it again, try {} of {MAX_ATTEMPTS}",
+                        msg.id, journal.attempts
+                    ));
+                }
+                Outcome::Abandoned(mut done) => {
+                    done.body = format!(
+                        "{} It was tried {} times, and abandoned each time.",
+                        done.body, journal.attempts
+                    );
+                    break Outcome::Finished(done);
+                }
+                other => break other,
+            }
+        };
         self.report(|r| {
             r.running.remove(&msg.id);
         });
@@ -2031,7 +2295,7 @@ impl Bridge {
                 },
             );
         });
-        let end = self.wait_for(&mut child, msg, plan)?;
+        let end = self.wait_for(&mut child, msg, plan, &[run_dir, &session_dir])?;
 
         // Kept whatever happened, with secrets out, and it's what everything
         // after this reads.
@@ -2057,6 +2321,18 @@ impl Bridge {
                 let mut done = self.failed(format!("it timed out after {} seconds", plan.timeout));
                 done.status = RunStatus::Timeout;
                 done
+            }
+            End::Quiet(shaken) => {
+                let mut done = self.failed(format!(
+                    "it went quiet: nothing it ran used any CPU or changed a file for {}, \
+                     and shaking its process tree woke nothing ({shaken})",
+                    how_long(self.cfg.idle_secs)
+                ));
+                done.status = RunStatus::Timeout;
+                if let (Some(from), Some(before)) = (&self.cfg.usage, &before) {
+                    done.usage = from.read(&session_dir, before).map(Box::new);
+                }
+                return Ok(Outcome::Abandoned(done));
             }
             End::Exited(status) if !status.success() => {
                 let how = match status.code() {
@@ -2233,11 +2509,20 @@ impl Bridge {
         Ok(command)
     }
 
-    /// Waits for a run to end, and leaves nothing of it running.
-    fn wait_for(&self, child: &mut Child, msg: &Message, plan: &Plan) -> Result<End> {
+    /// Waits for a run to end, and leaves nothing of it running. A run
+    /// that goes quiet for `idle_secs` is ended too, but only once a shake
+    /// of its process tree shows it's abandoned (see `Quiet`).
+    fn wait_for(
+        &self,
+        child: &mut Child,
+        msg: &Message,
+        plan: &Plan,
+        dirs: &[&Path],
+    ) -> Result<End> {
         let pid = child.id() as i32;
         let deadline = Instant::now() + Duration::from_secs(plan.timeout);
         let grace = Duration::from_secs(self.cfg.shutdown_grace_secs);
+        let mut quiet = Quiet::new(self.cfg.idle_secs, pid, dirs);
         let cut_short = loop {
             if exited(pid) {
                 break None;
@@ -2247,6 +2532,10 @@ impl Bridge {
             }
             if Instant::now() >= deadline {
                 break Some(End::TimedOut);
+            }
+            if let Some(shaken) = quiet.check(pid, dirs) {
+                self.log(format!("{}: abandoned, so ended: {shaken}", msg.id));
+                break Some(End::Quiet(shaken));
             }
             let stop_at = self.lock_state().stop_at;
             if stop_at.is_some_and(|at| at.elapsed() >= grace) {
@@ -2835,6 +3124,78 @@ mod tests {
         for pid in pids {
             wait_gone(pid);
         }
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn ps_cpu_time_reads_as_macos_and_linux_write_it() {
+        assert_eq!(cpu_time("0:00.03"), Some(3));
+        assert_eq!(cpu_time("1:02.50"), Some(6_250));
+        assert_eq!(cpu_time("01:02:03"), Some(372_300));
+        assert_eq!(cpu_time("2-00:00:01"), Some((2 * 86_400 + 1) * 100));
+        assert_eq!(cpu_time("soon"), None);
+    }
+
+    #[test]
+    fn a_shake_wakes_a_stopped_process_and_the_run_goes_on() {
+        let rig = Rig::new();
+        // The child stops itself, so nothing runs and nothing's written,
+        // while its parent waits for it.
+        let script = r#"sh -c 'kill -STOP $$; i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done' &
+            wait
+            echo done"#;
+        let bridge = rig.start(rig.settings(script, "idle_secs = 1"));
+        let id = rig.ask("hello");
+        assert_eq!(rig.reply_to(&id), "done");
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_busy_run_is_never_taken_for_a_quiet_one() {
+        let rig = Rig::new();
+        let script = r#"end=$(($(date +%s) + 4))
+            while [ "$(date +%s)" -lt "$end" ]; do :; done
+            echo done"#;
+        let bridge = rig.start(rig.settings(script, "idle_secs = 1"));
+        let id = rig.ask("hello");
+        assert_eq!(rig.reply_to(&id), "done");
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn an_abandoned_run_is_tried_again_and_can_still_answer() {
+        let rig = Rig::new();
+        // The first try hangs where no shake can wake it; the second answers.
+        let script = r#"n=$(cat "$HOME/tries" 2>/dev/null || echo 0)
+            n=$((n + 1))
+            echo $n > "$HOME/tries"
+            [ $n -eq 1 ] && sleep 300
+            echo "answered on try $n""#;
+        let bridge = rig.start(rig.settings(script, "idle_secs = 1"));
+        let id = rig.ask("hello");
+        assert_eq!(rig.reply_to(&id), "answered on try 2");
+        bridge.stop().unwrap();
+    }
+
+    #[test]
+    fn a_run_abandoned_on_every_try_fails_saying_what_the_shake_found() {
+        let rig = Rig::new();
+        let script = r#"echo x >> "$HOME/tries"
+            sleep 300"#;
+        let bridge = rig.start(rig.settings(script, "idle_secs = 1"));
+        let id = rig.ask("hello");
+        let reply = rig.reply_to(&id);
+        assert!(
+            reply.starts_with("api could not answer: it went quiet")
+                && reply.contains("shaking its process tree woke nothing")
+                && reply.contains("sleep (")
+                && reply.ends_with(&format!(
+                    "It was tried {MAX_ATTEMPTS} times, and abandoned each time."
+                )),
+            "{reply}"
+        );
+        let tries = fs::read_to_string(rig.home("tries")).unwrap();
+        assert_eq!(tries.lines().count(), MAX_ATTEMPTS as usize);
         bridge.stop().unwrap();
     }
 
