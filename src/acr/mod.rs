@@ -75,6 +75,11 @@ pub struct Target {
     /// for, read with `gh`. `--post-pr` reads its own when this is left out.
     #[arg(long, value_name = "NUMBER")]
     pr: Option<u64>,
+    /// The building session's brief for round 1's reviewers: a YAML file
+    /// with a `scope` statement, and `lenses`, each lens's where and how
+    /// to attack. See docs/acr-repo-setup.md.
+    #[arg(long, value_name = "FILE")]
+    brief: Option<PathBuf>,
 }
 
 /// What the change says it's for: `--description`'s file, or a pull
@@ -668,6 +673,7 @@ fn setting<'a>(
         description: None,
         converge: false,
         copies: Some(copies_root(paths)),
+        builder_brief: None,
     })
 }
 
@@ -871,6 +877,11 @@ pub fn run(paths: &Paths, command: AcrCmd) -> Result<ExitCode> {
             let list = not_findings(&cfg, &source, &target.repo, &target.base)?;
             let mut s = setting(paths, &cfg, &id, Some(list))?;
             s.description = description;
+            s.builder_brief = target
+                .brief
+                .as_deref()
+                .map(stages::read_builder_brief)
+                .transpose()?;
             // Under way until this ends, so an update to tailbus waits for it.
             let _active = keep::active_guard(paths, &id)?;
             let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
@@ -1025,6 +1036,7 @@ fn check(paths: &Paths, key_path: &Path) -> Result<bool> {
         bindings: Vec::new(),
         description: None,
         pr: None,
+        brief: None,
     };
     let (cfg, _) = load_config(paths, &target, &flags(&target))?;
     let mut names: Vec<&String> = cfg
@@ -1204,6 +1216,11 @@ fn pipeline_run(
     let mut s = setting(paths, &cfg, &id, Some(list))?;
     s.description = description;
     s.converge = converge;
+    s.builder_brief = target
+        .brief
+        .as_deref()
+        .map(stages::read_builder_brief)
+        .transpose()?;
     // Under way until this ends, so an update to tailbus waits for it.
     let _active = keep::active_guard(paths, &id)?;
     let (repo, base, head) = (&target.repo, target.base.as_str(), target.head.as_deref());
@@ -1274,6 +1291,7 @@ fn lens_criteria(paths: &Paths, tree: &Path, key: &trial::Key) -> Vec<(String, S
         bindings: Vec::new(),
         description: None,
         pr: None,
+        brief: None,
     };
     match load_config(paths, &target, &flags(&target)) {
         Ok((cfg, _)) => cfg
@@ -1312,6 +1330,7 @@ fn pipeline_arm(
         },
         description: None,
         pr: None,
+        brief: key.brief.clone(),
     };
     let (cfg, _) = load_config(paths, &target, &flags(&target))?;
     let mut bridges: Vec<String> = cfg
@@ -1429,6 +1448,7 @@ fn calibrate(paths: &Paths, key_path: &Path) -> Result<serde_json::Value> {
         bindings: Vec::new(),
         description: None,
         pr: None,
+        brief: None,
     };
     let (cfg, source) = load_config(paths, &target, &flags(&target))?;
     let judge = cfg.binding(Role::Judge, None)?;
@@ -1593,6 +1613,7 @@ mod tests {
             bindings: Vec::new(),
             description: None,
             pr: None,
+            brief: None,
         }
     }
 

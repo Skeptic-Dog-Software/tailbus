@@ -63,6 +63,11 @@ pub struct Key {
     /// audits left out.
     #[serde(default)]
     pub every_dimension: bool,
+    /// The building session's brief for the pipeline's round 1, written
+    /// before any review, as `tailbus acr run --brief` takes it. A relative
+    /// path is from the key's own file.
+    #[serde(default)]
+    pub brief: Option<PathBuf>,
 }
 
 /// A commit, which YAML reads as a number when it's all digits.
@@ -990,9 +995,12 @@ pub(super) fn read_key(key_path: &Path) -> Result<Key> {
         &fs::read_to_string(key_path).with_context(|| format!("reading {}", key_path.display()))?,
     )
     .with_context(|| format!("in {}", key_path.display()))?;
+    let dir = key_path.parent().unwrap_or(Path::new(""));
     if let Some(patch) = key.patch.take() {
-        let dir = key_path.parent().unwrap_or(Path::new(""));
         key.patch = Some(dir.join(patch));
+    }
+    if let Some(brief) = key.brief.take() {
+        key.brief = Some(dir.join(brief));
     }
     Ok(key)
 }
@@ -1126,6 +1134,7 @@ mod tests {
             findings: Vec::new(),
             patch: None,
             every_dimension: false,
+            brief: None,
         };
         let past = Key {
             base: fixed.clone(),
@@ -1396,6 +1405,7 @@ mod tests {
             findings: Vec::new(),
             patch: None,
             every_dimension: false,
+            brief: None,
         };
         let criteria = [(
             "correctness".to_string(),

@@ -157,6 +157,29 @@ tests:
   names. Put cheap setup in front of it, such as the offline dependency
   install and the cache copy from the runbook.
 
+## 5a. The builder's brief
+
+The session that built a change briefs its reviewers best: it knows what
+the change does and where it could be wrong. Pass its brief with
+`tailbus acr run --brief <file>`:
+
+```yaml
+scope: |
+  What the change does, mechanism by mechanism: what it fixes, how,
+  what it keeps, what its tests now pin, and what it doesn't touch.
+lenses:
+  correctness: |
+    The parts to attack in this lens, and how: what to run, what to
+    break, which edges and callers to check.
+  regression-safety: |
+    ...
+```
+
+Every role gets the scope statement, as the builder's claims to check.
+Each reviewer gets its own lens's part. The `brief` stage covers any lens
+the builder left out. After a fix, the steelman briefs the next round,
+since by then it holds the change's context.
+
 ## 6. Check it
 
 ```sh

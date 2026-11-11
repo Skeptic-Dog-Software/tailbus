@@ -347,6 +347,7 @@ pub fn steelman_prompt(
     earlier: &str,
     blockers: &str,
     writer_follows: bool,
+    lenses: &str,
 ) -> String {
     let pins = if writer_follows {
         "Leave the tests that pin these fixes to the test writer who follows you. Run only the \
@@ -381,9 +382,15 @@ pub fn steelman_prompt(
          person, not into the work. Keep the change to what it's for. Where the work claims \
          something about itself, in a comment, a test name, a doc or a ledger row, make the \
          claim true or take it out. {pins} Don't commit.\n\n\
-         A declined finding is recorded as a disagreement, not a resolution. Answer with only \
-         JSON: {{\"done\": \"<what you changed, in a few lines>\", \
-         \"declined\": [{{\"finding\": \"<its id>\", \"reason\": \"\"}}]}}."
+         A declined finding is recorded as a disagreement, not a resolution.\n\n\
+         # Brief the next round\n\n\
+         You know what you just changed better than anyone the next round sends. For each \
+         lens below, brief its reviewer: where your fixes could be wrong, or could have \
+         broken something they touch, and how to test it here. Questions to settle, not \
+         reassurance. Leave out a lens your fixes can't affect.\n\n{lenses}\n\
+         Answer with only JSON: {{\"done\": \"<what you changed, in a few lines>\", \
+         \"declined\": [{{\"finding\": \"<its id>\", \"reason\": \"\"}}], \
+         \"briefs\": {{\"<lens id>\": \"<the brief>\"}}}}."
     )
 }
 
@@ -400,6 +407,9 @@ pub struct Fixed {
     /// A steelman's: what it left out, and why.
     #[serde(default)]
     pub declined: Vec<Declined>,
+    /// A steelman's briefs for the next round's reviewers, by lens.
+    #[serde(default)]
+    pub briefs: std::collections::BTreeMap<String, String>,
 }
 
 pub fn read_fixed(text: &str) -> Result<Fixed> {

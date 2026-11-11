@@ -294,6 +294,9 @@ pub struct Steelman {
     pub pins: Vec<Pin>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tests_done: String,
+    /// Its briefs for the next round's reviewers, by lens.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub briefs: BTreeMap<String, String>,
     pub declined: Vec<roles::Declined>,
 }
 
@@ -339,6 +342,10 @@ pub struct Setting<'a> {
     /// checkout of its own, for the round. Without it, every reviewer works
     /// in the checkout.
     pub copies: Option<PathBuf>,
+    /// The building session's brief for round 1's reviewers, if it wrote
+    /// one. Later rounds are briefed by the steelman, which holds the
+    /// change's context by then.
+    pub builder_brief: Option<stages::BuilderBrief>,
 }
 
 /// A person's answer at a gate.
@@ -481,6 +488,9 @@ impl Artifacts {
 fn write_artifact(s: &Setting, run: &Run, change: &Change, round: u32) -> Result<Artifacts> {
     fs::create_dir_all(&s.work_dir)?;
     let mut intent = super::change::intent(s.description.as_deref(), &change.commits);
+    if let Some(brief) = &s.builder_brief {
+        intent.push_str(&stages::scope_section(brief));
+    }
     if s.cfg.stages.contains(&Kind::Context) {
         intent.push_str(&stages::context_pack(&run.repo, &run.base, change));
     }
@@ -755,43 +765,64 @@ fn attack(
     let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Each open lens's brief for this change, from one call, before any
     // reviewer starts.
-    let briefs: BTreeMap<String, String> = if cfg.stages.contains(&Kind::Brief) && !open.is_empty()
-    {
-        let lenses: Vec<stages::ToBrief> = open
-            .iter()
-            .map(|id| {
-                lens_of(cfg, id).map(|l| stages::ToBrief {
-                    id: &l.id,
-                    criteria: &l.criteria,
-                    attack: l.attack.as_deref(),
-                })
-            })
-            .collect::<Result<_>>()?;
-        let prompt = stages::briefer_prompt(&scope, &lenses, cfg.runbook.as_deref());
-        match ask(
-            run,
-            s,
-            caller,
-            Role::Orchestrator,
-            &prompt,
-            Some(&artifacts.diff),
-        )
-        .and_then(|text| stages::read_briefs(&text))
-        {
-            Ok(briefs) => briefs,
-            Err(e) => {
-                for id in &open {
-                    notes
-                        .entry(id.clone())
-                        .or_default()
-                        .push(format!("no brief: {e:#}"));
-                }
-                BTreeMap::new()
-            }
-        }
+    // Round 1's lenses are briefed by the change's builder, if it wrote a
+    // brief; the next round's, after a fix, by the steelman. The brief
+    // stage covers any lens they left out.
+    let given: BTreeMap<String, String> = if run.round == 1 {
+        s.builder_brief
+            .as_ref()
+            .map(|b| b.lenses.clone())
+            .unwrap_or_default()
     } else {
-        BTreeMap::new()
+        run.steelmans
+            .last()
+            .filter(|m| m.round + 1 == run.round)
+            .map(|m| m.briefs.clone())
+            .unwrap_or_default()
     };
+    let unbriefed: Vec<String> = open
+        .iter()
+        .filter(|id| !given.contains_key(*id))
+        .cloned()
+        .collect();
+    let mut briefs: BTreeMap<String, String> =
+        if cfg.stages.contains(&Kind::Brief) && !unbriefed.is_empty() {
+            let lenses: Vec<stages::ToBrief> = unbriefed
+                .iter()
+                .map(|id| {
+                    lens_of(cfg, id).map(|l| stages::ToBrief {
+                        id: &l.id,
+                        criteria: &l.criteria,
+                        attack: l.attack.as_deref(),
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let prompt = stages::briefer_prompt(&scope, &lenses, cfg.runbook.as_deref());
+            match ask(
+                run,
+                s,
+                caller,
+                Role::Orchestrator,
+                &prompt,
+                Some(&artifacts.diff),
+            )
+            .and_then(|text| stages::read_briefs(&text))
+            {
+                Ok(briefs) => briefs,
+                Err(e) => {
+                    for id in &unbriefed {
+                        notes
+                            .entry(id.clone())
+                            .or_default()
+                            .push(format!("no brief: {e:#}"));
+                    }
+                    BTreeMap::new()
+                }
+            }
+        } else {
+            BTreeMap::new()
+        };
+    briefs.extend(given);
     let copies = dir.map(Path::to_path_buf);
     let name = run
         .repo
@@ -1613,7 +1644,15 @@ fn fix(
             .iter()
             .map(|m| format!("- After round {}: {}\n", m.round, m.done))
             .collect();
-        roles::steelman_prompt(&intent, &earlier, &list(&folded), writing)
+        {
+            let lenses: String = run
+                .lenses
+                .keys()
+                .filter_map(|id| s.cfg.lenses.iter().find(|l| &l.id == id))
+                .map(|l| format!("- {}: {}\n", l.id, l.criteria.trim()))
+                .collect();
+            roles::steelman_prompt(&intent, &earlier, &list(&folded), writing, &lenses)
+        }
     } else {
         roles::fix_prompt(&list(&folded))
     };
@@ -1678,6 +1717,7 @@ fn fix(
                     declined: fixed.declined.clone(),
                     pins: Vec::new(),
                     tests_done: String::new(),
+                    briefs: fixed.briefs.clone(),
                 });
                 if writing {
                     let (pins, done) =
@@ -2174,6 +2214,7 @@ lenses:
             description: None,
             converge: false,
             copies: None,
+            builder_brief: None,
         }
     }
 
@@ -2605,6 +2646,63 @@ lenses:
             run.usage.iter().filter(|u| u.role == Role::Judge).count(),
             2
         );
+    }
+
+    #[test]
+    fn the_builder_briefs_round_one_and_the_steelman_the_next() {
+        let cfg = config("exception", 20, 1, "", "stages: [brief]");
+        let fixed = Mutex::new(false);
+        let fake = Fake::new(|role, prompt: &str| {
+            Ok(match role {
+                Role::Orchestrator if prompt.contains("You brief the reviewers") => {
+                    // Only the lens the builder left out.
+                    assert!(prompt.contains("- beta:") && !prompt.contains("- alpha:"));
+                    r#"{"briefs": {"beta": "Read the callers."}}"#.to_string()
+                }
+                Role::Reviewer if prompt.contains("alpha") && !*fixed.lock().unwrap() => {
+                    ONE.to_string()
+                }
+                Role::Reviewer => CLEAN.to_string(),
+                Role::Judge => rating("High"),
+                Role::Orchestrator if prompt.contains("You synthesize") => {
+                    assert!(prompt.contains("# Brief the next round"));
+                    *fixed.lock().unwrap() = true;
+                    r#"{"done": "fixed", "briefs": {"alpha": "Check my fix in a.src at midnight."}}"#
+                        .to_string()
+                }
+                _ => NOTHING.to_string(),
+            })
+        });
+        let mut s = setting(&cfg);
+        s.converge = true;
+        s.builder_brief = Some(stages::BuilderBrief {
+            scope: Some("It makes x one, in a.src.".into()),
+            lenses: BTreeMap::from([("alpha".to_string(), "Break the lookup.".to_string())]),
+        });
+        let c = change(&["a.src"]);
+        let mut run = start("r", Path::new("."), "main", None, &s, &c, &fake).unwrap();
+        drive(&mut run, &s, &fake, &|_| Ok(c.clone())).unwrap();
+        assert_eq!(run.status, Status::Confirmed);
+        let calls = fake.calls.lock().unwrap();
+        let alpha: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.0 == Role::Reviewer && c.3.contains("reviewer for alpha."))
+            .map(|c| &c.3)
+            .collect();
+        assert!(alpha[0].contains("Break the lookup."));
+        assert!(alpha[1].contains("Check my fix in a.src at midnight."));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.0 == Role::Reviewer && c.3.contains("Read the callers."))
+        );
+        drop(calls);
+        let sent = fake.sent.lock().unwrap();
+        assert!(
+            sent.iter()
+                .all(|(_, text)| text.contains("# What the change's builder says it does"))
+        );
+        let _ = fs::remove_dir_all(&s.work_dir);
     }
 
     #[test]

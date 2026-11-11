@@ -135,6 +135,37 @@ pub fn read_briefs(text: &str) -> Result<std::collections::BTreeMap<String, Stri
     Ok(super::roles::json_in::<Briefs>(text)?.briefs)
 }
 
+/// The building session's brief for the reviewers: what the change does,
+/// mechanism by mechanism, and for each lens where to attack it and how.
+/// It's the builder's account, so every role gets its scope statement as
+/// claims to check, and each reviewer only its own lens's part.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderBrief {
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub lenses: std::collections::BTreeMap<String, String>,
+}
+
+pub fn read_builder_brief(path: &Path) -> Result<BuilderBrief> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading the brief {}", path.display()))?;
+    serde_yaml_ng::from_str(&text).with_context(|| format!("in the brief {}", path.display()))
+}
+
+/// The builder's scope statement, for every role, ahead of the diff.
+pub fn scope_section(brief: &BuilderBrief) -> String {
+    match brief.scope.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(scope) => format!(
+            "# What the change's builder says it does\n\nThe builder's own account: claims to \
+             check against the code, not to take on trust.\n\n{}\n\n",
+            scope.trim()
+        ),
+        None => String::new(),
+    }
+}
+
 /// What a reviewer gets besides its lens's criteria: how to attack in the
 /// lens, where to attack in this change, from the brief stage, and, if it
 /// can run things, how to work in this repository.
@@ -145,8 +176,8 @@ pub fn guide(attack: Option<&str>, brief: Option<&str>, runbook: Option<&str>) -
     }
     if let Some(b) = brief.filter(|b| !b.trim().is_empty()) {
         out.push_str(&format!(
-            "# Where to attack in this change\n\nFrom a brief written for this change by \
-             someone who read it but didn't write it: leads, not findings.\n\n{}\n\n",
+            "# Where to attack in this change\n\nFrom a brief written for this change: leads, \
+             not findings.\n\n{}\n\n",
             b.trim()
         ));
     }
