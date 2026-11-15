@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "acrbus"
-version = "0.1.36"
-source = "git+https://github.com/Skeptic-Dog-Software/acrbus?tag=v0.1.36#5846b99f8634c319172538a8f598eb7860dbbbfc"
+version = "0.1.37"
+source = "git+https://github.com/Skeptic-Dog-Software/acrbus?tag=v0.1.37#913c409d881c4ceb118088725f2ec1405772effa"
 dependencies = [
  "anyhow",
  "clap",
