@@ -1,0 +1,41 @@
+# tailbus's defaults for an omp bridge, `kind = "omp"`: headless omp, a fresh
+# session for each request, with none of your extensions, skills, rules or
+# language servers. A bridge's own table in config.toml holds what's this
+# machine's: owner, command, home, path, working_directory, model, its
+# provider's models, and extra_args such as a provider extension. Anything
+# it sets wins over these.
+args = ["-p", "--model", "{MODEL}", "--session-dir", "{SESSION_DIR}", "--no-extensions",
+  "--no-skills", "--no-rules", "--no-lsp", "--no-title", "--auto-approve"]
+# 4 hours: a cap no run should reach. A run ends when it's done.
+timeout_secs = 14400
+max_concurrent = 3
+
+[options]
+max_timeout_secs = 14400
+tools = ["read", "grep", "glob", "bash", "edit", "write"]
+tools_args = ["--tools", "{TOOLS}"]
+# For a call with no tools at all. omp has
+# no flag that turns off MCP (as of omp 18.12), so its MCP servers are
+# whatever its config in the bridge's home names.
+no_tools_args = ["--no-tools"]
+efforts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+effort_args = ["--thinking", "{EFFORT}"]
+workdirs = []
+
+[usage]
+files = "**/*.jsonl"
+when = { type = "message", "message.role" = "assistant" }
+input = "message.usage.input"
+output = "message.usage.output"
+cache_read = "message.usage.cacheRead"
+cache_write = "message.usage.cacheWrite"
+reasoning = "message.usage.reasoningTokens"
+usd = "message.usage.cost.total"
+model = "message.model"
+
+[usage.opened]
+items = "message.content"
+when = { type = "toolCall" }
+name = "name"
+names = ["read"]
+path = "arguments.path"

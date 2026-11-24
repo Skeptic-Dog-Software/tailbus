@@ -1,0 +1,45 @@
+# tailbus's defaults for a pi bridge, `kind = "pi"`: headless pi, a fresh
+# session for each request, with none of your extensions, skills, prompt
+# templates or themes, and no project-local config trusted. A bridge's own
+# table in config.toml holds what's this machine's: owner, command, home,
+# path, working_directory, model, its provider's models, and extra_args.
+# Anything it sets wins over these.
+args = ["-p", "--model", "{MODEL}", "--session-dir", "{SESSION_DIR}", "--no-extensions",
+  "--no-skills", "--no-prompt-templates", "--no-themes", "--no-approve"]
+# 4 hours: a cap no run should reach. A run ends when it's done.
+timeout_secs = 14400
+max_concurrent = 3
+
+[options]
+max_timeout_secs = 14400
+tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
+tools_args = ["--tools", "{TOOLS}"]
+no_tools_args = ["--no-tools", "--no-mcp"]
+# The host's MCP servers reach no call that didn't name one: pi connects
+# none. A request's `mcp` names servers the bridge's `options.mcp` allows,
+# from pi's own mcp.json in the bridge's home; the call then keeps only
+# their tools, with its own.
+no_mcp_args = ["--no-mcp"]
+mcp_tool = "mcp__{SERVER}__*"
+efforts = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+effort_args = ["--thinking", "{EFFORT}"]
+workdirs = []
+
+[usage]
+files = "**/*.jsonl"
+when = { type = "message", "message.role" = "assistant" }
+input = "message.usage.input"
+output = "message.usage.output"
+cache_read = "message.usage.cacheRead"
+cache_write = "message.usage.cacheWrite"
+usd = "message.usage.cost.total"
+usd_input = "message.usage.cost.input"
+usd_cache_read = "message.usage.cost.cacheRead"
+model = "message.model"
+
+[usage.opened]
+items = "message.content"
+when = { type = "toolCall" }
+name = "name"
+names = ["read"]
+path = "arguments.path"

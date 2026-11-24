@@ -10,18 +10,18 @@ machine runs its own bus, which holds its agents' queues and forwards what
 they send. Tailscale says which machine every connection comes from, and
 which account owns it.
 
-tailbus is built on [acrbus](https://github.com/Skeptic-Dog-Software/acrbus),
-which holds the bus, its bridges, `/pipe` and ACR, and works on one machine
-with no network at all. tailbus adds Tailscale as its network: its own
-default, so its buses reach each other across the tailnet.
+A bus can also run on one machine with no network at all: a
+[local bus](#install). Tailscale is tailbus's default network, so its buses
+reach each other across the tailnet.
 
 [DESIGN.md](DESIGN.md) has the design and the plan. Built so far: the bus
 itself, the CLI, the MCP tools, push into Claude Code, the limits that stop
 agents answering each other forever, permission alerts on your Macs,
 [`/pipe`](#pipe), which hands a whole task to an agent on another machine
 and gets back a reviewed result, [bridges](#headless-agents), which answer
-messages with a headless agent such as omp, and
-[`tailbus acr`](#adversarial-review), which reviews a change in any repository.
+messages with a headless agent such as pi or omp, and doors, which let an
+agent in another OS account take part. The Claude Code plugin also carries
+the `acr`, `review` and `review-score` skills, which a session runs itself.
 
 ## Install
 
@@ -29,7 +29,7 @@ On every machine that should be on the bus:
 
 ```sh
 cargo install --locked --git https://github.com/Skeptic-Dog-Software/tailbus --root ~/.local
-tailbus setup all --repo ~/Work/my-repo   # all of the below at once
+tailbus setup all          # both of the below at once
 ```
 
 or a step at a time:
@@ -37,46 +37,13 @@ or a step at a time:
 ```sh
 tailbus service install     # run the bus now and at every login: launchd, or systemd --user
 tailbus setup claude        # add the Claude Code plugin
-tailbus setup acr           # ACR on this machine: headless Claude Code as its agent
-tailbus acr add-repo ~/Work/my-repo   # let ACR review a repository here
 ```
 
-`tailbus setup acr` sets up everything ACR needs on this machine, and leaves
-alone whatever's there already but the confinement, which it keeps current,
-so running it again is safe:
-
-- **A token** for headless Claude Code on your subscription. If there's none,
-  it runs `claude setup-token` and asks you to paste what it prints, without
-  showing it, into `~/.config/tailbus/claude-token`, readable only by you.
-- **The `claude-acr` bridge** in `config.toml`, which runs Claude Code in the
-  repository under review with only the tools a role is given, a fresh
-  config for each call, and its usage read from its transcript.
-- **The reviewers' confinement** in `~/.config/tailbus/acr/confine.json`,
-  which the bridge passes to every call: Claude Code's file tools, and its
-  subagents', refuse paths outside the repository under review and the
-  call's own folders. Its commands aren't confined. Claude Code's sandbox
-  would do that, but together with this it stops a session that signs in
-  with a token before its first request.
-- **ACR's bindings** in `acr.yaml`, if you have none: Haiku for the Sizer,
-  Sonnet for reviewers, Opus for the Orchestrator and Judge, all on this
-  machine and counted in tokens.
-- **The bridge's service**, started now and at every login.
-
-`tailbus acr add-repo` and `remove-repo` change which repositories ACR may
-review here, and restart the bridge; `--bridge` names a bridge other than
-`claude-acr`, such as one set up by hand.
-
-**Setting up a repository's review.** A repository's review config says what's
-wrong in each lens, how to attack it, and how to work in the repository on
-this machine. [acrbus's docs/acr-repo-setup.md](https://github.com/Skeptic-Dog-Software/acrbus/blob/main/docs/acr-repo-setup.md) walks through
-writing one for a repository you don't know yet, and checking it against
-real work.
-
 **Updates wait.** `tailbus service install` and `tailbus bridge install`,
-which an update runs, first wait for bridge runs and ACR reviews under way to
-finish, up to half an hour, so an update never throws a call away. `--now`
-restarts at once. A review whose call is cut short by the daemon restarting
-anyway reconnects and picks up its reply. On Linux, services are systemd user
+which an update runs, first wait for bridge runs under way to finish, up to
+half an hour, so an update never throws a call away. `--now` restarts at
+once. A caller whose request is cut short by the daemon restarting anyway
+reconnects and picks up its reply. On Linux, services are systemd user
 units, which stop when you log out unless you `sudo loginctl enable-linger
 $USER`.
 
@@ -104,8 +71,8 @@ showing tailbus's dialogs. A `[clients]` table tags
 `[bridges.<agent>]` tables set up [headless agents](#headless-agents).
 
 **A local bus** needs no Tailscale. It reaches only agents on its own machine,
-and other machines can't reach it, which is all [ACR](#adversarial-review) and
-the [bridges](#headless-agents) it calls need:
+and other machines can't reach it, which is all its sessions and
+[bridges](#headless-agents) need:
 
 ```toml
 network = "local"
@@ -121,7 +88,7 @@ have no effect on it.
 
 An agent's address is `name@machine`, such as `api@laptop`. The name
 defaults to the repository the session runs in, plus the worktree name in a
-linked worktree. Set `ACRBUS_AGENT` (or `TAILBUS_AGENT`, also read), or pass
+linked worktree. Set `TAILBUS_AGENT` (or `ACRBUS_AGENT`, still read), or pass
 `--as`, to choose another.
 
 Only one live session can hold a name at a time. A second session with the
@@ -440,7 +407,6 @@ models = ["some/other-model"]
 | `model` | `options.models`, and `model` | Needs `{MODEL}` in `args`. |
 | `effort` | `options.efforts`, with `{EFFORT}` in `options.effort_args` | How hard it thinks, such as `high`. The arguments are added only when a request names one. |
 | `log` | Always | `false` keeps no log of the run once it's answered, for a caller that keeps its own record. |
-| `review` | Only from this machine | Marks a request as part of an ACR review, which a bridge refuses from another machine. ACR sets it. |
 
 Be careful what `tools` promises. A flag such as omp's `--tools` doesn't limit
 MCP tools, so naming connectors in `options.tools` means the agent has to
@@ -559,276 +525,6 @@ The bridge adds no tools or permissions of its own: the agent has what `args`
 gives it. Only messages from `owner` reach it, but they run with nobody
 watching, so `args` should give it no more than those messages should have.
 
-## Adversarial review
-
-`tailbus acr` runs an adversarial convergence review of a change, in any
-repository. It holds no knowledge of one: every lens, path and language comes
-from `.acr/config.yaml`. Reviewers attack one lens each from a clean context,
-a Judge rates what they find, the Orchestrator fixes the blockers, and only
-the lenses with blockers are attacked again, by new reviewers. A lens is
-confirmed when its latest round has no blockers. Every role gets what's said
-about the change, its description and commit messages, its builder's
-statement and what earlier commits and docs say, as claims to check, not to
-take on trust. A lens's `blocker` gives its dimension's definition of a
-blocker, set when the repository is calibrated, and every repository also
-gets a built-in `elegance` lens. The method is in
-[the ACR skill](https://github.com/Skeptic-Dog-Software/acrbus/blob/main/plugin/skills/acr/SKILL.md). All four roles go through
-[bridges](#headless-agents).
-
-| Role | Job | Sized for |
-| --- | --- | --- |
-| Sizer | Classifies the change and picks the tier | A small, fast model: one quick call |
-| Orchestrator | Settles plain-language triggers, and fixes blockers | A strong model: few calls, and it writes |
-| Reviewer | Attacks one lens, in a fresh session. With read-only tools it reads the checkout; with a shell or a writing tool it gets a copy of its own, to run tests, probes and mutations in | A mid-size model thinking hard: most of the calls |
-| Judge | Checks findings against the code, rates them, and merges a lens's reviewers into one result. It repairs nothing, but may write and run a script, in its own scratch space, to test a claim | A strong model: it decides what blocks |
-
-tailbus names no model or provider. Each role's binding comes from
-`defaults.bindings` in your config, `bindings` in the repository's, a lens's
-`binding`, or `--binding role=name`, and a role without one is an error.
-
-Code runs the loop, so a run is repeatable, and can stop for a person and go
-on. Models are called only for judgment.
-
-| Command | Does |
-| --- | --- |
-| `tailbus acr validate [file]` | Check a config against the schema and its rules. `--base <ref>` reads the repository's. |
-| `tailbus acr schema` | Print the published schema. |
-| `tailbus acr plan --base <ref>` | Show the tier, lenses, bindings and estimated cost, with no model calls. |
-| `tailbus acr run --base <ref>` | Review a change. `--head <ref>` names it, or it's the working tree. Prints the report as JSON. The repository must be calibrated first (`--uncalibrated` reviews it anyway). |
-| `tailbus acr resume <run id>` | Go on past a gate: `--fold` and `--waive` take blockers' IDs, and `--approve` and `--stop` do what they say. |
-| `tailbus acr benchmark --base <ref> --known <file>` | Run a binding set against a commit with known blockers, and report what was caught, missed and falsely found, and the cost. |
-| `tailbus acr check <key>` | Check that a trial on an answer key can run: each session starts, reads the trial's copy, is refused a file outside it, and writes where it should. |
-| `tailbus acr calibrate <key>...` | Give the pipeline's Judge each key's own findings, one dimension at a time, and count the blockers it agrees on, misses and overrates, and the findings it drops. Runs no reviewer. Each run is recorded for the key's repository. |
-| `tailbus acr carry --name <name> [--base <path>] --head <path>` | Carry work that isn't code, such as a design or a document, into a git repository ACR can review: the version before the work, if there is one, and the version to review, each a file or folder of text. |
-| `tailbus acr calibration [--repo <path>] [--accept]` | Where a repository's calibration stands. `--accept` accepts it, once it has two runs on the current config and Judge and you've read where they disagree. |
-| `tailbus acr residual <key> --patch <file> \| --commit <rev> [--also <results>]` | Whether the key's findings, and the blockers a saved run upheld, are still present in a final version: the key's head with a patch, or another commit, such as what was merged. Check both sides against the same list. |
-| `tailbus acr trial <key> --arm <design>` | Review the key's change blind, in a copy holding only its head's history, and score the result against the key. `--stop-on-failure` ends the run at the first reviewer, Judge or stage that doesn't finish its work, keeping what its sessions left. |
-
-**What the change is for.** Every role gets, ahead of the diff, what the
-change says about itself: its description, from `--description <file>` or a
-pull request's title and description with `--pr <number>` (or `--post-pr`'s)
-through `gh`, and its commit messages, oldest first. With the comments the
-change adds, these are its claims. Reviewers check them against the code and
-tests, and the Judge rates a defect by what it costs given that purpose. A
-repository with good commit messages and pull request descriptions needs
-nothing else set up for it.
-
-**To convergence.** `tailbus acr trial <key> --arm converge` runs the
-pipeline as the essay ACR comes from prescribes, with nobody in the loop.
-Fresh reviewers attack. The Orchestrator then steelmans the change: it folds
-in the blockers the Judge upheld, and any it declines is recorded, with its
-reason, as a disagreement. What the Judge upheld without blocking is
-reported, not folded in, so the change doesn't grow past what it's for.
-Then the lenses whose triggers match what the fixes changed attack the new
-version, with the fixes' own diff as their focus, and this repeats until a
-round has no blocker. Before the review ends, every lens that hasn't
-attacked the change as it is now does, in one full sweep: it ends only
-when every lens agrees on the same version. Each round's version is checked again for the
-lenses it needs, without what was ruled out before: one a fix's code now
-triggers joins, and records when and why, and one that has run stays on. The Orchestrator here is
-the `steelman` binding, which needs `writes: true`. A review stops at 20
-rounds, a cap none should reach. The result gives the rounds, the tokens each
-took, and a patch of what the steelmans left, kept for 30 days in
-`acr-bench/converged/` so it can be audited. To audit one, give a copy of
-its key a `patch:` with that file: the trial's copy then has the patch
-committed on top of the head, and any design reviews the change as the
-convergence left it. `every_dimension: true` has a builder review every
-dimension the key names, where it would otherwise skip one the change can't
-affect.
-
-**Stages.** A repository's review config can turn on `stages`, which
-make what a careful reviewer does by habit part of every round:
-
-- `gate`: first, before any reviewer. Are the change's tests enough?
-  Changed lines no test runs, from a coverage report (`tests.coverage`,
-  `tests.report`), and mutants of the changed code every test passes. The
-  gaps are the `tests` lens's findings, and every reviewer is told them.
-  The reviewers run anyway: `tests.gate: stop` makes a gap that blocks end
-  the round there instead, sparing their tokens but putting off what they'd
-  find for a round. The gate runs the mutants itself.
-- `brief`: before the reviewers, the Orchestrator writes each lens a brief
-  for this change: where to attack, and how.
-- `test-writing`: between rounds of a review to convergence, after the
-  steelman's fixes, a fresh writer that didn't make them pins each fixed
-  blocker with a test and closes the gate's gaps. Each test it writes is
-  run on the code from before the fixes, where it must fail, and after,
-  where it must pass; one that passes before pins nothing, and a person
-  hears so.
-
-- `context`: every role gets what the repository's history says about the
-  changed files, gathered from git: earlier commits to them, docs and tests
-  that mention them, and where the functions the change touches are used.
-- `claims`: a lens that lists every claim the change makes about itself
-  (the doc lines and comments it adds, its tests' names, its commit
-  messages and description) and checks each one.
-- `mutation`: a lens whose reviewer proposes small breaks in the changed
-  code. ACR applies each in a copy of its own and runs the tests; a break
-  they don't catch is a finding, with its proof. The tests run as
-  `tests.command`, or as the repository's files suggest: Flutter, Cargo,
-  Go, npm or pytest. `{tests}` in the command stands for the test files.
-- `probes`: a lens whose reviewer writes and runs scenarios of what the
-  change says it does, and of the edges around it. Its binding needs a
-  shell.
-
-A Judge rates what the stages find, as any lens's findings. `tests.parallel`,
-`tests.timeout` and `tests.mutants` set how many mutants run at once, how
-long one run of the tests may take, and how many a reviewer proposes.
-
-`run` and `resume` exit 0 when every lens is confirmed or waived, 3 when they're
-waiting for a person, 4 on an escalation, and 1 if the review ended with
-lenses open. `--post-pr <number>` puts the labels and comment on a pull
-request, if the repository turned them on.
-
-**Config.** It loads in this order, each overriding the last: the framework's
-defaults, yours at `~/.config/tailbus/acr.yaml`, the repository's, and the
-run's flags (`--human-gate`, `--max-rounds`, `--review-scope`, and `--binding
-role=name`). An unknown key is an error.
-
-The repository's config needn't be in the repository. Keep it at
-`~/.config/tailbus/acr/<repository>.yaml`, or name it with `--config`, and its
-`not_findings` path is beside it. Then nothing about the review goes into the
-repository, and no change to it can touch the rules it's reviewed by. Without
-one, it's the repository's own `.acr/config.yaml`. [`schema/acr.schema.json`](https://github.com/Skeptic-Dog-Software/acrbus/blob/main/schema/acr.schema.json)
-is the published schema, and [`examples/acr/`](https://github.com/Skeptic-Dog-Software/acrbus/blob/main/examples/acr/) has configs for a
-Go and a Rust repository, and a user's. A tier's `match.paths` applies when every
-changed file matches. Tiers go from lowest to highest, and when the Sizer isn't
-sure, it's the higher one. `bottom-of-stack` reviews the first commit after the
-base.
-
-**Safety.**
-
-- A config kept outside the repository can't be changed by a change to it. One
-  in the repository, and its `not_findings`, come from `--base`, never the
-  change, and a change to either always escalates. Either way, a change can't
-  switch off its own review.
-- Only your config says how models are reached, in `allowed_bindings`. A
-  repository can only choose among those names, and has no key for secrets,
-  tools or commands. Its `costs` change only estimates.
-- A reviewer or Judge that fails leaves its lens open and escalates. A review
-  that didn't happen never reads as a clean one.
-
-**Time limits.** A review should never time out, so give each binding's
-`timeout`, and its bridge's `timeout_secs` and `max_timeout_secs`, a cap no
-review will reach: 4 hours, as `tailbus setup acr` does. A run still ends as
-soon as it's done. A review waits up to a day for each reply, counting any
-time queued behind the bridge's other runs, so a queue never cuts one short:
-only the bridge's cap on the run itself stops one.
-
-**Severity** is the same everywhere, so that results compare. A lens's
-`severity` can change what Medium and Low do, but not Critical, High or
-Rejected.
-
-| Severity | Meaning | Does |
-| --- | --- | --- |
-| Critical | Wrong result, data loss, security hole | Blocks |
-| High | Real defect in a realistic case | Blocks |
-| Medium | Real defect in a narrow case | Never blocks, and is logged |
-| Low | Nit or unlikely edge case | Never blocks, and is logged |
-| Rejected | Not a real defect, or a decided non-issue | Dropped, keeping the reason |
-
-The Judge also states facts about each finding: whether it was there before
-the change, whether the change claims to fix it or makes it worse, whether
-it's a test the change adds that can't fail when what it pins breaks, and
-whether it's a claim that would mislead someone into a defect. Fixed rules
-decide from them: a weak pin, a misleading claim, or an old defect the
-change claims to fix or makes worse is High at least; an old defect
-otherwise is logged, and a Critical one goes to a person. A finding the
-Judge places in a line the change adds isn't old, whatever the Judge says.
-The rules only raise or route: anything they don't cover keeps the Judge's
-severity.
-
-**The human gate.** `per-round` asks what's folded in each round, `ends` asks
-about the scope and the final result, and `exception` asks only about
-escalations. These always stop for a person, in any mode: reviewers split, a
-rejection that's a values call, a blocker at `max_rounds`, anything in
-`always_escalate`, a change to the config, or a review that didn't fully run.
-
-**Costs** are tokens first: every estimate and report counts them, whoever
-pays. Dollars come only where a call is billed in them. A binding that sets
-`subscription: true` in your config counts in tokens alone, whatever a price
-or its agent says, so a subscription plan needs no prices at all. What
-estimates are made from is the repository config's `costs`, which the
-repository's agent keeps. A call through a bridge that reports [what a run
-used](#what-a-run-used) is counted as the agent counted it. Any other call
-is estimated: the text ACR sends it and reads back, plus `costs.per_call`
-for its role. That covers what the text misses: the files its tools read,
-its turns, and its thinking. `costs.prices` gives US dollars per million
-tokens, by model, or by binding name for a binding that names no model, with
-`cached_input_per_mtok` and `cache_write_per_mtok` if cached input costs
-differently. Left out, cached input costs what other input does, which is the
-most it could. A binding in your config that sets both `input_per_mtok` and
-`output_per_mtok` keeps its own. With no price anywhere, a counted call uses
-the agent's.
-
-```yaml
-costs:
-  prices:
-    example/small-model: {input_per_mtok: 0.1, output_per_mtok: 0.5}
-    example/large-model: {input_per_mtok: 5, output_per_mtok: 25}
-  per_call:
-    reviewer: {input_tokens: 8000, cache_read_tokens: 40000, output_tokens: 6000}
-    judge: {input_tokens: 8000, output_tokens: 3000}
-```
-
-`tailbus acr plan` gives three figures, each in tokens, with dollars beside
-them when any call is billed in dollars. The least has every lens done in one
-round. The expected has each lens taking as many rounds as it did, on average,
-in the last 20 finished reviews of the repository on this machine, or every
-lens's average for a new one. The most has every lens go through every round,
-with a fix between. The plan names any binding billed in dollars that has no
-price, and says when nothing counts the tokens an agent reads and thinks. A
-run's report has `tokens`, how many calls were counted, estimated and on a
-subscription, and for the calls billed in dollars, `usd` by the config's
-prices and `agent_usd`, what the agents said. A price for a
-model none of your bindings use is an error, so a misspelt one is caught.
-
-**Generated files** are left out of the diff reviewers get, by default.
-Each is listed at the diff's top with its lines added and removed, so a hand
-edit hidden in one still shows, and reviewers can read it in the repository.
-A file is generated by its path, never its contents: code generators' naming
-conventions, such as Dart's `*.g.dart` or a build's `target/`, protobuf
-output, `generated/` folders, minified files and lockfiles; the paths a
-repository's `generated.paths` adds; or `linguist-generated` in the base's
-`.gitattributes`. The change itself can't mark anything generated, so it
-can't have its own code left out of its review. `keep` takes a path back, and
-`exclude: false` turns it off. A lens with `include_generated: true` gets the
-whole diff. `tailbus acr plan` lists what it left out.
-
-```yaml
-generated:
-  paths: ["lib/gen/**"]   # also generated
-  keep: ["Cargo.lock"]    # never left out
-lenses:
-  - id: migrations
-    include_generated: true
-    ...
-```
-
-**A review is its own agent.** `tailbus acr` sends as `acr`, whatever session
-starts it, so its calls and their replies never land in a session's inbox,
-where the session might act on them.
-
-**One machine.** tailbus carries messages between machines, but ACR runs on
-one: every binding it uses must reach an agent on the machine with the code,
-or it refuses to start, and a bridge refuses a review from another machine.
-Other machines can still ask a bridge anything else. Every call runs in the repository, so reviewers read
-the code itself. A reviewer whose binding names `Bash`, `Write` or `Edit` is
-the exception: it works in its own copy of the checkout, made for its round
-and removed after it, under `acr-copies/` in tailbus's state folder. A copy
-has its own git repository, reading the checkout's history through git's
-alternates, so nothing done in it reaches the checkout. The
-bridge must list the repository in `options.workdirs`, and ACR adds the
-copies' folder there the first time a reviewer needs one. Reviewers read the
-checkout, so a review of a commit (`--head`) needs that commit checked out
-with nothing changed on top; without `--head`, it's the working tree. Only a
-binding with `writes: true` may apply an Orchestrator's fixes, and after a
-fix the review goes on from the working tree. A Judge gets the diff its
-lens's reviewers got, and may write and run scripts under `$TMPDIR`, the
-run's own scratch space, which goes when the call ends: give its binding
-the tools for that. Nothing but an Orchestrator may change the checkout, and
-ACR checks: if it changes during a round, the round fails and escalates. A run is saved at each gate,
-not during a round, so a crash mid-round means starting over.
-
 ## How it works
 
 - **Storage.** Each bus keeps its agents' queues and its outbox in SQLite,
@@ -841,11 +537,7 @@ not during a round, so a crash mid-round means starting over.
   the freed space back to the system, and empties SQLite's WAL file. The
   daemon's and each bridge's logs are cut back to about their last 256 KiB
   once they pass 1 MiB, and a bridge's run logs go after
-  `log_retention_days`. A finished ACR review leaves nothing on disk but a
-  line of history, the last 20 per repository: its files, the attachments
-  it sent and got back, and its calls' bridge logs all go as it finishes.
-  One waiting for a person keeps its files to go on from, and goes after 30
-  days.
+  `log_retention_days`.
 - **Between machines.** Buses talk HTTP with JSON bodies on each machine's
   tailnet address, port 4747, which WireGuard encrypts. Each request is
   checked with `tailscale whois`. A message waits in the sender's outbox
@@ -896,10 +588,14 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-This repository is the tailbus program: `src/main.rs` names it and adds
-Tailscale (`src/tailscale.rs`) as its network. Everything else, the bus,
-bridges, `/pipe`, ACR and their tests, is
-[acrbus](https://github.com/Skeptic-Dog-Software/acrbus), pinned by tag in
-`Cargo.toml`. Change it there, tag a release, and move the pin here. To try
-a local acrbus first, point the dependency at it with
-`cargo build --config 'patch."https://github.com/Skeptic-Dog-Software/acrbus".acrbus.path="../acrbus"'`.
+`src/main.rs` names the program and adds Tailscale (`src/tailscale.rs`) as
+its network; everything else, the bus, bridges, doors, `/pipe` and their
+tests, is the library under `src/`. [docs/bus.md](docs/bus.md) and
+[docs/bridges.md](docs/bridges.md) go deeper on the bus and on bridges.
+The Claude Code plugin's command and skills are in `plugin/`, and
+`tailbus setup claude` installs them.
+
+Until 2026-11, the bus lived in
+[acrbus](https://github.com/Skeptic-Dog-Software/acrbus), which tailbus
+pinned by tag, with ACR, the adversarial review pipeline, beside it.
+tailbus took the bus in and left ACR out; acrbus is archived.

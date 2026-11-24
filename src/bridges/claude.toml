@@ -1,0 +1,50 @@
+# tailbus's defaults for a Claude Code bridge, `kind = "claude"`: headless
+# Claude Code, a fresh session for each request. A bridge's own table in
+# config.toml holds what's this machine's: owner, command, home, path,
+# working_directory and secrets. Anything it sets wins over these, and its
+# extra_args go after args.
+args = ["-p", "--model", "{MODEL}", "--strict-mcp-config", "--output-format", "text",
+  "--add-dir", "{ATTACHMENTS_DIR}", "--add-dir", "{RUN_DIR}/tmp"]
+model = "claude-sonnet-5-5"
+# 4 hours: a cap no run should reach. A run ends when it's done.
+timeout_secs = 14400
+max_concurrent = 3
+
+[env]
+# A fresh config for each run: none of your settings, plugins or MCP
+# servers, and its transcript where usage is read.
+CLAUDE_CONFIG_DIR = "{SESSION_DIR}"
+# A session's background work, such as a test run, lives until it's done:
+# otherwise it's stopped some minutes after the session's turn ends, and what
+# it found is lost. The bridge's timeout still ends every run.
+CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0"
+# Nothing a run starts downloads a toolchain or updates Homebrew on its own.
+RUSTUP_AUTO_INSTALL = "0"
+HOMEBREW_NO_AUTO_UPDATE = "1"
+
+[options]
+max_timeout_secs = 14400
+tools = ["Read", "Grep", "Glob", "Bash", "Write", "Edit"]
+tools_args = ["--tools", "{TOOLS}", "--allowedTools", "{TOOLS}"]
+no_tools_args = ["--tools", ""]
+models = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
+efforts = ["low", "medium", "high", "xhigh", "max"]
+effort_args = ["--effort", "{EFFORT}"]
+workdirs = []
+
+[usage]
+files = "**/*.jsonl"
+when = { type = "assistant" }
+dedupe = "message.id"
+input = "message.usage.input_tokens"
+output = "message.usage.output_tokens"
+cache_read = "message.usage.cache_read_input_tokens"
+cache_write = "message.usage.cache_creation_input_tokens"
+model = "message.model"
+
+[usage.opened]
+items = "message.content"
+when = { type = "tool_use" }
+name = "name"
+names = ["Read"]
+path = "input.file_path"

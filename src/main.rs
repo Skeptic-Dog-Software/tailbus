@@ -1,25 +1,25 @@
 //! tailbus: direct messages between AI agents on a tailnet, queued until
-//! they're read. It's acrbus, with Tailscale as its network.
+//! they're read, with Tailscale as its network.
 
 mod tailscale;
 
 use std::process::ExitCode;
 
-use acrbus::config::App;
+use tailbus::config::App;
 
-/// tailbus: acrbus on a tailnet.
+/// tailbus: the bus on a tailnet.
 pub const TAILBUS: App = App {
     name: "tailbus",
     label: "com.skepticdogsoftware.tailbus",
     about: "Direct messages between AI agents on a tailnet",
     network: "tailscale",
     networks: &[tailscale::KIND],
-    // ACRBUS_* first, the names it writes; TAILBUS_*, which sessions
-    // started before acrbus set, still read.
-    env: &["ACRBUS", "TAILBUS"],
+    // TAILBUS_* first, the names it writes; ACRBUS_*, which sessions
+    // started while tailbus was built on acrbus have, still read.
+    env: &["TAILBUS", "ACRBUS"],
 };
 
 fn main() -> ExitCode {
-    acrbus::config::set_app(&TAILBUS);
-    acrbus::cli::main()
+    tailbus::config::set_app(&TAILBUS);
+    tailbus::cli::main()
 }
