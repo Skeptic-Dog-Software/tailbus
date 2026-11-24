@@ -547,6 +547,29 @@ mod tests {
     }
 
     #[test]
+    fn a_codesmith_run_counts_its_steps_not_its_tool_calls() {
+        let d = dir();
+        append(
+            &d.join("usage.jsonl"),
+            &[
+                r#"{"type":"step","session":"s","model":"p/m","reason":"tool-calls","input":1200,"output":40,"cache_read":800,"cache_write":100,"reasoning":12,"usd":0.002,"time":1}"#.to_string(),
+                r#"{"type":"tool","session":"s","name":"read","path":"src/a.rs"}"#.to_string(),
+                r#"{"type":"step","session":"s","model":"p/m","reason":"stop","input":300,"output":60,"cache_read":2000,"cache_write":0,"reasoning":0,"time":2}"#.to_string(),
+            ],
+        );
+        let u = kind_usage(include_str!("bridges/codesmith.toml"))
+            .read(&d, &Before::new())
+            .unwrap();
+        assert_eq!(u.calls, 2, "a tool line isn't a model call");
+        assert_eq!(u.input_tokens, 1500);
+        assert_eq!(u.output_tokens, 100);
+        assert_eq!(u.cache_read_tokens, 2800);
+        assert_eq!(u.reasoning_tokens, Some(12));
+        assert_eq!(u.models, ["p/m"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn the_files_a_pi_call_read_are_named_once_in_the_order_first_read() {
         let d = dir();
         let read = |path: &str| {

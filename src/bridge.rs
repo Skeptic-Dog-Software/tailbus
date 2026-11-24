@@ -339,6 +339,8 @@ pub enum Kind {
     Omp,
     /// pi, the coding agent omp is built on.
     Pi,
+    /// CodeSmith's headless `codesmith run`.
+    Codesmith,
 }
 
 impl Kind {
@@ -347,6 +349,7 @@ impl Kind {
             Kind::Claude => "claude",
             Kind::Omp => "omp",
             Kind::Pi => "pi",
+            Kind::Codesmith => "codesmith",
         }
     }
 
@@ -356,6 +359,7 @@ impl Kind {
             Kind::Claude => include_str!("bridges/claude.toml"),
             Kind::Omp => include_str!("bridges/omp.toml"),
             Kind::Pi => include_str!("bridges/pi.toml"),
+            Kind::Codesmith => include_str!("bridges/codesmith.toml"),
         }
     }
 
@@ -378,7 +382,7 @@ pub(crate) fn with_defaults(table: toml::Value) -> Result<toml::Value> {
         return Ok(table);
     };
     let kind: Kind = kind.clone().try_into().context(
-        "kind must be one of \"claude\", \"omp\" and \"pi\", or left out for any other agent",
+        "kind must be one of \"claude\", \"codesmith\", \"omp\" and \"pi\", or left out for any other agent",
     )?;
     let mut merged: toml::Value =
         toml::from_str(kind.defaults()).context("reading the built-in bridge defaults")?;
@@ -5317,13 +5321,49 @@ mod tests {
         assert_eq!(merged["env"]["EXTRA"].as_str(), Some("yes"));
         assert!(merged.get("usage").is_some());
         // Every kind's defaults are a bridge's table.
-        for kind in [Kind::Claude, Kind::Omp, Kind::Pi] {
+        for kind in [Kind::Claude, Kind::Omp, Kind::Pi, Kind::Codesmith] {
             let defaults: toml::Value = toml::from_str(kind.defaults()).unwrap();
             assert!(defaults.get("owner").is_none(), "{kind:?}: the machine's");
         }
         let unknown: toml::Value = toml::from_str("kind = \"codex\"").unwrap();
         let e = format!("{:#}", with_defaults(unknown).unwrap_err());
-        assert!(e.contains("\"claude\", \"omp\" and \"pi\""), "{e}");
+        assert!(
+            e.contains("\"claude\", \"codesmith\", \"omp\" and \"pi\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_codesmith_bridge_keeps_each_session_in_its_own_database() {
+        let table: toml::Value = toml::from_str(
+            r#"
+            kind = "codesmith"
+            owner = "o"
+            command = "/bin/sh"
+            working_directory = "/tmp"
+            home = "/tmp"
+            path = "/usr/bin:/bin"
+            model = "provider/model-a"
+            session = "per-sender"
+            continue_args = ["--continue"]
+            [options]
+            models = ["provider/model-a"]
+            "#,
+        )
+        .unwrap();
+        let settings: Settings = with_defaults(table).unwrap().try_into().unwrap();
+        settings.check().unwrap();
+        assert_eq!(settings.args[0], "run");
+        assert_eq!(
+            settings.env["CODESMITH_DB"], "{SESSION_DIR}/codesmith.db",
+            "per run, or per sender"
+        );
+        assert_eq!(settings.options.tools_args, ["--tools", "{TOOLS}"]);
+        assert_eq!(settings.options.effort_args, ["--effort", "{EFFORT}"]);
+        assert!(settings.usage.is_some());
+        // Only a table that names the kind gets these: `codesmith bus relay`
+        // is the same program run another way.
+        assert_eq!(Kind::of(Path::new("/usr/local/bin/codesmith")), None);
     }
 
     #[test]

@@ -16,7 +16,7 @@ path = "/usr/local/bin:/usr/bin:/bin"
 
 | Setting | Means |
 | --- | --- |
-| `kind` | `"claude"`, `"omp"` or `"pi"`: an agent tailbus ships defaults for, in `src/bridges/`: its args, options, environment and usage come from there, and the table says only what's this machine's. |
+| `kind` | `"claude"`, `"codesmith"`, `"omp"` or `"pi"`: an agent tailbus ships defaults for, in `src/bridges/`: its args, options, environment and usage come from there, and the table says only what's this machine's. |
 | `owner` | Who a message must come from: the bus's `owner`. Required. |
 | `command`, `args` | What to run. `args` can use the placeholders below. |
 | `extra_args` | More arguments, after `args`: what this machine adds to its kind's defaults, such as a provider's extension. |
@@ -66,6 +66,19 @@ tailbus is tested with particular versions of the agent CLIs it drives:
 Claude Code 2.1.325, pi 1.5.2, and node 22.22.1 and 24.22.0. `setup refresh`
 and the daemon, as it starts, ask each bridge's agent for its version. One
 older than tested is something to fix; one newer is only noted.
+
+A `codesmith` bridge must say `kind = "codesmith"`: refresh doesn't move a
+table to it by its command, since `codesmith bus relay` is the same program
+run another way. Each run gets its own session database
+(`CODESMITH_DB`, in the session directory); for a per-sender session, set
+`continue_args = ["--continue"]`. Its usage comes from `--usage-log`, one
+line per model step; the files a run read aren't named yet, because CodeSmith
+writes each tool call on a line of its own.
+
+A bridge can also hand a message to a live CodeSmith session, with no kind:
+`command` is `codesmith` and `args` are `["bus", "relay", "--to", "NAME",
+"--from", "{SENDER}", "--id", "{ID}"]`. A repeat of the same `{ID}` gets the
+first answer. CodeSmith's own docs/tailbus.md describes it.
 
 ## Tools and MCP
 
