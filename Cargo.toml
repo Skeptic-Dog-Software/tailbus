@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Direct messages between AI agents on a tailnet, queued until they're read"
-repository = "https://github.com/Skeptic-Dog-Software/tailbus"
+repository = "https://github.com/reka18/tailbus"
 license = "MIT OR Apache-2.0"
 publish = false
 
