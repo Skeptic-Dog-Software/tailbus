@@ -223,7 +223,7 @@ pub(crate) fn write_plugin(exe: &Path) -> Result<PathBuf> {
             "name": name,
             "version": env!("CARGO_PKG_VERSION"),
             "description": description,
-            "repository": format!("https://github.com/Skeptic-Dog-Software/{name}")
+            "repository": env!("CARGO_PKG_REPOSITORY")
         })),
     )?;
     write(

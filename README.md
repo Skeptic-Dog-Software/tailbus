@@ -28,7 +28,7 @@ the `acr`, `review` and `review-score` skills, which a session runs itself.
 On every machine that should be on the bus:
 
 ```sh
-cargo install --locked --git https://github.com/Skeptic-Dog-Software/tailbus --root ~/.local
+cargo install --locked --git https://github.com/reka18/tailbus --root ~/.local
 tailbus setup all          # both of the below at once
 ```
 
