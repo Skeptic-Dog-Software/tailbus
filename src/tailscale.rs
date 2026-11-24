@@ -10,8 +10,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use acrbus::config::Config;
-use acrbus::network::{Kind, Network, Peer, Status, Whois};
+use tailbus::config::Config;
+use tailbus::network::{Kind, Network, Peer, Status, Whois};
 
 /// tailbus's network: the bus on a tailnet, its default.
 pub const KIND: Kind = Kind {
@@ -213,7 +213,7 @@ mod tests {
     fn tailscale_is_tailbus_default_and_takes_no_local_identity() {
         let open = |text: &str| {
             let cfg: Config = toml::from_str(text).unwrap();
-            acrbus::network::open_for(&crate::TAILBUS, &cfg)
+            tailbus::network::open_for(&crate::TAILBUS, &cfg)
         };
         assert!(open("").unwrap().remote());
         let e = open("owner = \"me@example.com\"").err().unwrap();
@@ -226,10 +226,10 @@ mod tests {
             format!("{e:#}").contains("tailbus knows: it knows local, tailscale"),
             "{e:#}"
         );
-        // Its one setting, the CLI's path, is tailbus's to read, not acrbus's.
+        // Its one setting, the CLI's path, is tailbus's to read, not the local bus's.
         let cfg: Config = toml::from_str("tailscale = \"/opt/ts/tailscale\"").unwrap();
         cfg.check_settings(&crate::TAILBUS).unwrap();
-        assert!(cfg.check_settings(&acrbus::config::ACRBUS).is_err());
+        assert!(cfg.check_settings(&tailbus::config::LOCAL).is_err());
         assert!(open("tailscale = \"/opt/ts/tailscale\"").unwrap().remote());
         let e = open("tailscale = 3").err().unwrap();
         assert!(
@@ -341,20 +341,21 @@ mod tests {
     }
 
     #[test]
-    fn acrbus_names_are_read_before_tailbus_ones() {
-        acrbus::config::set_app(&crate::TAILBUS);
+    fn tailbus_names_are_read_before_acrbus_ones() {
+        tailbus::config::set_app(&crate::TAILBUS);
         let name = "PREFIX_ORDER_TEST";
         // SAFETY: no other test reads or writes these two variables.
         unsafe {
-            std::env::set_var(format!("ACRBUS_{name}"), "new");
-            std::env::set_var(format!("TAILBUS_{name}"), "old");
+            std::env::set_var(format!("TAILBUS_{name}"), "new");
+            std::env::set_var(format!("ACRBUS_{name}"), "old");
         }
-        assert_eq!(acrbus::config::env_var(name).as_deref(), Some("new"));
-        // A session started before the split still has only its own.
-        unsafe { std::env::remove_var(format!("ACRBUS_{name}")) };
-        assert_eq!(acrbus::config::env_var(name).as_deref(), Some("old"));
+        assert_eq!(tailbus::config::env_var(name).as_deref(), Some("new"));
+        // A session started while tailbus was built on acrbus still has
+        // only tailbus's names.
         unsafe { std::env::remove_var(format!("TAILBUS_{name}")) };
-        assert_eq!(acrbus::config::env_var(name), None);
+        assert_eq!(tailbus::config::env_var(name).as_deref(), Some("old"));
+        unsafe { std::env::remove_var(format!("ACRBUS_{name}")) };
+        assert_eq!(tailbus::config::env_var(name), None);
     }
 
     #[test]

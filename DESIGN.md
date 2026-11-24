@@ -486,8 +486,8 @@ it's used. A route that isn't there can't be.
 
 #### What a run used
 
-Added 2026-11-07, so costs needn't be guessed. The text ACR sends a reviewer
-is a small part of what it uses. A trivial prompt through omp took 2,721
+Added 2026-11-07, so costs needn't be guessed. The text a request sends an
+agent is a small part of what it uses. A trivial prompt through omp took 2,721
 input tokens, all system prompt and tool definitions, where the text came to
 about 8.
 
@@ -508,65 +508,7 @@ about 8.
   session, and reads at most 1,000 files.
 - **Tokens first, dollars where they're spent.** On a subscription, dollars
   mean nothing and tokens still do, so every figure is tokens, and dollars
-  come only for calls billed in them. `subscription: true` on a binding
-  keeps a price or an agent's own figure from turning its tokens into
-  dollars.
-- **Set up by one command.** `tailbus setup acr` writes everything ACR
-  needs on a machine, and `tailbus acr add-repo` allows each repository: a
-  token, the bridge, the bindings and the service, each left alone if it's
-  there, so it can run again. Its config edits keep your comments, and are
-  checked before they're written. Services are launchd agents on macOS and
-  systemd user units on Linux.
-- **One machine.** ACR's reviewers read the code where it is, never a
-  copy, so every binding must reach an agent on the machine with the
-  repository, and every call runs in it. tailbus still carries messages
-  between machines; ACR doesn't use that, and both ends check: ACR won't
-  start with a binding elsewhere, and a bridge refuses a request marked as
-  a review from another machine. A reviewer reads the checkout, so
-  a commit under review must be checked out, clean, or the run refuses.
-  - *Rejected:* a snapshot of the commit sent to a reviewer elsewhere. It
-    copies the code off its machine.
-- **A review is its own agent, and updates wait for it.** It sends as
-  `acr`, never as the session that started it, whose hooks would hand it the
-  review's replies to act on. An install waits for bridge runs and reviews
-  under way, known by a process ID in each review's directory, and a call cut
-  short by a daemon restart reconnects and waits for its reply again, which
-  the daemon keeps.
-- **A review leaves nothing behind.** Its files go as it finishes, with the
-  attachments it sent and got back, and it asks bridges to keep no log of
-  its calls. What's left is a line of history, for estimates. Its report is
-  printed, and posted if asked; a review waiting at a gate keeps its files,
-  since it goes on from them.
-- **A Judge checks, and never repairs.** It reads the diff and the code,
-  and may write and run a script in its run's scratch space to test a
-  claim. Only an Orchestrator may change the checkout, and a fingerprint of
-  it before and after each round catches anything else that does: the
-  round fails and escalates. That catches it; the agent's own sandbox, if
-  it has one, is what would stop it.
-- **Generated files are left out, never hidden.** A regenerated file can
-  be most of a diff, and every reviewer would read it. So the diff a review
-  sends lists each one with its line counts instead, and reviewers can open
-  it in the repository. Generated is decided by path: generators' naming
-  conventions, which are the one place ACR knows any ecosystem, the
-  repository's `generated.paths`, and the base's `.gitattributes`. A lens
-  that has to see them, such as one on migrations, takes `include_generated`.
-  - *Rejected:* a marker such as "Code generated ... DO NOT EDIT" in a
-    file's first lines, and the change's own `.gitattributes`. Both are set
-    by the change, so it could have its own code left out of its review.
-  - *Fixed with it:* the plan priced every Judge call as reading the whole
-    diff, which it never got.
-- **No model of its own.** The framework names no binding, model or
-  provider, and a test fails if one appears in its code. Every role's
-  binding comes from the user's or the repository's config, or a flag.
-- **The config's price first.** ACR prices a counted call by the config, so
-  that the plan and the report agree, and keeps what the agent said beside
-  it. With no price in the config, it uses the agent's.
-- **Expected costs from history.** A plan's expected figure takes how many
-  rounds each lens took in the last 20 finished reviews of the repository,
-  or every lens's average for a new lens. A review still waiting would make
-  reviews look shorter, so it doesn't count. The most a review could cost
-  now counts the fixes between rounds, which it had left out.
-
+  come only for calls billed in them.
 Rejected: `--mode json` on stdout. The reply would then have to be dug out of
 an event stream, where the session already has everything.
 
@@ -585,14 +527,6 @@ cheaply.
   files open, so a rename would leave them writing to the old file. They
   append instead, set when they start, so a log cut back to its last lines
   under them stays whole.
-- **ACR keeps a line, not a review.** An expected cost needs each lens's
-  rounds, not the findings, so a finished review adds one line to
-  `history.jsonl`, under a lock, with the last 20 per repository kept.
-  Reading it costs one small file, where reading the reviews would cost all
-  of them. Benchmarks force one round, so they're left out. A finished
-  review's diffs go at once, and its report after 7 days. One waiting for a
-  person is taken as left after 30. Every `tailbus acr` command cleans up
-  first, going by file times, with nothing read.
 - **Undelivered isn't forever.** A message nobody answers or acknowledges
   in `retention_days` goes stale: out of every queue at once, kept
   `stale_days` (default 3) to be seen, then gone. Its sender gets a `stale`
@@ -1236,49 +1170,16 @@ A second run, on 2026-10-27 on Claude Code 2.1.311, the same way:
   process. After updating tailbus, restart sessions.
 
 
-### The ACR framework
+### The ACR framework, removed
 
-Added 2026-11-07: `tailbus acr`, the method below as a tool for any repository,
-with reviewers that needn't be Claude. The
-[README](README.md#adversarial-review) has the commands and config.
-
-- **Code runs the loop; models judge.** Rounds, fan-out and state are plain
-  code, so a run repeats, can be tested with no model, and can stop at a gate
-  and go on. The Orchestrator's binding is called only to settle plain-language
-  triggers and `always_escalate`, and to fix blockers.
-- **It has no repository's knowledge in it,** and a test holds it to that. A
-  second config, for a repository in another language, needed no change to the
-  framework.
-- **A change can't touch its own rules.** The repository's config is best kept
-  outside it, in the user's `acr/` directory, so no review files go into the
-  repositories reviewed. One kept in the repository comes from `--base`, read
-  with `git show`, never from the working tree.
-- **Only the user's config says how models are reached.** The repository's has
-  no key for it, so that's an unknown-key error, not a check that could be
-  missed.
-- **Failure is never a pass.** A reviewer that fails, an answer that can't be
-  read, or a Judge that fails leaves the lens open and escalates. If the
-  Orchestrator can't settle a description, the lens stays in.
-- **The Orchestrator fixes, through its bridge.** So ACR needs that bridge on
-  the machine with the checkout. Every other role only reads, and must name
-  its read-only tools, or the config is refused.
-- **The repository's agent sets what estimates are made from.** It knows how
-  much a reviewer reads and thinks there, and the user's config needn't
-  change for each repository. So `costs` is a repository key: prices by
-  model, and tokens each role's calls take beyond the text ACR measures.
-  A binding with its own prices in the user's config keeps them, since the
-  person paying knows their rates best. Prices change only estimates, never
-  what runs or what's allowed.
-  - *Why per call by role:* bridges don't report usage. The text ACR sends
-    is a small part of what a reviewer with `read` and `grep` takes in, and
-    high effort writes tokens nobody sees, so counting the text alone
-    undercounts by far.
-  - *Rejected:* a fixed multiplier in the framework. How much an agent reads
-    depends on the repository, which the framework knows nothing about.
-
-Decided here rather than left to a repository: a tier's paths must all match, so
-one source file among docs leaves the docs tier; description triggers count in a
-dry run, so its cost is an upper bound; and only a Medium can be waived.
+Added 2026-11-07 as `tailbus acr`, a pipeline that ran ACR's roles through
+bridges for any repository, from acrbus. Removed 2026-11-24 at the user's
+call, when tailbus took acrbus's bus in and left the pipeline out: its
+commands, `setup acr` and its bridge, the review-only bridge options
+(facts, cache keys, allowed tools and paths, relays, `accepts`), pi's
+review extension and the Grayboard link that carried a review's questions.
+The `acr`, `review` and `review-score` skills stay in the plugin, run by a
+session itself. A `[grayboard]` left in a config is ignored.
 
 ### ACR: adversarial convergence review
 

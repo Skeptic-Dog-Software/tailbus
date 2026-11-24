@@ -3,27 +3,6 @@
 version = 4
 
 [[package]]
-name = "acrbus"
-version = "0.1.38"
-source = "git+https://github.com/Skeptic-Dog-Software/acrbus?tag=v0.1.38#70386589fdaf803316d3173d57a4adef6adfc260"
-dependencies = [
- "anyhow",
- "clap",
- "globset",
- "libc",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "tiny_http",
- "toml",
- "toml_edit",
- "ureq",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -701,13 +680,22 @@ dependencies = [
 
 [[package]]
 name = "tailbus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "acrbus",
  "anyhow",
+ "clap",
+ "globset",
+ "libc",
+ "regex",
+ "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tiny_http",
  "toml",
+ "toml_edit",
+ "ureq",
 ]
 
 [[package]]
