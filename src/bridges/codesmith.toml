@@ -1,0 +1,41 @@
+# tailbus's defaults for a CodeSmith bridge, `kind = "codesmith"`: headless
+# `codesmith run`, a fresh session database for each request. A bridge's own
+# table in config.toml holds what's this machine's: owner, command, home,
+# path, working_directory, model, its provider's models, and extra_args.
+# Anything it sets wins over these. For a per-sender session, set
+# `continue_args = ["--continue"]`: it continues the latest session in that
+# sender's database.
+args = ["run", "-m", "{MODEL}", "--usage-log", "{SESSION_DIR}/usage.jsonl"]
+# 4 hours: a cap no run should reach. A run ends when it's done.
+timeout_secs = 14400
+max_concurrent = 3
+
+[env]
+CODESMITH_DB = "{SESSION_DIR}/codesmith.db"
+
+[options]
+max_timeout_secs = 14400
+tools = ["read", "grep", "glob", "shell", "edit", "write"]
+# `--tools` offers only these and denies every other tool, MCP and plugin
+# tools included.
+tools_args = ["--tools", "{TOOLS}"]
+no_tools_args = ["--no-tools", "--no-mcp"]
+no_mcp_args = ["--no-mcp"]
+# CodeSmith refuses a level the model lacks before any call.
+efforts = ["low", "medium", "high", "xhigh", "max"]
+effort_args = ["--effort", "{EFFORT}"]
+workdirs = []
+
+# One line per model step. CodeSmith writes each tool call on a line of its
+# own, and usage.opened reads only the calls inside a counted line, so the
+# files a run read aren't named yet.
+[usage]
+files = "**/usage.jsonl"
+when = { type = "step" }
+input = "input"
+output = "output"
+cache_read = "cache_read"
+cache_write = "cache_write"
+reasoning = "reasoning"
+usd = "usd"
+model = "model"
