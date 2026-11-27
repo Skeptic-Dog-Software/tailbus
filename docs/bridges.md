@@ -63,7 +63,7 @@ is due, and `setup refresh` names keys in a `kind` table that keep a newer
 default from it.
 
 tailbus is tested with particular versions of the agent CLIs it drives:
-Claude Code 2.1.325, pi 1.5.2, and node 22.22.1 and 24.22.0. `setup refresh`
+Claude Code 2.1.325, pi 1.5.2, node 22.22.1 and 24.22.0, and CodeSmith 0.8.0. `setup refresh`
 and the daemon, as it starts, ask each bridge's agent for its version. One
 older than tested is something to fix; one newer is only noted.
 
@@ -76,6 +76,14 @@ run another way. Each run gets its own session database
 `continue_args = ["--continue"]`. Its usage comes from `--usage-log`, one
 line per model step; the files a run read aren't named yet, because CodeSmith
 writes each tool call on a line of its own.
+
+A headless CodeSmith run (0.7.0 and later) refuses shell commands that reach
+outside its working directory, such as `git -C` into another repository or
+writing a file there by name. For work in a repository, list it in
+`options.workdirs` and have the request name it as `workdir`, so the run
+starts inside it. CodeSmith no longer reads settings from a repository
+itself: per-repository settings go in the bridge home's
+`~/.config/codesmith/projects/`, beside its global config.
 
 A bridge can also hand a message to a live CodeSmith session, with no kind:
 `command` is `codesmith` and `args` are `["bus", "relay", "--to", "NAME",
