@@ -1,8 +1,9 @@
 //! The versions of the outside tools bridges run that this binary was tested
 //! with, and how what's installed compares.
 //!
-//! A bridge drives an agent CLI it doesn't ship: Claude Code, or pi and the
-//! node it runs on. A release is tested with particular versions of each.
+//! A bridge drives an agent CLI it doesn't ship: Claude Code, pi and the
+//! node it runs on, or CodeSmith. A release is tested with particular
+//! versions of each.
 //! One older than tested may lack a flag or behave as an earlier release
 //! did, so it's something to fix; one newer is only said.
 
@@ -18,6 +19,8 @@ use crate::config::{APP_NAME, Config, Paths};
 pub const TESTED: &[(&str, &[&str])] = &[
     ("claude", &["2.1.325"]),
     ("pi", &["1.5.2"]),
+    // A codesmith bridge passes `--output final`, which CodeSmith 0.7.0 added.
+    ("codesmith", &["0.8.0"]),
     ("node", &["22.22.1", "24.22.0"]),
 ];
 
@@ -174,6 +177,7 @@ pub fn bridge_versions(paths: &Paths) -> Vec<(Level, String)> {
         let tools: &[&str] = match settings.agent_kind() {
             Some(Kind::Claude) => &["claude"],
             Some(Kind::Pi) => &["pi", "node"],
+            Some(Kind::Codesmith) => &["codesmith"],
             _ => continue,
         };
         for tool in tools {
@@ -192,6 +196,17 @@ pub fn bridge_versions(paths: &Paths) -> Vec<(Level, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_codesmith_is_something_to_fix() {
+        assert_eq!(version_in("codesmith 0.8.0").as_deref(), Some("0.8.0"));
+        assert_eq!(said("w", "codesmith", Some("0.8.0")).unwrap().0, Level::Ok);
+        assert_eq!(said("w", "codesmith", Some("0.6.1")).unwrap().0, Level::Fix);
+        assert_eq!(
+            said("w", "codesmith", Some("0.9.0")).unwrap().0,
+            Level::Note
+        );
+    }
 
     #[test]
     fn a_version_is_read_from_what_a_tool_prints() {
