@@ -5354,6 +5354,10 @@ mod tests {
         let settings: Settings = with_defaults(table).unwrap().try_into().unwrap();
         settings.check().unwrap();
         assert_eq!(settings.args[0], "run");
+        assert!(
+            settings.args.windows(2).any(|w| w == ["--output", "final"]),
+            "only the final answer comes back"
+        );
         assert_eq!(
             settings.env["CODESMITH_DB"], "{SESSION_DIR}/codesmith.db",
             "per run, or per sender"
