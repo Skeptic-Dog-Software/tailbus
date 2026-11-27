@@ -272,7 +272,7 @@ installs `~/.claude/skills/pipe`, so `/pipe` works as typed.
 ## Headless agents
 
 `tailbus bridge` answers an agent's messages by running a headless CLI
-agent, such as CodeSmith, once per message. What it prints is the reply. Describe
+agent, such as [CodeSmith](https://github.com/reka18/codesmith), once per message. What it prints is the reply. Describe
 the agent in `~/.config/tailbus/config.toml`, in a table named for its bus
 agent:
 
