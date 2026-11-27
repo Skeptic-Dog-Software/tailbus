@@ -19,7 +19,7 @@ itself, the CLI, the MCP tools, push into Claude Code, the limits that stop
 agents answering each other forever, permission alerts on your Macs,
 [`/pipe`](#pipe), which hands a whole task to an agent on another machine
 and gets back a reviewed result, [bridges](#headless-agents), which answer
-messages with a headless agent such as pi or omp, and doors, which let an
+messages with a headless agent such as CodeSmith, pi or omp, and doors, which let an
 agent in another OS account take part. The Claude Code plugin also carries
 the `acr`, `review` and `review-score` skills, which a session runs itself.
 
@@ -272,19 +272,27 @@ installs `~/.claude/skills/pipe`, so `/pipe` works as typed.
 ## Headless agents
 
 `tailbus bridge` answers an agent's messages by running a headless CLI
-agent, such as omp, once per message. What it prints is the reply. Describe
+agent, such as CodeSmith, once per message. What it prints is the reply. Describe
 the agent in `~/.config/tailbus/config.toml`, in a table named for its bus
 agent:
 
 ```toml
-[bridges.omp]
+[bridges.codesmith]
 owner = "you@example.com"
-command = "/Users/you/.local/bin/omp"
-args = ["-p", "--model", "some/model", "--session-dir", "{SESSION_DIR}", "--no-tools"]
+command = "/opt/homebrew/bin/codesmith"
+args = ["run", "--output", "final", "-m", "some/model", "--no-tools"]
 working_directory = "/Users/you/agent-home/workspace"
 home = "/Users/you/agent-home/home"
-path = "/Users/you/.local/bin:/usr/bin:/bin"
+path = "/opt/homebrew/bin:/usr/bin:/bin"
+env = { CODESMITH_DB = "{SESSION_DIR}/codesmith.db" }
 ```
+
+`--output final` makes the reply only the run's final answer (CodeSmith
+0.7.0 and later), and `CODESMITH_DB` gives each run its own session
+database. The model's provider and key go in CodeSmith's config in `home`.
+For CodeSmith, Claude Code, omp and pi, `kind = "codesmith"` (or `"claude"`,
+`"omp"`, `"pi"`) gives tailbus's defaults for that agent, so the table says
+only what's this machine's; see [docs/bridges.md](docs/bridges.md).
 
 | Setting | Means |
 | --- | --- |
@@ -384,14 +392,17 @@ options runs just as the table says, and the owner check comes before any
 option is read.
 
 ```toml
-[bridges.omp]
+[bridges.codesmith]
 model = "some/default-model"
-args = ["-p", "--model", "{MODEL}", "--session-dir", "{SESSION_DIR}"]
+args = ["run", "--output", "final", "-m", "{MODEL}", "--usage-log", "{SESSION_DIR}/usage.jsonl"]
+continue_args = ["--continue"]
+env = { CODESMITH_DB = "{SESSION_DIR}/codesmith.db" }
 
-[bridges.omp.options]
-tools = ["read", "grep", "mcp__jira_query"]
+[bridges.codesmith.options]
+tools = ["read", "grep", "glob"]
 tools_args = ["--tools", "{TOOLS}"]
-tools_env = "TAILBUS_ALLOWED_TOOLS"
+efforts = ["low", "medium", "high"]
+effort_args = ["--effort", "{EFFORT}"]
 sessions = ["per-sender"]
 max_timeout_secs = 1800
 workdirs = ["/Users/you/agent-home/review"]
@@ -408,10 +419,12 @@ models = ["some/other-model"]
 | `effort` | `options.efforts`, with `{EFFORT}` in `options.effort_args` | How hard it thinks, such as `high`. The arguments are added only when a request names one. |
 | `log` | Always | `false` keeps no log of the run once it's answered, for a caller that keeps its own record. |
 
-Be careful what `tools` promises. A flag such as omp's `--tools` doesn't limit
-MCP tools, so naming connectors in `options.tools` means the agent has to
-enforce the list too. For omp that's a few lines in an extension that reads
-`tools_env`. Only list what's really enforced.
+Be careful what `tools` promises. CodeSmith's `--tools` offers only the
+tools it names and denies every other one, MCP tools included. A flag such
+as omp's `--tools` doesn't limit MCP tools, so naming connectors in
+`options.tools` means the agent has to enforce the list too. For omp that's
+a few lines in an extension that reads `tools_env`. Only list what's really
+enforced.
 
 Every reply from a bridge carries its result beside the text: `status` (`ok`,
 `failed`, `timeout`, `refused` or `cancelled`), `exit_code`, `duration_ms`,
@@ -425,19 +438,19 @@ stdout and stderr, its options and its result are kept in
 An agent that writes a line of JSON to its session for each model call can
 say what a run really used. Tell its bridge where the numbers are, and every
 result gets a `usage`: the calls, input, output, cache reads and writes, and
-what the agent says it cost. For omp 18.17.0:
+what the agent says it cost. For CodeSmith's `--usage-log`:
 
 ```toml
-[bridges.omp.usage]
-files = "**/*.jsonl"            # under {SESSION_DIR}, which args must use
-when = { type = "message", "message.role" = "assistant" }
-input = "message.usage.input"   # input not read from a cache
-output = "message.usage.output" # thinking included
-cache_read = "message.usage.cacheRead"
-cache_write = "message.usage.cacheWrite"
-reasoning = "message.usage.reasoningTokens"
-usd = "message.usage.cost.total"
-model = "message.model"
+[bridges.codesmith.usage]
+files = "**/usage.jsonl"        # under {SESSION_DIR}, which args or env must use
+when = { type = "step" }        # one line per model step
+input = "input"                 # input not read from a cache
+output = "output"               # thinking included
+cache_read = "cache_read"
+cache_write = "cache_write"
+reasoning = "reasoning"
+usd = "usd"                     # billed cost; "usd_estimated" for an estimate
+model = "model"
 ```
 
 Paths into a line are dotted. A line counts when everything in `when`
@@ -456,7 +469,7 @@ prints any stderr tail to stderr, and exits by status. Scripts can run as many
 as they like at once: each gets the reply to its own request.
 
 ```sh
-tailbus call omp@server "Review this" --attach change.diff \
+tailbus call codesmith@server "Review this" --attach change.diff \
   --tools read,grep --model some/other-model --run-timeout 900
 ```
 
