@@ -67,7 +67,9 @@ Claude Code 2.1.325, pi 1.5.2, and node 22.22.1 and 24.22.0. `setup refresh`
 and the daemon, as it starts, ask each bridge's agent for its version. One
 older than tested is something to fix; one newer is only noted.
 
-A `codesmith` bridge must say `kind = "codesmith"`: refresh doesn't move a
+A `codesmith` bridge needs CodeSmith 0.7.0 or later, whose `--output final`
+keeps the narration of earlier steps out of the answer. It must say
+`kind = "codesmith"`: refresh doesn't move a
 table to it by its command, since `codesmith bus relay` is the same program
 run another way. Each run gets its own session database
 (`CODESMITH_DB`, in the session directory); for a per-sender session, set

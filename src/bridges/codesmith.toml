@@ -5,7 +5,9 @@
 # Anything it sets wins over these. For a per-sender session, set
 # `continue_args = ["--continue"]`: it continues the latest session in that
 # sender's database.
-args = ["run", "-m", "{MODEL}", "--usage-log", "{SESSION_DIR}/usage.jsonl"]
+# `--output final` prints only the run's final answer, not the narration of
+# earlier steps (CodeSmith 0.7.0 and later).
+args = ["run", "--output", "final", "-m", "{MODEL}", "--usage-log", "{SESSION_DIR}/usage.jsonl"]
 # 4 hours: a cap no run should reach. A run ends when it's done.
 timeout_secs = 14400
 max_concurrent = 3
